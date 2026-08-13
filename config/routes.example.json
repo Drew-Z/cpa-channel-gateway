@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "channels": [
+    {
+      "id": "free",
+      "enabled": false,
+      "models": [
+        {
+          "upstream": "grok-4.5",
+          "protocol": "responses",
+          "aliases": ["free/grok-4.5"],
+          "inputModalities": ["text"],
+          "outputModalities": ["text"]
+        }
+      ]
+    }
+  ],
+  "stableAliases": [
+    {
+      "alias": "coding-main",
+      "channel": "free",
+      "model": "grok-4.5"
+    }
+  ],
+  "pinnedAliases": [
+    {
+      "alias": "ai-daily-v1",
+      "channel": "free",
+      "model": "grok-4.5",
+      "approvalRef": "replace-with-approved-config-version"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "cpa-channel-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Single-tenant CPA and HAProxy gateway for constrained upstream channels",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node scripts/gateway.mjs validate",
+    "generate": "node scripts/gateway.mjs generate",
+    "activate": "node scripts/gateway.mjs activate",
+    "rollback": "node scripts/gateway.mjs rollback",
+    "status": "node scripts/gateway.mjs status",
+    "import:legacy": "node scripts/import-legacy-env.mjs",
+    "canary": "node scripts/canary.mjs",
+    "install:runtime": "node scripts/install-runtime.mjs",
+    "start": "node scripts/gateway.mjs start",
+    "test": "node --test"
+  }
+}

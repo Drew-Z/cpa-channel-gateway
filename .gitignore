@@ -1,0 +1,14 @@
+config/channels.local.env
+config/routes.local.json
+runtime/
+bin/
+logs/
+auth/
+*.local
+*.log
+.env
+.env.*
+!.env.example
+node_modules/
+coverage/
+.DS_Store

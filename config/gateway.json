@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "public": {
+    "host": "0.0.0.0",
+    "portEnv": "SERVER_PORT",
+    "defaultPort": 24674
+  },
+  "internal": {
+    "host": "127.0.0.1",
+    "firstChannelPort": 19001
+  },
+  "queue": {
+    "maxConnectionsPerChannel": 1,
+    "maxQueuedPerChannel": 8,
+    "timeoutSeconds": 120
+  },
+  "timeouts": {
+    "connectSeconds": 15,
+    "clientSeconds": 900,
+    "serverSeconds": 900
+  },
+  "runtime": {
+    "cpaVersion": "7.2.131",
+    "cpaSha256": {
+      "aarch64": "c82bd3dfb62da2ff567930d928c8aaf33f384917bdfc197f28ddbf7ff50509f3",
+      "amd64": "a7e1127d10e908f37fa7bb5f5f4a9aebb26e5baca17c7bd92987df3a0bda9043"
+    },
+    "haproxyVersion": "3.2.22",
+    "haproxySha256": "afca3a26d573df53d0e1fc475dcd743ec5875e038e1476c80e871d70228ca2da",
+    "downloadOnStart": true
+  },
+  "cpa": {
+    "requestRetry": 0,
+    "maxRetryCredentials": 1,
+    "maxRetryIntervalSeconds": 0,
+    "sessionAffinity": true,
+    "managementRemote": false,
+    "managementPanel": false,
+    "usageStatistics": false,
+    "loggingToFile": false,
+    "logsMaxTotalSizeMb": 64
+  }
+}
