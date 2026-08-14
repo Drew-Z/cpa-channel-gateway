@@ -37,6 +37,16 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 模型级 `protocol` 可以覆盖渠道默认值。同一物理渠道的所有协议仍使用同一个 HAProxy listener，因此共享一个并发槽。
 
+启用渠道的完整模型目录通过以下命令显式同步：
+
+```bash
+npm run sync:models
+```
+
+公开模型 ID 使用 `<channel-id>/<upstream-model-id>`。后半段保留上游原始大小写以及 `/`、`:`、`@` 等常见模型字符，因此 `free/Provider/Model-A:free` 是合法 ID。这个命名空间是确定具体物理渠道所必需的，不是可漂移别名；`coding-main` 等 `stableAliases` 才是面向客户端的可切换逻辑别名。
+
+同步是显式运维动作，不在每次启动时自动执行，也不作为渠道测活。它只访问 `/models`，成功后备份并更新私有 routes；生成服务启动时仍只读取本地已验证配置，不依赖远程目录。上游目录不能证明模型支持哪种 API 或能力，新模型默认继承渠道协议，必要时必须在 routes 中覆盖并完成对应 canary。
+
 每个模型至少包含：
 
 ```json
@@ -55,7 +65,7 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 - `outputModalities`
 - `thinkingLevels`
 
-不要凭模型名称推断能力。只有实际完成对应任务型验收后，才声明图片、工具、结构化输出、长上下文或 thinking 能力。
+不要凭模型名称或 `/models` 返回结果推断能力。只有实际完成对应任务型验收后，才声明图片、工具、结构化输出、长上下文或 thinking 能力。
 
 ## Stable and pinned aliases
 

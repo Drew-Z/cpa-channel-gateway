@@ -68,6 +68,23 @@ test('does not fall back to example secrets during normal validation', () => {
   assert.throws(() => loadConfig(root), /Missing private configuration/)
 })
 
+test('accepts namespaced upstream model ids and permits empty enabled channels only for discovery', () => {
+  const root = fixtureRoot()
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+  routes.channels[0].models[0].upstream = 'Provider/Model-A:free'
+  routes.channels[0].models[0].aliases = ['chat/Provider/Model-A:free']
+  routes.pinnedAliases[0].model = 'Provider/Model-A:free'
+  fs.writeFileSync(routesPath, JSON.stringify(routes))
+  assert.equal(loadConfig(root).channels[0].models[0].aliases[0], 'chat/Provider/Model-A:free')
+
+  routes.channels[0].models = []
+  routes.pinnedAliases = []
+  fs.writeFileSync(routesPath, JSON.stringify(routes))
+  assert.throws(() => loadConfig(root), /Enabled channel chat has no models/)
+  assert.equal(loadConfig(root, { allowEmptyEnabledChannels: true }).channels[0].models.length, 0)
+})
+
 test('requires a private token only when Cloudflare Tunnel is enabled', () => {
   const enabledRoot = fixtureRoot()
   const enabledEnv = path.join(enabledRoot, 'config', 'channels.local.env')

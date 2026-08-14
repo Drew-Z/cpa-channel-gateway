@@ -6,7 +6,7 @@
 
 ## 解决的问题
 
-- 聚合多个 OpenAI Chat Completions、OpenAI Responses 和 Claude Messages 兼容渠道。
+- 聚合多个 OpenAI Chat Completions、OpenAI Responses 和 Claude Messages 兼容渠道，并可显式同步启用渠道的完整模型目录。
 - 通过 `coding-main` 等稳定别名切换渠道/模型，客户端配置保持不变。
 - 每个物理渠道共享一个 HAProxy backend，`maxconn 1`，所以该渠道的全部模型和协议合计最多只有一个在途请求。
 - 每渠道最多排队 8 个请求，等待上限 120 秒；HAProxy 和 CPA 默认不自动重放生成请求。
@@ -44,9 +44,10 @@ Cloudflare Tunnel or direct allocation
 
 2. 在 `channels.local.env` 填写每个渠道的 URL、密钥、默认协议和启用状态。
    使用自有 HTTPS 域名时，再填写私密的 Cloudflare Tunnel Token；未配置时保持关闭。
-3. 在 `routes.local.json` 声明已经验收的模型。单个渠道可以按模型分别声明 `openai-compatible`、`responses` 或 `claude`。
-4. 配置稳定别名；AI Daily 等受审批约束的用途只能使用带 `approvalRef` 的 `pinnedAliases`。
-5. 验证并生成：
+3. 执行 `npm run sync:models`，把启用渠道 `/models` 返回的目录同步到私有 routes。每个模型使用 `<渠道ID>/<原始模型ID>` 作为无冲突的公开 ID。
+4. 在 `routes.local.json` 审核模型协议和能力元数据。单个渠道可以按模型分别覆盖为 `openai-compatible`、`responses` 或 `claude`。
+5. 配置稳定别名；AI Daily 等受审批约束的用途只能使用带 `approvalRef` 的 `pinnedAliases`。
+6. 验证并生成：
 
    ```bash
    npm run check
@@ -94,6 +95,19 @@ npm run import:legacy -- /absolute/path/to/channels.local.env
 
 二进制缓存在 `bin/`。修改 `config/gateway.json` 中的固定版本和校验和后，下一次启动会自动重新安装。
 
+## 模型目录同步
+
+渠道模型发生变化时，显式执行：
+
+```bash
+npm run sync:models
+npm run check
+```
+
+同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何启用渠道请求失败或返回空目录时都不会改写 routes；成功时会先创建 `config/routes.local.pre-model-sync-*.json` 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`，未被引用的下线模型会删除。仍被 stable/pinned alias 引用的下线模型会暂时保留，待别名切走后在下次同步清理。
+
+上游 `/models` 可能同时列出生成、embedding、reranker 或语音模型。目录同步只证明“上游声明存在”，不证明它支持当前渠道默认协议；正式使用前仍要按能力执行任务型 canary。
+
 ## 模型替换
 
 只修改 `config/routes.local.json`：
@@ -128,12 +142,13 @@ npm run rollback
 ```bash
 GATEWAY_API_KEY='...' \
 CANARY_MODEL='sample/example-coding-model' \
+CANARY_PROTOCOL='responses' \
 npm run canary
 ```
 
 从容器外验收时再提供 `GATEWAY_BASE_URL='https://<网关地址>'`；脚本仍只记录低敏摘要，不输出响应正文。
 
-默认任务是生成一首四句七言绝句。脚本只记录 HTTP 状态、模型名和正文长度，不输出正文、密钥、上游地址或完整错误。canary 也是正式请求，必须遵守渠道授权、进入相同 HAProxy 队列，并由操作者明确执行；项目不创建周期性模型探测。
+默认任务是生成一首四句七言绝句。`CANARY_PROTOCOL` 接受 `responses`、`openai-compatible`（或等价的 `chat`）和 `claude`。脚本只记录 HTTP 状态、模型名和正文长度，不输出正文、密钥、上游地址或完整错误。canary 也是正式请求，必须遵守渠道授权、进入相同 HAProxy 队列，并由操作者明确执行；项目不创建周期性模型探测。
 
 ## 运维策略
 

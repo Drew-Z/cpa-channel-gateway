@@ -4,16 +4,16 @@ import { readEnvFile } from './env.mjs'
 
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const MODEL_NAME = /^[^\s/][^\r\n]{0,254}$/
-const ALIAS = /^[a-z0-9][a-z0-9._/-]{0,127}$/
+const ALIAS = /^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$/
 const ENV_NAME = /^[A-Z][A-Z0-9_]*$/
 
-export function loadConfig(root, { allowExamples = false } = {}) {
+export function loadConfig(root, { allowExamples = false, allowEmptyEnabledChannels = false } = {}) {
   const gateway = readJson(path.join(root, 'config', 'gateway.json'))
   const routesPath = chooseLocal(root, 'routes.local.json', 'routes.example.json', allowExamples)
   const envPath = chooseLocal(root, 'channels.local.env', 'channels.example.env', allowExamples)
   const routes = readJson(routesPath)
   const env = readEnvFile(envPath)
-  return validateAndNormalize({ gateway, routes, env, paths: { routesPath, envPath } })
+  return validateAndNormalize({ gateway, routes, env, paths: { routesPath, envPath }, allowEmptyEnabledChannels })
 }
 
 function chooseLocal(root, localName, exampleName, allowExamples) {
@@ -27,7 +27,7 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'))
 }
 
-function validateAndNormalize({ gateway, routes, env, paths }) {
+function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledChannels }) {
   const errors = []
   if (gateway.schemaVersion !== 1) errors.push('gateway.json schemaVersion must be 1')
   if (routes.schemaVersion !== 1) errors.push('routes schemaVersion must be 1')
@@ -85,7 +85,7 @@ function validateAndNormalize({ gateway, routes, env, paths }) {
       })
     }
     const enabled = Boolean(routeChannel.enabled ?? true) && enabledByEnv
-    if (enabled && models.length === 0) errors.push(`Enabled channel ${id} has no models`)
+    if (enabled && models.length === 0 && !allowEmptyEnabledChannels) errors.push(`Enabled channel ${id} has no models`)
     const channel = {
       id,
       name: env[`${envPrefix}_NAME`]?.trim() || id,

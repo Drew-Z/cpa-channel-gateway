@@ -1,4 +1,5 @@
 export function buildCanaryRequest(protocol, model, prompt) {
+  protocol = normalizeCanaryProtocol(protocol)
   if (protocol === 'responses') {
     return { path: '/v1/responses', body: { model, input: prompt, stream: false, max_output_tokens: 256 } }
   }
@@ -20,6 +21,7 @@ export function resolveCanaryUrl(baseUrl, port, requestPath) {
 }
 
 export function extractCanaryContent(protocol, payload) {
+  protocol = normalizeCanaryProtocol(protocol)
   if (protocol === 'responses') {
     if (typeof payload?.output_text === 'string') return payload.output_text
     return (payload?.output ?? []).flatMap(item => item?.content ?? []).map(item => item?.text ?? '').join('')
@@ -27,4 +29,8 @@ export function extractCanaryContent(protocol, payload) {
   if (protocol === 'chat') return payload?.choices?.[0]?.message?.content
   if (protocol === 'claude') return (payload?.content ?? []).map(item => item?.text ?? '').join('')
   return ''
+}
+
+export function normalizeCanaryProtocol(protocol) {
+  return protocol === 'openai-compatible' ? 'chat' : protocol
 }

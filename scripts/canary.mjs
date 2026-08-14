@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { request } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { buildCanaryRequest, extractCanaryContent, resolveCanaryUrl } from '../src/canary.mjs'
+import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol, resolveCanaryUrl } from '../src/canary.mjs'
 
 const port = Number(process.env.SERVER_PORT || process.env.PORT || 3000)
 const apiKey = process.env.GATEWAY_API_KEY
 if (!apiKey) throw new Error('GATEWAY_API_KEY is required')
 const model = process.env.CANARY_MODEL || 'coding-main'
-const protocol = process.env.CANARY_PROTOCOL || 'responses'
+const protocol = normalizeCanaryProtocol(process.env.CANARY_PROTOCOL || 'responses')
 const prompt = process.env.CANARY_PROMPT || '请写一首四句七言绝句，主题是秋夜读书。只输出诗题和诗句。'
 const requestShape = buildCanaryRequest(protocol, model, prompt)
 const result = await post(resolveCanaryUrl(process.env.GATEWAY_BASE_URL, port, requestShape.path), JSON.stringify(requestShape.body), {
