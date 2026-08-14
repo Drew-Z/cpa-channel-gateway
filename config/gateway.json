@@ -5,6 +5,13 @@
     "portEnv": "SERVER_PORT",
     "defaultPort": 3000
   },
+  "cloudflareTunnel": {
+    "enabledEnv": "CLOUDFLARE_TUNNEL_ENABLED",
+    "tokenEnv": "CLOUDFLARE_TUNNEL_TOKEN",
+    "metricsHost": "127.0.0.1",
+    "metricsPort": 20000,
+    "readyTimeoutSeconds": 30
+  },
   "internal": {
     "host": "127.0.0.1",
     "firstChannelPort": 19001
@@ -27,6 +34,11 @@
     },
     "haproxyVersion": "3.2.22",
     "haproxySha256": "afca3a26d573df53d0e1fc475dcd743ec5875e038e1476c80e871d70228ca2da",
+    "cloudflaredVersion": "2026.8.1",
+    "cloudflaredSha256": {
+      "aarch64": "6d517efc10dfce17440177bd7011909166eab44bae0f6998182183df717c7dba",
+      "amd64": "98d8eadbfdf8c7ec994e08260599c9be991e7833c746f98692b18bdf71c9b9dc"
+    },
     "downloadOnStart": true
   },
   "cpa": {

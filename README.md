@@ -19,7 +19,7 @@
 ```text
 Codex / Claude Code / AI Daily
               |
-        public allocation
+Cloudflare Tunnel or direct allocation
               |
          CLIProxyAPI
               |
@@ -43,6 +43,7 @@ Codex / Claude Code / AI Daily
    ```
 
 2. 在 `channels.local.env` 填写每个渠道的 URL、密钥、默认协议和启用状态。
+   使用自有 HTTPS 域名时，再填写私密的 Cloudflare Tunnel Token；未配置时保持关闭。
 3. 在 `routes.local.json` 声明已经验收的模型。单个渠道可以按模型分别声明 `openai-compatible`、`responses` 或 `claude`。
 4. 配置稳定别名；AI Daily 等受审批约束的用途只能使用带 `approvalRef` 的 `pinnedAliases`。
 5. 验证并生成：
@@ -64,7 +65,7 @@ npm run import:legacy -- /absolute/path/to/channels.local.env
 
 ## 翼龙面板
 
-完整步骤见 [翼龙面板部署指南](docs/pterodactyl-deployment.md)。公开仓库可直接通过 HTTPS 克隆，Git 用户名和 Access Token 均留空。私有渠道配置不通过 Git 分发，必须在安装后由操作者手工上传。
+完整步骤见 [翼龙面板部署指南](docs/pterodactyl-deployment.md)。自有域名接入见 [Cloudflare Tunnel 部署](docs/cloudflare-tunnel.md)。公开仓库可直接通过 HTTPS 克隆，Git 用户名和 Access Token 均留空。私有渠道配置不通过 Git 分发，必须在安装后由操作者手工上传。
 
 推荐填写：
 
@@ -85,11 +86,11 @@ npm run import:legacy -- /absolute/path/to/channels.local.env
 
 首次启动会：
 
-1. 按容器架构下载固定 CPA 发布包并核对仓库内 SHA-256。
+1. 按容器架构下载固定 CPA 和 cloudflared 发布包并核对仓库内 SHA-256。
 2. 下载固定 HAProxy 源码与无 root 的构建依赖，核对 SHA-256 后编译并缓存。
 3. 校验私有配置，生成内容寻址 release。
-4. 执行 `haproxy -c` 与 CPA 二进制预检。
-5. 先启动 HAProxy 并等待全部内部 listener 就绪，再启动 CPA 并等待公网端口就绪；任一进程退出时终止整个服务，让面板明确重启。
+4. 执行 `haproxy -c` 与 CPA 二进制预检；启用 Tunnel 时再预检 cloudflared。
+5. 先启动 HAProxy 和 CPA；启用 Tunnel 时再启动 cloudflared 并等待本地 readiness。任一必需进程退出时终止整个服务，让面板明确重启。
 
 二进制缓存在 `bin/`。修改 `config/gateway.json` 中的固定版本和校验和后，下一次启动会自动重新安装。
 
@@ -147,6 +148,7 @@ npm run canary
 ## 安全
 
 - 网关是单租户服务，必须使用长度至少 32 的随机 `GATEWAY_API_KEY`。
+- Cloudflare Tunnel 默认关闭；Token 只存在于 `channels.local.env`，并通过子进程环境传递。cloudflared 固定版本、校验 SHA-256 且禁用自动更新。
 - CPA Management API 默认关闭；确需开启时仍只允许 localhost。
 - 不提交 `config/*.local.*`、`runtime/`、`auth/`、`logs/` 或 `bin/`。
 - 公开或发布前运行 `npm run audit:public`；该检查会扫描当前跟踪文件、完整可达 Git 历史以及本地私密值是否意外进入仓库，但不会输出私密值。

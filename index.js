@@ -2,18 +2,18 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { runtimeNeedsInstall } from './src/runtime.mjs'
 
 const root = path.dirname(fileURLToPath(import.meta.url))
 const node = process.execPath
 const expected = JSON.parse(fs.readFileSync(path.join(root, 'config', 'gateway.json'), 'utf8')).runtime
+const runtimeArch = process.arch === 'arm64' ? 'aarch64' : process.arch === 'x64' ? 'amd64' : process.arch
+const binDir = path.join(root, 'bin')
 const versionPath = path.join(root, 'bin', 'versions.json')
 let installed = null
 try { installed = JSON.parse(fs.readFileSync(versionPath, 'utf8')) } catch {}
 
-if (!fs.existsSync(path.join(root, 'bin', 'CLIProxyAPI')) ||
-    !fs.existsSync(path.join(root, 'bin', 'haproxy')) ||
-    installed?.cpaVersion !== expected.cpaVersion ||
-    installed?.haproxyVersion !== expected.haproxyVersion) {
+if (runtimeNeedsInstall({ expected, installed, binDir, platform: process.platform, arch: runtimeArch })) {
   await run(node, [path.join(root, 'scripts', 'install-runtime.mjs')])
 }
 

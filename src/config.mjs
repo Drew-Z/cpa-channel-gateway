@@ -5,6 +5,7 @@ import { readEnvFile } from './env.mjs'
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const MODEL_NAME = /^[^\s/][^\r\n]{0,254}$/
 const ALIAS = /^[a-z0-9][a-z0-9._/-]{0,127}$/
+const ENV_NAME = /^[A-Z][A-Z0-9_]*$/
 
 export function loadConfig(root, { allowExamples = false } = {}) {
   const gateway = readJson(path.join(root, 'config', 'gateway.json'))
@@ -32,6 +33,13 @@ function validateAndNormalize({ gateway, routes, env, paths }) {
   if (routes.schemaVersion !== 1) errors.push('routes schemaVersion must be 1')
   const gatewayKey = requireSecret(env, 'GATEWAY_API_KEY', errors, 32)
   const managementKey = env.CPA_MANAGEMENT_KEY?.trim() ?? ''
+  const tunnelSettings = gateway.cloudflareTunnel ?? {}
+  const tunnelEnabledEnv = String(tunnelSettings.enabledEnv ?? '')
+  const tunnelCredentialEnv = String(tunnelSettings.tokenEnv ?? '')
+  const tunnelEnabled = parseBoolean(env[tunnelEnabledEnv] ?? 'false', tunnelEnabledEnv || 'cloudflareTunnel.enabledEnv', errors)
+  const tunnelCredential = tunnelEnabled
+    ? requireSecret(env, tunnelCredentialEnv, errors, 32)
+    : env[tunnelCredentialEnv]?.trim() ?? ''
   const seenChannels = new Set()
   const seenAliases = new Set()
   const channelById = new Map()
@@ -112,7 +120,24 @@ function validateAndNormalize({ gateway, routes, env, paths }) {
 
   validateGateway(gateway, errors)
   if (errors.length) throw new Error(`Configuration validation failed:\n- ${errors.join('\n- ')}`)
-  return { gateway, routes, env, paths, gatewayKey, managementKey, channels, stableAliases, pinnedAliases }
+  return {
+    gateway,
+    routes,
+    env,
+    paths,
+    gatewayKey,
+    managementKey,
+    channels,
+    stableAliases,
+    pinnedAliases,
+    cloudflareTunnel: {
+      enabled: tunnelEnabled,
+      credential: tunnelCredential,
+      metricsHost: tunnelSettings.metricsHost,
+      metricsPort: tunnelSettings.metricsPort,
+      readyTimeoutMs: tunnelSettings.readyTimeoutSeconds * 1000
+    }
+  }
 }
 
 function requireSecret(env, key, errors, minLength) {
@@ -153,12 +178,18 @@ function normalizeThinking(values) {
 
 function validateGateway(gateway, errors) {
   const q = gateway.queue ?? {}
+  const tunnel = gateway.cloudflareTunnel ?? {}
   if (typeof gateway.cpa?.localModelCatalog !== 'boolean') errors.push('cpa.localModelCatalog must be boolean')
+  if (!ENV_NAME.test(tunnel.enabledEnv ?? '')) errors.push('cloudflareTunnel.enabledEnv must be an environment variable name')
+  if (!ENV_NAME.test(tunnel.tokenEnv ?? '')) errors.push('cloudflareTunnel.tokenEnv must be an environment variable name')
+  if (tunnel.metricsHost !== '127.0.0.1') errors.push('cloudflareTunnel.metricsHost must be 127.0.0.1')
   if (q.maxConnectionsPerChannel !== 1) errors.push('queue.maxConnectionsPerChannel must be exactly 1')
   for (const [name, value] of Object.entries({
     'queue.maxQueuedPerChannel': q.maxQueuedPerChannel,
     'queue.timeoutSeconds': q.timeoutSeconds,
-    'internal.firstChannelPort': gateway.internal?.firstChannelPort
+    'internal.firstChannelPort': gateway.internal?.firstChannelPort,
+    'cloudflareTunnel.metricsPort': tunnel.metricsPort,
+    'cloudflareTunnel.readyTimeoutSeconds': tunnel.readyTimeoutSeconds
   })) {
     if (!Number.isSafeInteger(value) || value <= 0) errors.push(`${name} must be a positive integer`)
   }

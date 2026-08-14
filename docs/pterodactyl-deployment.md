@@ -32,7 +32,7 @@
 
 ## 3. 等待安装
 
-首次启动会下载并校验 CPA 发布包，然后下载 HAProxy 源码并在 2 核容器内编译。已验证环境通常需要约 4 至 6 分钟；以后只要固定版本未变，就会复用 `bin/` 缓存。
+首次启动会下载并校验 CPA 与 cloudflared 发布包，然后下载 HAProxy 源码并在 2 核容器内编译。已验证环境通常需要约 4 至 6 分钟；以后按组件复用 `bin/` 缓存，只新增 cloudflared 时不会重新编译版本未变的 HAProxy。
 
 如果服务器安装后自动启动，而私有配置尚未上传，运行时安装完成后出现以下错误是预期行为：
 
@@ -51,7 +51,7 @@ Missing private configuration: config/routes.local.json
 /home/container/config/routes.local.json
 ```
 
-只上传这两个私有配置，不要替换仓库中的 `config/gateway.json`。上传前确认文件名没有被浏览器或系统追加 `.txt`，并确认 `channels.local.env` 中的 `GATEWAY_API_KEY` 至少 32 个字符。
+只上传这两个私有配置，不要替换仓库中的 `config/gateway.json`。上传前确认文件名没有被浏览器或系统追加 `.txt`，并确认 `channels.local.env` 中的 `GATEWAY_API_KEY` 至少 32 个字符。使用 Cloudflare Tunnel 时，Token 也只写在这个本地 env 文件中；完整步骤见 [Cloudflare Tunnel 部署](cloudflare-tunnel.md)。
 
 这些文件已被 `config/*.local.*` 忽略，不会被 Git 更新跟踪。仍应只在可信设备和面板连接中传输，并避免在控制台、工单或截图中展示其内容。
 
@@ -60,7 +60,7 @@ Missing private configuration: config/routes.local.json
 上传完成后启动服务器。成功时控制台会输出一个不含密钥的 ready 记录：
 
 ```json
-{"ready":true,"port":12345,"release":"..."}
+{"ready":true,"port":12345,"release":"...","cloudflareTunnel":false}
 ```
 
 其中端口应等于面板的主 allocation。随后在可信客户端中把 Base URL 指向：
@@ -96,7 +96,7 @@ npm run canary
 
 ## 6. 更新和回退
 
-保持 Auto Update 关闭。更新前备份两个 `config/*.local.*` 文件，在维护窗口手工拉取或重装 `main`，再重新启动。固定 CPA/HAProxy 版本改变时会重新安装运行时。
+保持 Auto Update 关闭。更新前备份两个 `config/*.local.*` 文件，在维护窗口手工拉取或重装 `main`，再重新启动。固定 CPA/HAProxy/cloudflared 版本改变时只重新安装对应运行时组件。
 
 只替换渠道或模型时，编辑并重新上传 `config/routes.local.json`。如果面板提供容器终端，再执行：
 
@@ -113,4 +113,6 @@ npm run activate
 - `Configuration validation failed`：渠道 ID、环境变量前缀、模型路由、稳定别名或密钥长度不一致。
 - `No Debian APT source list found`：所选 Server Image 不是当前安装器支持的 Debian 系镜像，请切回已验证的 Nodejs 22。
 - `Listener ... did not become ready`：检查 HAProxy 编译/配置输出以及内部端口是否被其他进程占用，不要把内部端口添加为公网 allocation。
+- `Cloudflare Tunnel is enabled but bin/cloudflared is missing`：重新启动以触发固定运行时安装，并检查 GitHub Release 下载是否被容器网络阻断。
+- `HTTP readiness endpoint ... did not return 2xx`：Tunnel Token 无效、cloudflared 尚未建立到 Cloudflare 的活跃连接，或容器无法通过出站网络连接 Cloudflare；先在 Dashboard 检查 Tunnel connector 状态和 cloudflared 日志。Published application route 不是 `/ready` 返回 2xx 的必要条件，但仍需在验收公网域名之前配置。
 - CPA 启动后立刻退出：先看控制台中的 HAProxy/CPA 预检错误；不要通过启用自动重试来掩盖配置问题。

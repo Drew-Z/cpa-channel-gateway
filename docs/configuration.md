@@ -22,6 +22,17 @@ CHANNEL_<ID>_ENABLED
 - `responses`：OpenAI Responses/Codex 兼容上游。
 - `claude`：Anthropic Messages 兼容上游。
 
+## Cloudflare Tunnel environment
+
+Tunnel 默认关闭。使用 dashboard 管理的 Cloudflare Tunnel 时，只在 `channels.local.env` 中配置：
+
+```text
+CLOUDFLARE_TUNNEL_ENABLED=true
+CLOUDFLARE_TUNNEL_TOKEN=<private-token>
+```
+
+启用时 Token 必填且至少 32 个字符；关闭时可以留空。校验摘要、生成 release、日志和 Git 均不得输出 Token。Tunnel 的 hostname 与 `http://127.0.0.1:<SERVER_PORT>` route 由 Cloudflare Dashboard 管理，不写入渠道路由文件。
+
 ## Routes
 
 模型级 `protocol` 可以覆盖渠道默认值。同一物理渠道的所有协议仍使用同一个 HAProxy listener，因此共享一个并发槽。

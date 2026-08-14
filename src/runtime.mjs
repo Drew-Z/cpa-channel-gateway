@@ -2,11 +2,38 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 const CPA_BINARY_NAMES = new Set(['cli-proxy-api', 'CLIProxyAPI'])
+const CLOUDFLARED_ASSETS = {
+  aarch64: 'cloudflared-linux-arm64',
+  amd64: 'cloudflared-linux-amd64'
+}
 
 export function findCpaBinary(files) {
   const candidates = files.filter(file => CPA_BINARY_NAMES.has(path.basename(file)))
   if (candidates.length !== 1) throw new Error(`Expected one CPA binary, found ${candidates.length}`)
   return candidates[0]
+}
+
+export function cloudflaredAssetName(arch) {
+  const asset = CLOUDFLARED_ASSETS[arch]
+  if (!asset) throw new Error(`Unsupported cloudflared architecture: ${arch}`)
+  return asset
+}
+
+export function runtimeNeedsInstall({ expected, installed, binDir, platform, arch, exists = fs.existsSync }) {
+  return runtimeInstallPlan({ expected, installed, binDir, platform, arch, exists }).length > 0
+}
+
+export function runtimeInstallPlan({ expected, installed, binDir, platform, arch, exists = fs.existsSync }) {
+  const components = [
+    { id: 'cpa', version: 'cpaVersion', binary: 'CLIProxyAPI' },
+    { id: 'haproxy', version: 'haproxyVersion', binary: 'haproxy' },
+    { id: 'cloudflared', version: 'cloudflaredVersion', binary: 'cloudflared' }
+  ]
+  const runtimeChanged = platform !== undefined && arch !== undefined &&
+    (installed?.platform !== platform || installed?.arch !== arch)
+  return components
+    .filter(component => runtimeChanged || installed?.[component.version] !== expected[component.version] || !exists(path.join(binDir, component.binary)))
+    .map(component => component.id)
 }
 
 export function stageOpenSslHeaders(sslRoot) {

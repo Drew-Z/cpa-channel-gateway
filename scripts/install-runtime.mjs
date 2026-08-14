@@ -5,27 +5,41 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { findCpaBinary, stageOpenSslHeaders, stageOpenSslLibraries } from '../src/runtime.mjs'
+import { cloudflaredAssetName, findCpaBinary, runtimeInstallPlan, stageOpenSslHeaders, stageOpenSslLibraries } from '../src/runtime.mjs'
 
 const root = path.resolve(process.env.GATEWAY_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url))))
 const gatewayConfig = JSON.parse(fs.readFileSync(path.join(root, 'config', 'gateway.json'), 'utf8'))
 const cpaVersion = String(gatewayConfig.runtime?.cpaVersion || '').trim()
 const haproxyVersion = String(gatewayConfig.runtime?.haproxyVersion || '').trim()
+const cloudflaredVersion = String(gatewayConfig.runtime?.cloudflaredVersion || '').trim()
 if (!/^\d+\.\d+\.\d+$/.test(cpaVersion)) throw new Error(`Invalid CPA version: ${cpaVersion}`)
 if (!/^\d+\.\d+\.\d+$/.test(haproxyVersion)) throw new Error(`Invalid HAProxy version: ${haproxyVersion}`)
+if (!/^\d+\.\d+\.\d+$/.test(cloudflaredVersion)) throw new Error(`Invalid cloudflared version: ${cloudflaredVersion}`)
 const platform = process.platform
 const arch = process.arch === 'arm64' ? 'aarch64' : process.arch === 'x64' ? 'amd64' : null
 if (platform !== 'linux' || !arch) throw new Error(`Unsupported runtime: ${platform}/${process.arch}`)
 
 const binDir = path.join(root, 'bin')
 fs.mkdirSync(binDir, { recursive: true })
+const manifestPath = path.join(binDir, 'versions.json')
+let previous = null
+try { previous = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) } catch {}
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cpa-gateway-'))
 try {
-  await installCpa(tmpDir, binDir, arch)
-  await installHaproxy(tmpDir, binDir)
-  const manifest = { schemaVersion: 1, cpaVersion, haproxyVersion, platform, arch, installedAt: new Date().toISOString() }
-  fs.writeFileSync(path.join(binDir, 'versions.json'), JSON.stringify(manifest, null, 2) + '\n')
-  console.log(JSON.stringify({ ...manifest, binDir }, null, 2))
+  const expected = { cpaVersion, haproxyVersion, cloudflaredVersion }
+  const installedComponents = runtimeInstallPlan({ expected, installed: previous, binDir, platform, arch })
+  if (installedComponents.includes('cpa')) {
+    await installCpa(tmpDir, binDir, arch)
+  }
+  if (installedComponents.includes('haproxy')) {
+    await installHaproxy(tmpDir, binDir)
+  }
+  if (installedComponents.includes('cloudflared')) {
+    await installCloudflared(tmpDir, binDir, arch)
+  }
+  const manifest = { schemaVersion: 1, cpaVersion, haproxyVersion, cloudflaredVersion, platform, arch, installedAt: new Date().toISOString() }
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+  console.log(JSON.stringify({ ...manifest, installedComponents, binDir }, null, 2))
 } finally {
   fs.rmSync(tmpDir, { recursive: true, force: true })
 }
@@ -44,6 +58,19 @@ async function installCpa(tmp, destination, targetArch) {
   const binary = findCpaBinary(walkFiles(extractDir))
   fs.copyFileSync(binary, path.join(destination, 'CLIProxyAPI'))
   fs.chmodSync(path.join(destination, 'CLIProxyAPI'), 0o755)
+}
+
+async function installCloudflared(tmp, destination, targetArch) {
+  const asset = cloudflaredAssetName(targetArch)
+  const expected = gatewayConfig.runtime?.cloudflaredSha256?.[targetArch]
+  if (!expected) throw new Error(`No checksum for cloudflared asset ${asset}`)
+  const binary = path.join(tmp, asset)
+  const base = `https://github.com/cloudflare/cloudflared/releases/download/${cloudflaredVersion}`
+  await download(`${base}/${asset}`, binary)
+  assertSha256(binary, expected)
+  const installed = path.join(destination, 'cloudflared')
+  fs.copyFileSync(binary, installed)
+  fs.chmodSync(installed, 0o755)
 }
 
 async function installHaproxy(tmp, destination) {

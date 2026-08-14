@@ -30,6 +30,7 @@ test('generates protocol-specific CPA sections and one HAProxy queue per channel
   assert.match(result.cpa, /base-url: "http:\/\/127\.0\.0\.1:19003"/)
   assert.ok(!result.cpa.includes('https://chat.example.test'))
   assert.ok(!result.haproxy.includes('secret-chat'))
+  assert.equal(result.cloudflareTunnel.enabled, false)
 })
 
 test('normalizes CPA executor paths without duplicating the upstream v1 segment', () => {
@@ -65,6 +66,27 @@ test('does not fall back to example secrets during normal validation', () => {
   fs.mkdirSync(path.join(root, 'config'))
   copy('gateway.json', root)
   assert.throws(() => loadConfig(root), /Missing private configuration/)
+})
+
+test('requires a private token only when Cloudflare Tunnel is enabled', () => {
+  const enabledRoot = fixtureRoot()
+  const enabledEnv = path.join(enabledRoot, 'config', 'channels.local.env')
+  fs.appendFileSync(enabledEnv, '\nCLOUDFLARE_TUNNEL_ENABLED=true\nCLOUDFLARE_TUNNEL_TOKEN=fixture_tunnel_token_that_is_long_enough_123456\n')
+  const enabled = loadConfig(enabledRoot)
+  assert.equal(enabled.cloudflareTunnel.enabled, true)
+  assert.equal(enabled.cloudflareTunnel.credential, 'fixture_tunnel_token_that_is_long_enough_123456')
+  const generated = generateRelease(enabledRoot)
+  const releaseText = [
+    generated.cpa,
+    generated.haproxy,
+    fs.readFileSync(path.join(generated.releaseDir, 'manifest.json'), 'utf8')
+  ].join('\n')
+  assert.doesNotMatch(releaseText, /fixture_tunnel_token_that_is_long_enough_123456/)
+
+  const missingRoot = fixtureRoot()
+  const missingEnv = path.join(missingRoot, 'config', 'channels.local.env')
+  fs.appendFileSync(missingEnv, '\nCLOUDFLARE_TUNNEL_ENABLED=true\nCLOUDFLARE_TUNNEL_TOKEN=\n')
+  assert.throws(() => loadConfig(missingRoot), /CLOUDFLARE_TUNNEL_TOKEN is missing/)
 })
 
 function fixtureRoot() {

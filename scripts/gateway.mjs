@@ -5,7 +5,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { generateRelease, activateRelease, rollbackRelease } from '../src/generate.mjs'
 import { loadConfig } from '../src/config.mjs'
-import { childOutcome, terminateChildren, waitForPort } from '../src/supervisor.mjs'
+import { childOutcome, terminateChildren, waitForHttpOk, waitForPort } from '../src/supervisor.mjs'
 
 const root = path.resolve(process.env.GATEWAY_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url))))
 const command = process.argv[2] || 'status'
@@ -41,6 +41,7 @@ function publicSummary(config) {
     channels: config.channels.map(item => ({ id: item.id, name: item.name, enabled: item.enabled, modelCount: item.models.length, protocol: item.protocol })),
     stableAliases: config.stableAliases.map(item => ({ alias: item.alias, channel: item.channel, model: item.model })),
     pinnedAliases: config.pinnedAliases.map(item => ({ alias: item.alias, channel: item.channel, model: item.model, approvalRef: item.approvalRef })),
+    cloudflareTunnel: { enabled: config.cloudflareTunnel.enabled },
     queue: config.gateway.queue
   }
 }
@@ -51,7 +52,9 @@ async function start(rootDir) {
   const binDir = path.join(rootDir, 'bin')
   const cpaPath = path.join(binDir, process.platform === 'win32' ? 'CLIProxyAPI.exe' : 'CLIProxyAPI')
   const haproxyPath = path.join(binDir, process.platform === 'win32' ? 'haproxy.exe' : 'haproxy')
+  const cloudflaredPath = path.join(binDir, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared')
   if (!fs.existsSync(cpaPath) || !fs.existsSync(haproxyPath)) throw new Error('Missing runtime binaries. Run the documented install step before start.')
+  if (generated.cloudflareTunnel.enabled && !fs.existsSync(cloudflaredPath)) throw new Error('Cloudflare Tunnel is enabled but bin/cloudflared is missing. Run the documented install step before start.')
   runCheck(haproxyPath, ['-c', '-f', path.join(generated.releaseDir, 'haproxy', 'haproxy.cfg')], 'HAProxy configuration')
   runCheck(cpaPath, ['-help'], 'CPA binary', new Set([0, 2]))
   fs.mkdirSync(path.join(rootDir, 'runtime', 'auth'), { recursive: true })
@@ -92,7 +95,35 @@ async function start(rootDir) {
     const startup = await Promise.race([cpaReady, ...outcomes, signalOutcome])
     if (startup?.type === 'signal') return
     if (startup) throw childFailure(startup)
-    console.log(JSON.stringify({ ready: true, port: publicPort, release: generated.digest }))
+
+    if (generated.cloudflareTunnel.enabled) {
+      const tunnel = generated.cloudflareTunnel
+      runCheck(cloudflaredPath, ['version'], 'cloudflared binary')
+      const tunnelEnv = { ...process.env, NO_AUTOUPDATE: 'true' }
+      tunnelEnv['TUNNEL_TOKEN'] = tunnel.credential
+      const cloudflared = spawn(cloudflaredPath, [
+        'tunnel',
+        '--no-autoupdate',
+        '--metrics', `${tunnel.metricsHost}:${tunnel.metricsPort}`,
+        'run'
+      ], {
+        stdio: 'inherit',
+        windowsHide: true,
+        env: tunnelEnv
+      })
+      children.push(cloudflared)
+      outcomes.push(childOutcome(cloudflared, 'cloudflared'))
+      const tunnelReady = waitForHttpOk(
+        `http://${tunnel.metricsHost}:${tunnel.metricsPort}/ready`,
+        tunnel.readyTimeoutMs,
+        { signal: abortController.signal }
+      ).then(() => null)
+      const tunnelStartup = await Promise.race([tunnelReady, ...outcomes, signalOutcome])
+      if (tunnelStartup?.type === 'signal') return
+      if (tunnelStartup) throw childFailure(tunnelStartup)
+    }
+
+    console.log(JSON.stringify({ ready: true, port: publicPort, release: generated.digest, cloudflareTunnel: generated.cloudflareTunnel.enabled }))
 
     const outcome = await Promise.race([...outcomes, signalOutcome])
     if (outcome.type !== 'signal') throw childFailure(outcome)

@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { findCpaBinary, stageOpenSslHeaders, stageOpenSslLibraries } from '../src/runtime.mjs'
+import { cloudflaredAssetName, findCpaBinary, runtimeInstallPlan, runtimeNeedsInstall, stageOpenSslHeaders, stageOpenSslLibraries } from '../src/runtime.mjs'
 
 test('finds the CPA binary name used by pinned no-plugin release archives', () => {
   assert.equal(
@@ -15,6 +15,26 @@ test('finds the CPA binary name used by pinned no-plugin release archives', () =
   assert.throws(
     () => findCpaBinary(['/tmp/release/cli-proxy-api', '/tmp/release/CLIProxyAPI']),
     /Expected one CPA binary, found 2/
+  )
+})
+
+test('selects pinned cloudflared assets and requires the complete runtime set', () => {
+  assert.equal(cloudflaredAssetName('aarch64'), 'cloudflared-linux-arm64')
+  assert.equal(cloudflaredAssetName('amd64'), 'cloudflared-linux-amd64')
+  assert.throws(() => cloudflaredAssetName('riscv64'), /Unsupported cloudflared architecture/)
+
+  const expected = { cpaVersion: '1.2.3', haproxyVersion: '3.2.1', cloudflaredVersion: '2026.8.1' }
+  const installed = { ...expected, platform: 'linux', arch: 'aarch64' }
+  const present = new Set(['CLIProxyAPI', 'haproxy', 'cloudflared'].map(name => path.join('/runtime', name)))
+  const runtime = { expected, installed, binDir: '/runtime', platform: 'linux', arch: 'aarch64', exists: file => present.has(file) }
+  assert.equal(runtimeNeedsInstall(runtime), false)
+  present.delete(path.join('/runtime', 'cloudflared'))
+  assert.deepEqual(runtimeInstallPlan(runtime), ['cloudflared'])
+  assert.equal(runtimeNeedsInstall(runtime), true)
+  assert.equal(runtimeNeedsInstall({ ...runtime, installed: { ...installed, cloudflaredVersion: 'old' }, exists: () => true }), true)
+  assert.deepEqual(
+    runtimeInstallPlan({ ...runtime, arch: 'amd64', exists: () => true }),
+    ['cpa', 'haproxy', 'cloudflared']
   )
 })
 
