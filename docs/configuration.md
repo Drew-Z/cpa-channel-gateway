@@ -30,9 +30,9 @@ CHANNEL_<ID>_ENABLED
 
 ```json
 {
-  "upstream": "grok-4.6",
+  "upstream": "example-coding-model",
   "protocol": "responses",
-  "aliases": ["free3/grok-4.6"]
+  "aliases": ["sample/example-coding-model"]
 }
 ```
 

@@ -9,6 +9,7 @@
   },
   "scripts": {
     "check": "node scripts/gateway.mjs validate",
+    "audit:public": "node scripts/public-audit.mjs",
     "generate": "node scripts/gateway.mjs generate",
     "activate": "node scripts/gateway.mjs activate",
     "rollback": "node scripts/gateway.mjs rollback",

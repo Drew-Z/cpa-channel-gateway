@@ -11,6 +11,14 @@ export function buildCanaryRequest(protocol, model, prompt) {
   throw new Error(`Unsupported CANARY_PROTOCOL: ${protocol}`)
 }
 
+export function resolveCanaryUrl(baseUrl, port, requestPath) {
+  const target = new URL(baseUrl || `http://127.0.0.1:${port}`)
+  if (!['http:', 'https:'].includes(target.protocol) || target.username || target.password || target.search || target.hash) {
+    throw new Error('GATEWAY_BASE_URL must be a clean http(s) URL')
+  }
+  return new URL(requestPath, target).toString()
+}
+
 export function extractCanaryContent(protocol, payload) {
   if (protocol === 'responses') {
     if (typeof payload?.output_text === 'string') return payload.output_text

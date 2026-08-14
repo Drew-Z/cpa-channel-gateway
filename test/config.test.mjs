@@ -18,7 +18,7 @@ test('generates protocol-specific CPA sections and one HAProxy queue per channel
   assert.match(result.cpa, /request-retry: 0/)
   assert.match(result.cpa, /identity-confuse: false/)
   assert.match(result.cpa, /disable-codex-cloaking: true/)
-  assert.match(result.cpa, /^port: 24674$/m)
+  assert.match(result.cpa, /^port: 3000$/m)
   assert.doesNotMatch(result.cpa, /^\s+prefix:/m)
   assert.equal((result.haproxy.match(/ maxconn 1 maxqueue 8 /g) ?? []).length, 3)
   assert.equal((result.haproxy.match(/^frontend channel_/gm) ?? []).length, 3)

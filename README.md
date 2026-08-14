@@ -57,27 +57,31 @@ Codex / Claude Code / AI Daily
 已有旧格式 env 时可执行：
 
 ```bash
-npm run import:legacy -- /absolute/path/to/grok-4.5-channel.local.env
+npm run import:legacy -- /absolute/path/to/channels.local.env
 ```
 
 导入器只在本地写入 Git 忽略文件，所有渠道默认禁用，不会枚举模型或调用上游。
 
 ## 翼龙面板
 
+完整步骤见 [翼龙面板部署指南](docs/pterodactyl-deployment.md)。公开仓库可直接通过 HTTPS 克隆，Git 用户名和 Access Token 均留空。私有渠道配置不通过 Git 分发，必须在安装后由操作者手工上传。
+
 推荐填写：
 
 | 设置 | 值 |
 | --- | --- |
 | Server Image | Nodejs 22 |
-| Git Repo Address | 本仓库 SSH/HTTPS 地址 |
+| Git Repo Address | `https://github.com/Drew-Z/cpa-channel-gateway.git` |
 | Install Branch | `main` |
 | User Uploaded Files | 关闭 |
 | Auto Update | 关闭；升级必须审核固定版本后手动执行 |
+| Git Username | 留空 |
+| Git Access Token | 留空 |
 | Additional Node Packages | 留空 |
 | Main File | `index.js` |
 | Additional Arguments | 留空 |
 
-将面板主 allocation 的端口作为环境变量 `SERVER_PORT`；当前截图中主端口为 `24674`。第二个 allocation 不需要使用。
+将面板主 allocation 的端口作为环境变量 `SERVER_PORT`。只需要一个公网 allocation；第二个 allocation 不需要使用。
 
 首次启动会：
 
@@ -96,8 +100,8 @@ npm run import:legacy -- /absolute/path/to/grok-4.5-channel.local.env
 ```json
 {
   "alias": "coding-main",
-  "channel": "free3",
-  "model": "grok-4.6"
+  "channel": "sample",
+  "model": "example-coding-model"
 }
 ```
 
@@ -122,9 +126,11 @@ npm run rollback
 
 ```bash
 GATEWAY_API_KEY='...' \
-CANARY_MODEL='free3/grok-4.6' \
+CANARY_MODEL='sample/example-coding-model' \
 npm run canary
 ```
+
+从容器外验收时再提供 `GATEWAY_BASE_URL='https://<网关地址>'`；脚本仍只记录低敏摘要，不输出响应正文。
 
 默认任务是生成一首四句七言绝句。脚本只记录 HTTP 状态、模型名和正文长度，不输出正文、密钥、上游地址或完整错误。canary 也是正式请求，必须遵守渠道授权、进入相同 HAProxy 队列，并由操作者明确执行；项目不创建周期性模型探测。
 
@@ -143,6 +149,7 @@ npm run canary
 - 网关是单租户服务，必须使用长度至少 32 的随机 `GATEWAY_API_KEY`。
 - CPA Management API 默认关闭；确需开启时仍只允许 localhost。
 - 不提交 `config/*.local.*`、`runtime/`、`auth/`、`logs/` 或 `bin/`。
+- 公开或发布前运行 `npm run audit:public`；该检查会扫描当前跟踪文件、完整可达 Git 历史以及本地私密值是否意外进入仓库，但不会输出私密值。
 - 默认关闭 CPA 的 Claude/Codex cloaking、身份混淆和系统提示词替换；真实客户端信息可以由客户端正常发送。
 - 启动时使用 CPA 的 `-local-model`，模型目录来自已审核的本地 routes 配置，不依赖远程模型目录服务。
 - HAProxy 验证上游 TLS 证书并固定 HTTP/1.1，避免单连接多路复用绕过单并发约束。
@@ -154,6 +161,7 @@ npm run canary
 ```bash
 npm test
 npm run check
+npm run audit:public
 node --check index.js
 ```
 

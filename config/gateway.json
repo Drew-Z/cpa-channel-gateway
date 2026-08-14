@@ -3,7 +3,7 @@
   "public": {
     "host": "0.0.0.0",
     "portEnv": "SERVER_PORT",
-    "defaultPort": 24674
+    "defaultPort": 3000
   },
   "internal": {
     "host": "127.0.0.1",

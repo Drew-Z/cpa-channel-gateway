@@ -1,5 +1,4 @@
-config/channels.local.env
-config/routes.local.json
+config/*.local.*
 runtime/
 bin/
 logs/
@@ -9,6 +8,8 @@ auth/
 .env
 .env.*
 !.env.example
+*.key
+*.pem
 node_modules/
 coverage/
 .DS_Store

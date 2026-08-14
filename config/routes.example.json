@@ -2,13 +2,13 @@
   "schemaVersion": 1,
   "channels": [
     {
-      "id": "free",
+      "id": "sample",
       "enabled": false,
       "models": [
         {
-          "upstream": "grok-4.5",
+          "upstream": "example-coding-model",
           "protocol": "responses",
-          "aliases": ["free/grok-4.5"],
+          "aliases": ["sample/example-coding-model"],
           "inputModalities": ["text"],
           "outputModalities": ["text"]
         }
@@ -18,15 +18,15 @@
   "stableAliases": [
     {
       "alias": "coding-main",
-      "channel": "free",
-      "model": "grok-4.5"
+      "channel": "sample",
+      "model": "example-coding-model"
     }
   ],
   "pinnedAliases": [
     {
       "alias": "ai-daily-v1",
-      "channel": "free",
-      "model": "grok-4.5",
+      "channel": "sample",
+      "model": "example-coding-model",
       "approvalRef": "replace-with-approved-config-version"
     }
   ]
