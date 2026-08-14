@@ -144,6 +144,7 @@ npm run canary
 - CPA Management API 默认关闭；确需开启时仍只允许 localhost。
 - 不提交 `config/*.local.*`、`runtime/`、`auth/`、`logs/` 或 `bin/`。
 - 默认关闭 CPA 的 Claude/Codex cloaking、身份混淆和系统提示词替换；真实客户端信息可以由客户端正常发送。
+- 启动时使用 CPA 的 `-local-model`，模型目录来自已审核的本地 routes 配置，不依赖远程模型目录服务。
 - HAProxy 验证上游 TLS 证书并固定 HTTP/1.1，避免单连接多路复用绕过单并发约束。
 - 上游基路径由 CPA 的协议专用本地 URL 保留；Claude 会归一化末尾 `/v1`，避免生成 `/v1/v1/messages`。
 - 仓库不包含真实渠道名称以外的 URL、密钥、原始错误和响应正文。

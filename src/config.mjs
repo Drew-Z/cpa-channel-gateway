@@ -153,6 +153,7 @@ function normalizeThinking(values) {
 
 function validateGateway(gateway, errors) {
   const q = gateway.queue ?? {}
+  if (typeof gateway.cpa?.localModelCatalog !== 'boolean') errors.push('cpa.localModelCatalog must be boolean')
   if (q.maxConnectionsPerChannel !== 1) errors.push('queue.maxConnectionsPerChannel must be exactly 1')
   for (const [name, value] of Object.entries({
     'queue.maxQueuedPerChannel': q.maxQueuedPerChannel,

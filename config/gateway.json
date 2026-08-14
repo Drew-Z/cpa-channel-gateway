@@ -38,6 +38,7 @@
     "managementPanel": false,
     "usageStatistics": false,
     "loggingToFile": false,
-    "logsMaxTotalSizeMb": 64
+    "logsMaxTotalSizeMb": 64,
+    "localModelCatalog": true
   }
 }

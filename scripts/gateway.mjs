@@ -79,7 +79,9 @@ async function start(rootDir) {
     if (early) throw childFailure(early)
 
     const publicPort = Number(process.env[generated.gateway.public.portEnv] || process.env.SERVER_PORT || process.env.PORT || generated.gateway.public.defaultPort)
-    const cpa = spawn(cpaPath, ['-config', path.join(generated.releaseDir, 'cpa', 'config.yaml')], {
+    const cpaArgs = ['-config', path.join(generated.releaseDir, 'cpa', 'config.yaml')]
+    if (generated.gateway.cpa.localModelCatalog) cpaArgs.push('-local-model')
+    const cpa = spawn(cpaPath, cpaArgs, {
       stdio: 'inherit',
       env: { ...process.env, SERVER_PORT: String(publicPort) }
     })

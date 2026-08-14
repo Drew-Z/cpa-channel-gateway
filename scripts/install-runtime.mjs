@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { findCpaBinary } from '../src/runtime.mjs'
+import { findCpaBinary, stageOpenSslHeaders, stageOpenSslLibraries } from '../src/runtime.mjs'
 
 const root = path.resolve(process.env.GATEWAY_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url))))
 const gatewayConfig = JSON.parse(fs.readFileSync(path.join(root, 'config', 'gateway.json'), 'utf8'))
@@ -58,35 +58,71 @@ async function installHaproxy(tmp, destination) {
   const sslRoot = path.join(tmp, 'ssl-dev')
   const aptState = path.join(tmp, 'apt-state')
   const aptCache = path.join(tmp, 'apt-cache')
+  const aptConfig = path.join(tmp, 'apt.conf')
+  const aptParts = path.join(tmp, 'apt-parts')
+  const sourceParts = path.join(tmp, 'source-parts')
   fs.mkdirSync(path.join(aptState, 'lists', 'partial'), { recursive: true })
   fs.mkdirSync(path.join(aptCache, 'archives', 'partial'), { recursive: true })
+  fs.mkdirSync(aptParts)
+  fs.mkdirSync(sourceParts)
+  const sourceList = ['/etc/apt/sources.list', '/etc/apt/sources.list.d/debian.sources'].find(file => fs.existsSync(file))
+  if (!sourceList) throw new Error('No Debian APT source list found')
+  const temporarySourceList = path.join(tmp, path.extname(sourceList) === '.sources' ? 'debian.sources' : 'sources.list')
+  const sourceText = fs.readFileSync(sourceList, 'utf8')
+    .replace(/^(\s*URIs:\s+)http:\/\//gm, '$1https://')
+    .replace(/^(\s*deb(?:-src)?\s+(?:\[[^\]]+\]\s+)?)http:\/\//gm, '$1https://')
+  fs.writeFileSync(temporarySourceList, sourceText)
+  fs.writeFileSync(aptConfig, [
+    `Dir::Etc::sourcelist "${temporarySourceList}";`,
+    `Dir::Etc::sourceparts "${sourceParts}";`,
+    'Dir::Etc::main "";',
+    `Dir::Etc::parts "${aptParts}";`,
+    'Dir::State::status "/var/lib/dpkg/status";',
+    'Acquire::Languages "none";',
+    'Acquire::GzipIndexes "true";'
+  ].join('\n') + '\n')
   fs.mkdirSync(sslRoot)
   const aptOptions = [
     '-o', `Dir::State::lists=${path.join(aptState, 'lists')}`,
     '-o', `Dir::Cache::archives=${path.join(aptCache, 'archives')}`,
-    '-o', 'APT::Update::Post-Invoke-Success::=',
-    '-o', 'DPkg::Post-Invoke::='
+    '-o', 'Acquire::Retries=3',
+    '-o', 'Acquire::http::Pipeline-Depth=0'
   ]
-  execFileSync('apt-get', [...aptOptions, 'update'], { stdio: 'inherit' })
-  execFileSync('apt-get', [...aptOptions, 'download', 'libssl-dev'], { cwd: sslRoot, stdio: 'inherit' })
+  const aptEnv = { ...process.env, APT_CONFIG: aptConfig }
+  await runApt(aptOptions, ['update'], { env: aptEnv })
+  await runApt(aptOptions, ['download', 'libssl-dev'], { cwd: sslRoot, env: aptEnv })
   const sslDebs = fs.readdirSync(sslRoot).filter(name => /^libssl-dev_.*\.deb$/.test(name))
   if (sslDebs.length !== 1) throw new Error(`Expected one libssl-dev package, found ${sslDebs.length}`)
   execFileSync('dpkg-deb', ['-x', path.join(sslRoot, sslDebs[0]), sslRoot], { stdio: 'inherit' })
-  const sslLibrary = walkFiles(sslRoot).find(file => path.basename(file) === 'libssl.so')
-  const sslInclude = path.join(sslRoot, 'usr', 'include')
-  if (!sslLibrary || !fs.existsSync(path.join(sslInclude, 'openssl', 'ssl.h'))) throw new Error('Extracted libssl-dev package is incomplete')
+  const sslInclude = stageOpenSslHeaders(sslRoot)
+  const sslLibrary = stageOpenSslLibraries(sslRoot)
+  if (!fs.existsSync(path.join(sslInclude, 'openssl', 'ssl.h'))) throw new Error('Extracted libssl-dev package is incomplete')
   execFileSync('make', [
     '-C', sourceDir,
     'TARGET=linux-glibc',
     'USE_OPENSSL=1',
     `SSL_INC=${sslInclude}`,
-    `SSL_LIB=${path.dirname(sslLibrary)}`,
+    `SSL_LIB=${sslLibrary}`,
     '-j2'
   ], { stdio: 'inherit' })
   const binary = path.join(sourceDir, 'haproxy')
   if (!fs.existsSync(binary)) throw new Error('HAProxy build did not produce haproxy binary')
   fs.copyFileSync(binary, path.join(destination, 'haproxy'))
   fs.chmodSync(path.join(destination, 'haproxy'), 0o755)
+}
+
+async function runApt(options, args, extra = {}) {
+  let lastError
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      execFileSync('apt-get', [...options, ...args], { stdio: 'inherit', ...extra })
+      return
+    } catch (error) {
+      lastError = error
+      if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 3000 * attempt))
+    }
+  }
+  throw lastError
 }
 
 async function fetchText(url) {
