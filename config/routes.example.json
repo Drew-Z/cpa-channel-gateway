@@ -4,10 +4,12 @@
     {
       "id": "sample",
       "enabled": false,
+      "priority": 100,
       "models": [
         {
           "upstream": "example-coding-model",
           "protocol": "responses",
+          "priority": 100,
           "aliases": ["sample/example-coding-model"],
           "inputModalities": ["text"],
           "outputModalities": ["text"]

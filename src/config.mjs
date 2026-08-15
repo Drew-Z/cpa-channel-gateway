@@ -64,6 +64,7 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
     const protocol = (env[`${envPrefix}_PROTOCOL`] || 'openai-compatible').trim()
     if (!['openai-compatible', 'responses', 'claude'].includes(protocol)) errors.push(`${envPrefix}_PROTOCOL is not supported: ${protocol}`)
     const enabledByEnv = parseBoolean(env[`${envPrefix}_ENABLED`] ?? 'true', `${envPrefix}_ENABLED`, errors)
+    const channelPriority = optionalInteger(routeChannel.priority, `${id}.priority`, errors) ?? 0
     const models = []
     for (const [modelIndex, model] of (routeChannel.models ?? []).entries()) {
       const upstreamModel = String(model.upstream ?? '').trim()
@@ -72,11 +73,13 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
       if (!['openai-compatible', 'responses', 'claude'].includes(modelProtocol)) errors.push(`${id}.models[${modelIndex}].protocol is not supported: ${modelProtocol}`)
       const aliases = [...new Set((model.aliases ?? []).map(value => String(value).trim()))]
       if (!aliases.length) aliases.push(`${id}/${upstreamModel}`)
+      else if (!aliases.includes(`${id}/${upstreamModel}`)) aliases.push(`${id}/${upstreamModel}`)
       for (const alias of aliases) validateAlias(alias, `${id}.models[${modelIndex}]`, seenAliases, errors)
       models.push({
         upstream: upstreamModel,
         protocol: modelProtocol,
         aliases,
+        priority: optionalInteger(model.priority, `${id}.${upstreamModel}.priority`, errors) ?? channelPriority,
         displayName: model.displayName ? String(model.displayName) : undefined,
         maxContextLength: optionalPositiveInteger(model.maxContextLength, `${id}.${upstreamModel}.maxContextLength`, errors),
         inputModalities: normalizeModalities(model.inputModalities, ['text']),
@@ -93,6 +96,7 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
       upstream,
       apiKey: secret,
       protocol,
+      priority: channelPriority,
       models
     }
     channels.push(channel)
@@ -166,6 +170,12 @@ function optionalPositiveInteger(value, field, errors) {
   return value
 }
 
+function optionalInteger(value, field, errors) {
+  if (value === undefined || value === null) return undefined
+  if (!Number.isSafeInteger(value)) errors.push(`${field} must be an integer`)
+  return value
+}
+
 function normalizeModalities(values, fallback) {
   if (!Array.isArray(values) || values.length === 0) return fallback
   return [...new Set(values.map(value => String(value).trim().toLowerCase()).filter(Boolean))]
@@ -187,7 +197,10 @@ function validateGateway(gateway, errors) {
   for (const [name, value] of Object.entries({
     'queue.maxQueuedPerChannel': q.maxQueuedPerChannel,
     'queue.timeoutSeconds': q.timeoutSeconds,
+    'internal.cpaPort': gateway.internal?.cpaPort,
     'internal.firstChannelPort': gateway.internal?.firstChannelPort,
+    'control.maxRequestBytes': gateway.control?.maxRequestBytes,
+    'control.busyRetryAfterSeconds': gateway.control?.busyRetryAfterSeconds,
     'cloudflareTunnel.metricsPort': tunnel.metricsPort,
     'cloudflareTunnel.readyTimeoutSeconds': tunnel.readyTimeoutSeconds
   })) {

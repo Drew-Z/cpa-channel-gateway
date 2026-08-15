@@ -2,14 +2,16 @@
 
 面向个人单租户的多渠道模型网关。它在一个固定 Node.js 容器中运行
 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 与
-[HAProxy](https://www.haproxy.org/)，只向公网暴露 CPA 聚合端口。
+[HAProxy](https://www.haproxy.org/)。公网只暴露 Node 控制网关；CPA 与所有
+HAProxy listener 均绑定到容器回环地址。
 
 ## 解决的问题
 
-- 聚合多个 OpenAI Chat Completions、OpenAI Responses 和 Claude Messages 兼容渠道，并可显式同步启用渠道的完整模型目录。
+- 聚合多个 OpenAI Chat Completions、OpenAI Responses 和 Claude Messages 兼容渠道，并把相同原始模型 ID 自动聚合成一个逻辑模型。
 - 通过 `coding-main` 等稳定别名切换渠道/模型，客户端配置保持不变。
 - 每个物理渠道共享一个 HAProxy backend，`maxconn 1`，所以该渠道的全部模型和协议合计最多只有一个在途请求。
-- 每渠道最多排队 8 个请求，等待上限 120 秒；HAProxy 和 CPA 默认不自动重放生成请求。
+- Node 为每个物理渠道持有一个互斥租约。渠道繁忙时会从所有模型的新请求候选中临时隐藏；没有其他空闲候选时立即返回 `429 all_candidates_busy`，不向上游排队或重复调用。
+- HAProxy 仍以 `maxconn 1` 作为最终硬约束；CPA 和网关都不会自动重放已经发往上游的生成请求。
 - 私有渠道 URL、密钥、激活配置、日志和二进制不会进入 Git。
 - 配置生成按内容寻址，支持原子激活和一次回滚。
 - canary 使用真实小任务，不使用 `hi`、`你好` 等无意义提示词。
@@ -21,12 +23,13 @@ Codex / Claude Code / AI Daily
               |
 Cloudflare Tunnel or direct allocation
               |
-         CLIProxyAPI
-              |
-  127.0.0.1:19001..190NN
-              |
-           HAProxy
-   one queue per physical channel
+      Node control gateway
+       /v1/*     /healthz
+          |          |
+ native Responses   CPA adapted transport
+          |          |
+       HAProxy 127.0.0.1:19001..190NN
+       one active request per physical channel
               |
         upstream channels
 ```
@@ -91,7 +94,7 @@ npm run import:legacy -- /absolute/path/to/channels.local.env
 2. 下载固定 HAProxy 源码与无 root 的构建依赖，核对 SHA-256 后编译并缓存。
 3. 校验私有配置，生成内容寻址 release。
 4. 执行 `haproxy -c` 与 CPA 二进制预检；启用 Tunnel 时再预检 cloudflared。
-5. 先启动 HAProxy 和 CPA；启用 Tunnel 时再启动 cloudflared 并等待本地 readiness。任一必需进程退出时终止整个服务，让面板明确重启。
+5. 先启动 HAProxy 与内网 CPA，再由 Node 监听公网 allocation；启用 Tunnel 时最后启动 cloudflared 并等待本地 readiness。任一必需进程退出时终止整个服务，让面板明确重启。
 
 二进制缓存在 `bin/`。修改 `config/gateway.json` 中的固定版本和校验和后，下一次启动会自动重新安装。
 
@@ -148,7 +151,7 @@ npm run canary
 
 从容器外验收时再提供 `GATEWAY_BASE_URL='https://<网关地址>'`；脚本仍只记录低敏摘要，不输出响应正文。
 
-默认任务是生成一首四句七言绝句。`CANARY_PROTOCOL` 接受 `responses`、`openai-compatible`（或等价的 `chat`）和 `claude`。脚本只记录 HTTP 状态、模型名和正文长度，不输出正文、密钥、上游地址或完整错误。canary 也是正式请求，必须遵守渠道授权、进入相同 HAProxy 队列，并由操作者明确执行；项目不创建周期性模型探测。
+默认任务是生成一首四句七言绝句。`CANARY_PROTOCOL` 接受 `responses`、`openai-compatible`（或等价的 `chat`）和 `claude`。脚本只记录 HTTP 状态、模型名和正文长度，不输出正文、密钥、上游地址或完整错误。canary 也是正式请求，必须取得与生产请求相同的渠道租约，并由操作者明确执行；项目不创建周期性模型探测。
 
 ## 运维策略
 
@@ -170,6 +173,7 @@ npm run canary
 - 默认关闭 CPA 的 Claude/Codex cloaking、身份混淆和系统提示词替换；真实客户端信息可以由客户端正常发送。
 - 启动时使用 CPA 的 `-local-model`，模型目录来自已审核的本地 routes 配置，不依赖远程模型目录服务。
 - HAProxy 验证上游 TLS 证书并固定 HTTP/1.1，避免单连接多路复用绕过单并发约束。
+- Responses 客户端与 Responses 渠道同协议时，Node 直接保留实际请求语义和经过审查的非敏感端到端请求头；模型、认证、目标地址及传输相关字段由网关替换。其他协议组合标记为 CPA `adapted` 路径。
 - 上游基路径由 CPA 的协议专用本地 URL 保留；Claude 会归一化末尾 `/v1`，避免生成 `/v1/v1/messages`。
 - 仓库不包含真实渠道名称以外的 URL、密钥、原始错误和响应正文。
 

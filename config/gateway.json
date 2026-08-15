@@ -14,7 +14,12 @@
   },
   "internal": {
     "host": "127.0.0.1",
+    "cpaPort": 24675,
     "firstChannelPort": 19001
+  },
+  "control": {
+    "maxRequestBytes": 4194304,
+    "busyRetryAfterSeconds": 1
   },
   "queue": {
     "maxConnectionsPerChannel": 1,

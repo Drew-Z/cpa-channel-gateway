@@ -10,6 +10,7 @@ export function generateRelease(root) {
   const channels = assignListeners(loaded.channels, loaded.gateway.internal.firstChannelPort)
   const runtimePaths = {
     authDir: path.join(root, 'runtime', 'auth').replaceAll('\\', '/'),
+    cpaPort: loaded.gateway.internal.cpaPort
   }
   const cpa = buildCpaConfig(loaded, channels, { stableAliases: loaded.stableAliases, pinnedAliases: loaded.pinnedAliases }, runtimePaths)
   const haproxy = buildHaproxyConfig(loaded.gateway, channels)

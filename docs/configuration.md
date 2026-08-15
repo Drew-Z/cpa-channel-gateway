@@ -43,7 +43,12 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 npm run sync:models
 ```
 
-公开模型 ID 使用 `<channel-id>/<upstream-model-id>`。后半段保留上游原始大小写以及 `/`、`:`、`@` 等常见模型字符，因此 `free/Provider/Model-A:free` 是合法 ID。这个命名空间是确定具体物理渠道所必需的，不是可漂移别名；`coding-main` 等 `stableAliases` 才是面向客户端的可切换逻辑别名。
+每个启用渠道的原始模型会同时形成两类公开 ID：
+
+- `<upstream-model-id>`：逻辑模型。多个渠道提供完全相同的原始 ID 时自动聚合，调度器从健康且空闲的候选中选择。
+- `<channel-id>/<upstream-model-id>`：精确模型。它固定到一个物理渠道，但仍必须取得该渠道的互斥租约。
+
+原始 ID 保留上游大小写以及 `/`、`:`、`@` 等常见模型字符，因此 `free/Provider/Model-A:free` 是合法精确 ID。`coding-main` 等现有 `stableAliases` 继续兼容；当前配置格式中的 stable/pinned alias 仍固定到审核过的渠道与模型。
 
 同步是显式运维动作，不在每次启动时自动执行，也不作为渠道测活。它只访问 `/models`，成功后备份并更新私有 routes；生成服务启动时仍只读取本地已验证配置，不依赖远程目录。上游目录不能证明模型支持哪种 API 或能力，新模型默认继承渠道协议，必要时必须在 routes 中覆盖并完成对应 canary。
 
@@ -56,6 +61,8 @@ npm run sync:models
   "aliases": ["sample/example-coding-model"]
 }
 ```
+
+渠道和模型都可以设置整数 `priority`，数值越大越优先；模型级值覆盖渠道级值。未配置时为 `0`，同健康状态和优先级下按渠道 ID 稳定排序。
 
 可选字段：
 
@@ -85,4 +92,4 @@ npm run sync:models
 }
 ```
 
-校验器拒绝把 `maxConnectionsPerChannel` 改成其他值。HAProxy 为每个物理渠道生成一个 backend，并设置 `http-reuse never`、`alpn http/1.1`、`maxconn 1`、`maxqueue 8` 和 `retries 0`。
+校验器拒绝把 `maxConnectionsPerChannel` 改成其他值。Node 调度器会在请求进入 HAProxy 前取得每渠道互斥租约；繁忙渠道不会再次收到新请求。HAProxy 为每个物理渠道生成一个 backend，并设置 `http-reuse never`、`alpn http/1.1`、`maxconn 1`、`maxqueue 8` 和 `retries 0`，仅作为绕过调度器时的最终防线。

@@ -1,6 +1,6 @@
 # Cloudflare Tunnel 部署
 
-本方案通过容器内的 `cloudflared` 主动连接 Cloudflare，绕过 HidenCloud 的 HTTP 反向代理。公网只使用 Cloudflare 管理的 HTTPS 域名；CPA、HAProxy 与渠道端口仍保持原有边界。
+本方案通过容器内的 `cloudflared` 主动连接 Cloudflare，绕过 HidenCloud 的 HTTP 反向代理。公网只使用 Cloudflare 管理的 HTTPS 域名；Node 控制网关仍是唯一公网入口，CPA、HAProxy 与渠道端口只在容器回环地址上监听。
 
 官方参考：
 

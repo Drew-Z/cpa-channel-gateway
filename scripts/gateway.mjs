@@ -5,6 +5,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { generateRelease, activateRelease, rollbackRelease } from '../src/generate.mjs'
 import { loadConfig } from '../src/config.mjs'
+import { createControlGateway } from '../src/control-gateway.mjs'
 import { childOutcome, terminateChildren, waitForHttpOk, waitForPort } from '../src/supervisor.mjs'
 
 const root = path.resolve(process.env.GATEWAY_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url))))
@@ -61,6 +62,7 @@ async function start(rootDir) {
   fs.mkdirSync(path.join(rootDir, 'logs'), { recursive: true })
   const children = []
   const outcomes = []
+  let controlGateway = null
   const abortController = new AbortController()
   let resolveSignal
   const signalOutcome = new Promise(resolve => { resolveSignal = resolve })
@@ -82,19 +84,22 @@ async function start(rootDir) {
     if (early) throw childFailure(early)
 
     const publicPort = Number(process.env[generated.gateway.public.portEnv] || process.env.SERVER_PORT || process.env.PORT || generated.gateway.public.defaultPort)
+    const cpaPort = generated.gateway.internal.cpaPort
     const cpaArgs = ['-config', path.join(generated.releaseDir, 'cpa', 'config.yaml')]
     if (generated.gateway.cpa.localModelCatalog) cpaArgs.push('-local-model')
     const cpa = spawn(cpaPath, cpaArgs, {
       stdio: 'inherit',
-      env: { ...process.env, SERVER_PORT: String(publicPort) }
+      env: { ...process.env, SERVER_PORT: String(cpaPort) }
     })
     children.push(cpa)
     outcomes.push(childOutcome(cpa, 'CPA'))
-    const publicHost = ['0.0.0.0', '::'].includes(generated.gateway.public.host) ? '127.0.0.1' : generated.gateway.public.host
-    const cpaReady = waitForPort(publicHost, publicPort, 15_000, { signal: abortController.signal }).then(() => null)
+    const cpaReady = waitForPort(generated.gateway.internal.host, cpaPort, 15_000, { signal: abortController.signal }).then(() => null)
     const startup = await Promise.race([cpaReady, ...outcomes, signalOutcome])
     if (startup?.type === 'signal') return
     if (startup) throw childFailure(startup)
+
+    controlGateway = createControlGateway(generated)
+    await controlGateway.listen({ host: generated.gateway.public.host, port: publicPort })
 
     if (generated.cloudflareTunnel.enabled) {
       const tunnel = generated.cloudflareTunnel
@@ -131,6 +136,7 @@ async function start(rootDir) {
     abortController.abort()
     process.removeListener('SIGINT', onSigint)
     process.removeListener('SIGTERM', onSigterm)
+    await controlGateway?.close().catch(() => {})
     await terminateChildren(children)
   }
 }
