@@ -1,11 +1,18 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildModelCatalogUrl, canonicalModelAlias, fetchChannelModels, synchronizeRouteModels } from '../src/model-sync.mjs'
+import { buildModelCatalogUrl, canonicalModelAlias, fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from '../src/model-sync.mjs'
 
 test('builds model catalog URLs from the configured upstream base path', () => {
   assert.equal(buildModelCatalogUrl(new URL('https://api.example.test/v1')).toString(), 'https://api.example.test/v1/models')
   assert.equal(buildModelCatalogUrl(new URL('https://api.example.test/custom/v1/')).toString(), 'https://api.example.test/custom/v1/models')
   assert.equal(buildModelCatalogUrl(new URL('https://api.example.test')).toString(), 'https://api.example.test/models')
+})
+
+test('selects enabled channels by default and explicit disabled channels by id', () => {
+  const channels = [{ id: 'free', enabled: true }, { id: 'free3', enabled: false }]
+  assert.deepEqual(selectChannelsForSync(channels).map(channel => channel.id), ['free'])
+  assert.deepEqual(selectChannelsForSync(channels, ['free3']).map(channel => channel.id), ['free3'])
+  assert.throws(() => selectChannelsForSync(channels, ['missing']), /Unknown channels/)
 })
 
 test('fetches paginated model catalogs with protocol-appropriate authentication', async () => {

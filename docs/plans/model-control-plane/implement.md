@@ -18,6 +18,8 @@ The first admin slice is now also implemented: same-port `/admin`, in-memory Htt
 
 The private configuration slice now supports atomic, revisioned channel create/update/delete operations. New channels start disabled, deletion requires a disabled channel with no stable/pinned alias references, failed validation restores both private files, and every successful mutation reports that a restart is required.
 
+运维导入也支持安全合并：`npm run merge:legacy -- <legacy-env>` 只更新旧格式文件中的渠道字段，保留现有密钥、Tunnel、启用状态、模型目录和别名，并将新增渠道置为禁用；写入前会创建私有 revision 备份。`npm run sync:models -- <channel-id>...` 可在不启用渠道的情况下显式同步指定模型目录，便于先目录发现、再任务型测活、最后启用。
+
 ## Phase 1: Contracts and Pure Logic
 
 - Add versioned schemas for private providers, logical models, candidates, and redacted health state.

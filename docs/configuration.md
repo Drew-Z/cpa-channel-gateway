@@ -53,6 +53,20 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 ## Routes
 
+从旧格式渠道文件补充渠道时，优先使用合并导入，避免覆盖现有管理密钥、Tunnel 配置、启用状态和审核过的路由：
+
+```bash
+npm run merge:legacy -- /absolute/path/to/legacy-channel.env
+```
+
+合并会保留现有渠道的模型目录和别名；新渠道以禁用、空模型目录加入，需先显式同步目录、完成任务型测活，再启用渠道。导入过程会在 `runtime/config-revisions/` 创建私有备份，失败会恢复原文件。
+
+默认同步所有已启用渠道；要在不启用新渠道的情况下只同步指定目录，可把渠道 ID 作为位置参数：
+
+```bash
+npm run sync:models -- free3 free7-glm-5-2
+```
+
 模型级 `protocol` 可以覆盖渠道默认值。同一物理渠道的所有协议仍使用同一个 HAProxy listener，因此共享一个并发槽。
 
 启用渠道的完整模型目录通过以下命令显式同步：

@@ -66,7 +66,13 @@ Cloudflare Tunnel or direct allocation
 npm run import:legacy -- /absolute/path/to/channels.local.env
 ```
 
-导入器只在本地写入 Git 忽略文件，所有渠道默认禁用，不会枚举模型或调用上游。
+旧格式文件需要补充到现有配置时，使用合并模式：
+
+```bash
+npm run merge:legacy -- /absolute/path/to/channels.local.env
+```
+
+合并模式会保留现有网关密钥、管理密钥、Tunnel 配置、启用状态、模型路由和别名；新增渠道默认禁用，并在写入前备份到 `runtime/config-revisions/`。旧式 `chat/completion` 会归一化为 `openai-compatible`，误填到 Base URL 末尾的 `/chat/completions`、`/responses` 或 `/messages` 也会移除。初次导入发现已有私有配置时会拒绝覆盖；只有明确执行 `npm run replace:legacy -- <path>` 才会整体替换。所有模式都只在本地写入 Git 忽略文件，不会枚举模型或调用上游。
 
 ## 翼龙面板
 

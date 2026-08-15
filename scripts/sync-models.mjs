@@ -3,15 +3,15 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadConfig } from '../src/config.mjs'
-import { fetchChannelModels, synchronizeRouteModels } from '../src/model-sync.mjs'
+import { fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from '../src/model-sync.mjs'
 
 const root = path.resolve(process.env.GATEWAY_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url))))
 const config = loadConfig(root, { allowEmptyEnabledChannels: true })
-const enabled = config.channels.filter(channel => channel.enabled)
-if (!enabled.length) throw new Error('No enabled channels are available for model synchronization')
+const selected = selectChannelsForSync(config.channels, process.argv.slice(2))
+if (!selected.length) throw new Error('No enabled channels are available for model synchronization')
 
 const discoveries = new Map()
-for (const channel of enabled) {
+for (const channel of selected) {
   discoveries.set(channel.id, await fetchChannelModels(channel))
 }
 

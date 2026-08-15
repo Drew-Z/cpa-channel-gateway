@@ -15,6 +15,8 @@
     "rollback": "node scripts/gateway.mjs rollback",
     "status": "node scripts/gateway.mjs status",
     "import:legacy": "node scripts/import-legacy-env.mjs",
+    "merge:legacy": "node scripts/import-legacy-env.mjs --merge",
+    "replace:legacy": "node scripts/import-legacy-env.mjs --replace",
     "sync:models": "node scripts/sync-models.mjs",
     "canary": "node scripts/canary.mjs",
     "install:runtime": "node scripts/install-runtime.mjs",

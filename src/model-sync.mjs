@@ -9,6 +9,15 @@ export function buildModelCatalogUrl(upstream) {
   return target
 }
 
+export function selectChannelsForSync(channels, requestedIds = []) {
+  const ids = [...new Set(requestedIds.map(value => String(value).trim().toLowerCase()).filter(Boolean))]
+  if (!ids.length) return channels.filter(channel => channel.enabled)
+  const byId = new Map(channels.map(channel => [channel.id, channel]))
+  const unknown = ids.filter(id => !byId.has(id))
+  if (unknown.length) throw new Error(`Unknown channels requested for model synchronization: ${unknown.join(', ')}`)
+  return ids.map(id => byId.get(id))
+}
+
 export async function fetchChannelModels(channel, { fetchImpl = fetch, timeoutMs = 30_000, maxPages = 20 } = {}) {
   const target = buildModelCatalogUrl(channel.upstream)
   const models = []
