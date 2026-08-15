@@ -253,6 +253,7 @@ test('models endpoint exposes logical, stable, and direct ids', async t => {
   assert.equal(result.statusCode, 200)
   const ids = JSON.parse(result.body).data.map(item => item.id)
   assert.deepEqual(ids, ['coding-main', 'free/shared-model', 'shared-model'])
+  assert.doesNotMatch(result.body, /upstream\.example\.test/)
 })
 
 test('admin session protects status and runs a redacted exact-model canary', async t => {
@@ -285,6 +286,11 @@ test('admin session protects status and runs a redacted exact-model canary', asy
   const session = await request({ port: address.port, method: 'GET', path: '/admin/api/session', headers: { cookie } })
   assert.equal(session.statusCode, 200)
   assert.equal(JSON.parse(session.body).csrfToken, csrf)
+
+  const status = await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })
+  assert.equal(status.statusCode, 200)
+  assert.equal(status.headers['cache-control'], 'no-store')
+  assert.equal(JSON.parse(status.body).channels[0].baseUrl, 'https://upstream.example.test/v1')
 
   const missingCsrf = await request({
     port: address.port,
@@ -363,6 +369,7 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.body, /id="addChannelForm"/)
   assert.match(first.body, /id="usage"/)
   assert.match(first.body, /\/admin\/api\/usage/)
+  assert.match(first.body, /<th>Base URL<\/th>/)
   assert.match(first.body, /mode:'same-origin'/)
   assert.match(first.body, /headers\['x-csrf-token'\]=csrf/)
 })

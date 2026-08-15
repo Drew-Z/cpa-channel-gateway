@@ -220,6 +220,7 @@ MVP may return a short `503 reloading` window while internal children change. Ze
 - The session cookie is HttpOnly, Secure, SameSite=Strict, short-lived, and revocable on process restart.
 - Mutations require CSRF protection and `Origin` validation.
 - API keys are accepted on create/replace, written server-side, and returned only as masked presence.
+- Authenticated channel status may include the validated upstream Base URL for operator identification. Admin responses are `no-store`; public APIs and logs never expose the URL.
 - Errors are classified and redacted before persistence or display.
 - Cloudflare Access can be added in front of `/admin/*`; it is recommended but not required for the first single-user build.
 
