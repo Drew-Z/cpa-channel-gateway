@@ -14,7 +14,9 @@ Router MVP is implemented in the working tree:
 
 Persistent health state, configuration jobs, channel/model editing, and hot apply/rollback remain in later phases below.
 
-The first admin slice is now also implemented: same-port `/admin`, in-memory HttpOnly admin sessions, CSRF/origin checks for tests, logical-model candidate status, and exact-candidate poetry canaries with redacted summaries. Channel CRUD, model grouping edits, and runtime apply remain later-phase work.
+The first admin slice is now also implemented: same-port `/admin`, in-memory HttpOnly admin sessions, CSRF/origin checks for tests, logical-model candidate status, and exact-candidate poetry canaries with redacted summaries. Model grouping edits and runtime apply remain later-phase work.
+
+The private configuration slice now supports atomic, revisioned channel create/update/delete operations. New channels start disabled, deletion requires a disabled channel with no stable/pinned alias references, failed validation restores both private files, and every successful mutation reports that a restart is required.
 
 ## Phase 1: Contracts and Pure Logic
 

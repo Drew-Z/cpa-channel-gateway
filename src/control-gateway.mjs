@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
 import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol } from './canary.mjs'
+import { ConfigMutationError, createPrivateConfigManager } from './config-manager.mjs'
 import { createModelScheduler, GatewayRoutingError } from './scheduler.mjs'
 
 const API_PATHS = new Set(['/v1/responses', '/v1/chat/completions', '/v1/messages'])
@@ -25,14 +26,15 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
   const sessions = new Map()
   const lastTests = new Map()
   const lastTestStarted = new Map()
+  const configManager = createPrivateConfigManager(config)
   const server = http.createServer((request, response) => {
     handleRequest(request, response).catch(error => {
       if (response.headersSent) {
         response.destroy(error)
         return
       }
-      const statusCode = error instanceof GatewayRoutingError ? error.statusCode : error.statusCode ?? 500
-      const code = error instanceof GatewayRoutingError ? error.code : error.code ?? 'internal_error'
+      const statusCode = error instanceof GatewayRoutingError || error instanceof ConfigMutationError ? error.statusCode : error.statusCode ?? 500
+      const code = error instanceof GatewayRoutingError || error instanceof ConfigMutationError ? error.code : error.code ?? 'internal_error'
       sendJson(response, statusCode, { error: { code, message: publicErrorMessage(error, statusCode) } }, {
         ...(code === 'all_candidates_busy' ? { 'retry-after': String(config.gateway.control.busyRetryAfterSeconds) } : {})
       })
@@ -117,6 +119,32 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
     }
     if (url.pathname === '/admin/api/models' && request.method === 'GET') {
       sendJson(response, 200, { data: adminModels() })
+      return
+    }
+    if (url.pathname === '/admin/api/config' && request.method === 'GET') {
+      sendJson(response, 200, configManager?.status() ?? { revision: null, restartRequired: false, writable: false })
+      return
+    }
+    if (url.pathname === '/admin/api/channels' && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      const body = await readJsonBody(request, maxRequestBytes)
+      sendJson(response, 202, configManager.createChannel(body))
+      return
+    }
+    const channelRoute = /^\/admin\/api\/channels\/([a-z][a-z0-9-]{0,31})$/.exec(url.pathname)
+    if (channelRoute && request.method === 'PATCH') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      const body = await readJsonBody(request, maxRequestBytes)
+      sendJson(response, 202, configManager.updateChannel(channelRoute[1], body))
+      return
+    }
+    if (channelRoute && request.method === 'DELETE') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      if (scheduler.reservations.isBusy(channelRoute[1])) throw publicError('channel_busy', 409, 'A busy channel cannot be deleted')
+      sendJson(response, 202, configManager.deleteChannel(channelRoute[1]))
       return
     }
     if (url.pathname === '/admin/api/tests' && request.method === 'POST') {
@@ -425,6 +453,10 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
     if (!sameOrigin(request)) throw publicError('invalid_origin', 403, 'Admin request origin is not allowed')
     const csrf = request.headers['x-csrf-token']
     if (typeof csrf !== 'string' || !safeEqual(csrf, session.csrfToken)) throw publicError('invalid_csrf', 403, 'CSRF validation failed')
+  }
+
+  function requireConfigManager() {
+    if (!configManager) throw new ConfigMutationError('configuration_not_writable', 503, 'Private configuration paths are not available')
   }
 }
 

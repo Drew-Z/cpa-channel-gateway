@@ -115,7 +115,6 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
       const model = String(entry.model ?? '').trim()
       const channel = channelById.get(channelId)
       if (!channel) errors.push(`${field}[${index}] references unknown channel ${channelId}`)
-      else if (!channel.enabled) errors.push(`${field}[${index}] references disabled channel ${channelId}`)
       else if (!channel.models.some(item => item.upstream === model)) errors.push(`${field}[${index}] references unknown model ${channelId}/${model}`)
       const approvalRef = String(entry.approvalRef ?? '').trim()
       if (pinned && !approvalRef) errors.push(`${field}[${index}] requires approvalRef`)
