@@ -44,6 +44,17 @@ test('passive authentication failure removes a channel from later selection', ()
   next.release()
 })
 
+test('staged channels are available only to manual exact-model tests', () => {
+  const config = fixtureConfig()
+  config.channels.push({ ...channel('staged', 200, [model('staged', 'new-model', 200)]), enabled: false, staged: true, runtimeEnabled: true })
+  const scheduler = createModelScheduler(config)
+  assert.ok(!scheduler.catalog.listPublicModels().some(item => item.id === 'staged/new-model'))
+  assert.throws(() => scheduler.reserve('staged/new-model'), error => error.code === 'no_eligible_candidates')
+  const testLease = scheduler.reserve('staged/new-model', { source: 'manual-test' })
+  assert.equal(testLease.candidate.channelId, 'staged')
+  testLease.release()
+})
+
 function fixtureConfig() {
   const alpha = channel('alpha', 100, [
     model('alpha', 'shared-model', 100),

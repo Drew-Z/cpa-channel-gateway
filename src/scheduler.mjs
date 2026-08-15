@@ -59,7 +59,7 @@ export function createModelScheduler(config, { reservations = new ChannelReserva
   function reserve(modelId, metadata = {}) {
     const resolved = catalog.resolve(modelId)
     if (!resolved) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${modelId}`)
-    const eligible = resolved.candidates.filter(candidate => isEligible(candidate, channelState, candidateState, now()))
+    const eligible = resolved.candidates.filter(candidate => isEligible(candidate, channelState, candidateState, now(), metadata.source ?? 'production'))
     if (!eligible.length) {
       throw new GatewayRoutingError('no_eligible_candidates', 503, `No eligible channel is available for model: ${modelId}`)
     }
@@ -125,7 +125,8 @@ export function createModelScheduler(config, { reservations = new ChannelReserva
   }
 }
 
-function isEligible(candidate, channelState, candidateState, now) {
+function isEligible(candidate, channelState, candidateState, now, source) {
+  if (candidate.channel.staged && source !== 'manual-test') return false
   const channel = channelState.get(candidate.channelId)
   if (BLOCKED_CHANNEL_STATES.has(channel?.health)) return false
   if (channel?.health === 'cooling') {

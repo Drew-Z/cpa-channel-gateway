@@ -66,6 +66,7 @@ test('synchronizes complete channel inventories while preserving reviewed metada
   const reviewed = result.routes.channels[0].models.find(model => model.upstream === 'Model-A')
   assert.equal(reviewed.maxContextLength, 128000)
   assert.deepEqual(reviewed.thinkingLevels, ['high'])
+  assert.equal(reviewed.status, 'active')
   assert.deepEqual(reviewed.aliases, ['custom-a', 'sample/Model-A'])
   const added = result.routes.channels[0].models.find(model => model.upstream === 'provider/model-b:free')
   assert.deepEqual(added.aliases, ['sample/provider/model-b:free'])
@@ -90,4 +91,6 @@ test('preserves stale models until stable or pinned aliases move away from them'
     preservedReferenced: 1,
     after: 2
   }])
+  assert.equal(result.routes.channels[0].models.find(model => model.upstream === 'old-model').status, 'stale')
+  assert.equal(result.routes.channels[0].models.find(model => model.upstream === 'new-model').status, 'active')
 })

@@ -43,7 +43,7 @@ export function buildCpaConfig(config, channels, routes, runtimePaths) {
     '  session-affinity-ttl: "1h"'
   ]
 
-  const enabled = channels.filter(item => item.enabled)
+  const enabled = channels.filter(item => item.runtimeEnabled ?? item.enabled)
   const compatible = protocolViews(enabled, 'openai-compatible')
   const responses = protocolViews(enabled, 'responses')
   const claude = protocolViews(enabled, 'claude')

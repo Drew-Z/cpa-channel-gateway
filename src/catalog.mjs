@@ -1,10 +1,12 @@
 export function buildModelCatalog(config) {
   const logicalModels = new Map()
   const exactAliases = new Map()
+  const stagedExactAliases = new Map()
   const routeAliases = new Map()
   const candidatesByKey = new Map()
+  const allModels = new Map()
 
-  for (const channel of config.channels.filter(item => item.enabled)) {
+  for (const channel of config.channels.filter(item => item.runtimeEnabled ?? item.enabled)) {
     for (const model of channel.models) {
       const candidate = {
         key: `${channel.id}\0${model.upstream}\0${model.protocol}`,
@@ -18,9 +20,15 @@ export function buildModelCatalog(config) {
         model
       }
       candidatesByKey.set(candidate.key, candidate)
-      if (!logicalModels.has(model.upstream)) logicalModels.set(model.upstream, [])
-      logicalModels.get(model.upstream).push(candidate)
-      for (const alias of model.aliases) exactAliases.set(alias, candidate)
+      if (!allModels.has(model.upstream)) allModels.set(model.upstream, [])
+      allModels.get(model.upstream).push(candidate)
+      if (channel.enabled) {
+        if (!logicalModels.has(model.upstream)) logicalModels.set(model.upstream, [])
+        logicalModels.get(model.upstream).push(candidate)
+        for (const alias of model.aliases) exactAliases.set(alias, candidate)
+      } else if (channel.staged) {
+        stagedExactAliases.set(candidate.directAlias, candidate)
+      }
     }
   }
 
@@ -39,6 +47,8 @@ export function buildModelCatalog(config) {
       if (logicalCandidates) return { requestedModel: modelId, kind: 'logical', candidates: [...logicalCandidates] }
       const exactCandidate = exactAliases.get(modelId)
       if (exactCandidate) return { requestedModel: modelId, kind: 'direct', candidates: [exactCandidate] }
+      const stagedCandidate = stagedExactAliases.get(modelId)
+      if (stagedCandidate) return { requestedModel: modelId, kind: 'staged-direct', candidates: [stagedCandidate] }
       return null
     },
     listPublicModels() {
@@ -55,8 +65,10 @@ export function buildModelCatalog(config) {
       }))
     },
     logicalModels,
+    allModels,
     exactAliases,
-    routeAliases
+    routeAliases,
+    stagedExactAliases
   }
 }
 

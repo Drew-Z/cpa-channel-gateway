@@ -65,6 +65,9 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
     const protocol = (env[`${envPrefix}_PROTOCOL`] || 'openai-compatible').trim()
     if (!['openai-compatible', 'responses', 'claude'].includes(protocol)) errors.push(`${envPrefix}_PROTOCOL is not supported: ${protocol}`)
     const enabledByEnv = parseBoolean(env[`${envPrefix}_ENABLED`] ?? 'true', `${envPrefix}_ENABLED`, errors)
+    const staged = routeChannel.staged ?? false
+    if (typeof staged !== 'boolean') errors.push(`${id}.staged must be boolean`)
+    if (staged && routeChannel.enabled === true) errors.push(`${id} cannot be both enabled and staged`)
     const channelPriority = optionalInteger(routeChannel.priority, `${id}.priority`, errors) ?? 0
     const models = []
     for (const [modelIndex, model] of (routeChannel.models ?? []).entries()) {
@@ -76,6 +79,8 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
       if (!aliases.length) aliases.push(`${id}/${upstreamModel}`)
       else if (!aliases.includes(`${id}/${upstreamModel}`)) aliases.push(`${id}/${upstreamModel}`)
       for (const alias of aliases) validateAlias(alias, `${id}.models[${modelIndex}]`, seenAliases, errors)
+      const status = model.status ?? 'active'
+      if (!['active', 'stale'].includes(status)) errors.push(`${id}.models[${modelIndex}].status is not supported: ${status}`)
       models.push({
         upstream: upstreamModel,
         protocol: modelProtocol,
@@ -85,15 +90,18 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
         maxContextLength: optionalPositiveInteger(model.maxContextLength, `${id}.${upstreamModel}.maxContextLength`, errors),
         inputModalities: normalizeModalities(model.inputModalities, ['text']),
         outputModalities: normalizeModalities(model.outputModalities, ['text']),
-        thinkingLevels: normalizeThinking(model.thinkingLevels)
+        thinkingLevels: normalizeThinking(model.thinkingLevels),
+        status
       })
     }
-    const enabled = Boolean(routeChannel.enabled ?? true) && enabledByEnv
+    const enabled = Boolean(routeChannel.enabled ?? true) && enabledByEnv && !staged
     if (enabled && models.length === 0 && !allowEmptyEnabledChannels) errors.push(`Enabled channel ${id} has no models`)
     const channel = {
       id,
       name: env[`${envPrefix}_NAME`]?.trim() || id,
       enabled,
+      staged: Boolean(staged),
+      runtimeEnabled: (enabled || Boolean(staged)),
       upstream,
       apiKey: secret,
       protocol,

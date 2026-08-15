@@ -17,7 +17,7 @@ export function buildHaproxyConfig(config, channels) {
     `  timeout queue ${config.queue.timeoutSeconds}s`,
     ''
   ]
-  for (const channel of channels.filter(item => item.enabled)) {
+  for (const channel of channels.filter(item => item.runtimeEnabled ?? item.enabled)) {
     const listener = channel.listener
     const backend = `channel_${channel.id.replaceAll('-', '_')}`
     const upstream = channel.upstream
@@ -44,7 +44,7 @@ export function buildHaproxyConfig(config, channels) {
     lines.push(`  server upstream ${address}${tls} maxconn ${config.queue.maxConnectionsPerChannel} maxqueue ${config.queue.maxQueuedPerChannel} check`)
     lines.push('')
   }
-  if (!channels.some(item => item.enabled)) {
+  if (!channels.some(item => item.runtimeEnabled ?? item.enabled)) {
     lines.push('# No enabled channels. Enable at least one channel before starting CPA.')
   }
   return lines.join('\n') + '\n'

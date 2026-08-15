@@ -92,7 +92,7 @@ export function synchronizeRouteModels(routes, discoveries) {
       const prior = existingByUpstream.get(upstream)
       if (!prior?.length) {
         added += 1
-        models.push({ upstream, aliases: [canonicalModelAlias(channel.id, upstream)] })
+        models.push({ upstream, aliases: [canonicalModelAlias(channel.id, upstream)], status: 'active' })
         continue
       }
 
@@ -100,11 +100,18 @@ export function synchronizeRouteModels(routes, discoveries) {
       const hasCanonical = prior.some(model => (model.aliases ?? []).includes(canonical))
       for (const [index, model] of prior.entries()) {
         if (index === 0 && !hasCanonical) {
-          models.push({ ...model, aliases: [...new Set([...(model.aliases ?? []), canonical])] })
+          models.push({ ...model, aliases: [...new Set([...(model.aliases ?? []), canonical])], status: 'active' })
         } else {
-          models.push(model)
+          models.push({ ...model, status: 'active' })
         }
       }
+    }
+
+    for (const model of preserved) {
+      const prior = existingByUpstream.get(model)
+      if (!prior) continue
+      const first = models.find(item => item.upstream === model)
+      if (first) first.status = 'stale'
     }
 
     summaries.push({

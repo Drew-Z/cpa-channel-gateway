@@ -4,6 +4,7 @@
     {
       "id": "sample",
       "enabled": false,
+      "staged": false,
       "priority": 100,
       "models": [
         {

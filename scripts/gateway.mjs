@@ -17,7 +17,7 @@ try {
     console.log(JSON.stringify(publicSummary(config), null, 2))
   } else if (command === 'generate') {
     const generated = generateRelease(root)
-    console.log(JSON.stringify({ digest: generated.digest, channels: generated.channels.map(item => ({ id: item.id, enabled: item.enabled, listener: item.listener })) }, null, 2))
+    console.log(JSON.stringify({ digest: generated.digest, channels: generated.channels.map(item => ({ id: item.id, enabled: item.enabled, staged: item.staged, runtimeEnabled: item.runtimeEnabled, listener: item.listener })) }, null, 2))
   } else if (command === 'activate') {
     const generated = generateRelease(root)
     console.log(JSON.stringify(activateRelease(root, generated), null, 2))
@@ -39,7 +39,7 @@ try {
 
 function publicSummary(config) {
   return {
-    channels: config.channels.map(item => ({ id: item.id, name: item.name, enabled: item.enabled, modelCount: item.models.length, protocol: item.protocol })),
+    channels: config.channels.map(item => ({ id: item.id, name: item.name, enabled: item.enabled, staged: item.staged, runtimeEnabled: item.runtimeEnabled, modelCount: item.models.length, protocol: item.protocol })),
     stableAliases: config.stableAliases.map(item => ({ alias: item.alias, channel: item.channel, model: item.model })),
     pinnedAliases: config.pinnedAliases.map(item => ({ alias: item.alias, channel: item.channel, model: item.model, approvalRef: item.approvalRef })),
     cloudflareTunnel: { enabled: config.cloudflareTunnel.enabled },
@@ -76,7 +76,7 @@ async function start(rootDir) {
     children.push(haproxy)
     outcomes.push(childOutcome(haproxy, 'HAProxy'))
     const haproxyReady = Promise.all(generated.channels
-      .filter(item => item.enabled)
+      .filter(item => item.runtimeEnabled ?? item.enabled)
       .map(item => waitForPort(generated.gateway.internal.host, item.listener, 15_000, { signal: abortController.signal })))
       .then(() => null)
     const early = await Promise.race([haproxyReady, ...outcomes, signalOutcome])

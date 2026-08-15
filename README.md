@@ -48,7 +48,7 @@ Cloudflare Tunnel or direct allocation
 
 2. 在 `channels.local.env` 填写每个渠道的 URL、密钥、默认协议和启用状态。
    使用自有 HTTPS 域名时，再填写私密的 Cloudflare Tunnel Token；未配置时保持关闭。
-3. 执行 `npm run sync:models`，把启用渠道 `/models` 返回的目录同步到私有 routes。每个模型使用 `<渠道ID>/<原始模型ID>` 作为无冲突的公开 ID。
+3. 执行 `npm run sync:models`，把启用渠道 `/models` 返回的目录同步到私有 routes。每个模型使用 `<渠道ID>/<原始模型ID>` 作为无冲突的公开 ID。新渠道默认进入“待测试”状态，只有完成任务型测活后才切换为生产启用。
 4. 在 `routes.local.json` 审核模型协议和能力元数据。单个渠道可以按模型分别覆盖为 `openai-compatible`、`responses` 或 `claude`。
 5. 配置稳定别名；AI Daily 等受审批约束的用途只能使用带 `approvalRef` 的 `pinnedAliases`。
 6. 验证并生成：
@@ -86,7 +86,7 @@ npm run merge:legacy -- /absolute/path/to/channels.local.env
 | Git Repo Address | `https://github.com/Drew-Z/cpa-channel-gateway.git` |
 | Install Branch | `main` |
 | User Uploaded Files | 关闭 |
-| Auto Update | 关闭；升级必须审核固定版本后手动执行 |
+| Auto Update | `1`；公开代码可自动拉取，私有配置仍需手工上传 |
 | Git Username | 留空 |
 | Git Access Token | 留空 |
 | Additional Node Packages | 留空 |
@@ -97,9 +97,9 @@ npm run merge:legacy -- /absolute/path/to/channels.local.env
 
 ### 管理台
 
-`CPA_MANAGEMENT_KEY` 留空时 `/admin` 不开放。填写独立的 32 字符以上随机管理密钥并重启后，访问同一域名的 `/admin` 登录。管理台的会话只保存在 Node 内存中，重启后失效；测活必须填写精确的 `<channel>/<upstream-model-id>`，避免逻辑模型候选变化造成误判。测活使用固定诗词任务、同一渠道互斥租约和相同协议路径，只保存状态摘要、transport、延迟与正文长度，不保存诗词正文。
+`CPA_MANAGEMENT_KEY` 留空时 `/admin` 不开放。填写独立的 32 字符以上随机管理密钥并重启后，访问同一域名的 `/admin` 登录。管理台的会话只保存在 Node 内存中，重启后失效；测活必须填写精确的 `<channel>/<upstream-model-id>`，避免逻辑模型候选变化造成误判。待测试渠道会启动内网 HAProxy/CPA listener，但不会出现在公开 `/v1/models`，也不会被生产调度；只有管理员点击“设为生产”后才会加入统一模型出口。测活使用固定诗词任务、同一渠道互斥租约和相同协议路径，只保存状态摘要、transport、延迟与正文长度，不保存诗词正文。
 
-管理台的渠道列表会向已登录管理员显示经过校验的 Base URL，方便区分名称相近的渠道；公开模型 API、未登录响应和日志不会暴露该地址。管理台还展示滚动 24 小时真实业务请求统计，包括请求总数、成功/失败/取消数量、成功率、逻辑模型、请求入口和实际渠道模型。管理台测活不计入使用统计。统计事件写入 Git 忽略的 `runtime/usage-events.jsonl`，仅包含时间、模型路由、结果和 transport；不保存提示词、响应正文、请求头、密钥、用户标识或请求 ID。成功率按完整返回的 `2xx` 请求数除以全部请求数计算，容器重启后仍可从本地事件文件恢复。
+管理台的渠道列表会向已登录管理员显示经过校验的 Base URL，方便区分名称相近的渠道；公开模型 API、未登录响应和日志不会暴露该地址。管理台可以按渠道显式执行只读 `/models` 同步；同步失败不会改写 routes，成功会先备份并提示需要重启。模型目录中已从上游消失、但仍被 stable/pinned alias 引用的模型会标记为 `stale`，不会自动替换 `coding-backup`。管理台还展示滚动 24 小时真实业务请求统计，包括请求总数、成功/失败/取消数量、成功率、逻辑模型、请求入口和实际渠道模型。管理台测活不计入使用统计。统计事件写入 Git 忽略的 `runtime/usage-events.jsonl`，仅包含时间、模型路由、结果和 transport；不保存提示词、响应正文、请求头、密钥、用户标识或请求 ID。成功率按完整返回的 `2xx` 请求数除以全部请求数计算，容器重启后仍可从本地事件文件恢复。
 
 首次启动会：
 
@@ -120,7 +120,7 @@ npm run sync:models
 npm run check
 ```
 
-同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何启用渠道请求失败或返回空目录时都不会改写 routes；成功时会先创建 `config/routes.local.pre-model-sync-*.json` 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`，未被引用的下线模型会删除。仍被 stable/pinned alias 引用的下线模型会暂时保留，待别名切走后在下次同步清理。
+同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何渠道请求失败或返回空目录时都不会改写 routes；成功时会先创建 `config/routes.local.pre-model-sync-*.json` 或 revision 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`，未被引用的下线模型会删除。仍被 stable/pinned alias 引用的下线模型会保留并标记为 `stale`，待别名切走后在下次同步清理。管理台同步支持显式指定待测试渠道，不会把它们加入公开目录。
 
 上游 `/models` 可能同时列出生成、embedding、reranker 或语音模型。目录同步只证明“上游声明存在”，不证明它支持当前渠道默认协议；正式使用前仍要按能力执行任务型 canary。
 

@@ -17,7 +17,7 @@ export function generateRelease(root) {
   const manifest = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
-    channels: channels.map(channel => ({ id: channel.id, enabled: channel.enabled, listener: channel.listener, modelCount: channel.models.length })),
+    channels: channels.map(channel => ({ id: channel.id, enabled: channel.enabled, staged: channel.staged, runtimeEnabled: channel.runtimeEnabled, listener: channel.listener, modelCount: channel.models.length })),
     files: ['cpa/config.yaml', 'haproxy/haproxy.cfg']
   }
   const digest = crypto.createHash('sha256').update(cpa).update('\0').update(haproxy).digest('hex').slice(0, 16)

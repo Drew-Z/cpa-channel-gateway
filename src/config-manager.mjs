@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { loadConfig } from './config.mjs'
 import { parseEnv, serializeEnv } from './env.mjs'
+import { fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from './model-sync.mjs'
 
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const PROTOCOLS = new Set(['openai-compatible', 'responses', 'claude'])
@@ -16,12 +17,13 @@ export class ConfigMutationError extends Error {
   }
 }
 
-export function createPrivateConfigManager(config) {
+export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
   if (!config.paths?.routesPath || !config.paths?.envPath) return null
   const routesPath = config.paths.routesPath
   const envPath = config.paths.envPath
   const root = path.dirname(path.dirname(routesPath))
   const initialRevision = currentRevision()
+  let modelSyncActive = false
 
   return {
     status() {
@@ -42,8 +44,8 @@ export function createPrivateConfigManager(config) {
         env[`${prefix}_PROTOCOL`] = values.protocol
         env[`${prefix}_ENABLED`] = 'false'
         routes.channels ??= []
-        routes.channels.push({ id, enabled: false, priority: values.priority, models: [] })
-        return { id, name: values.name, enabled: false, protocol: values.protocol, priority: values.priority, modelCount: 0, hasApiKey: true }
+        routes.channels.push({ id, enabled: false, staged: true, priority: values.priority, models: [] })
+        return { id, name: values.name, enabled: false, staged: true, protocol: values.protocol, priority: values.priority, modelCount: 0, hasApiKey: true }
       })
     },
     updateChannel(idValue, input) {
@@ -61,11 +63,19 @@ export function createPrivateConfigManager(config) {
           channel.enabled = values.enabled
           env[`${prefix}_ENABLED`] = String(values.enabled)
         }
+        if (values.staged !== undefined) {
+          channel.staged = values.staged
+          if (values.staged) {
+            channel.enabled = false
+            env[`${prefix}_ENABLED`] = 'false'
+          }
+        }
         if (values.priority !== undefined) channel.priority = values.priority
         return {
           id,
           name: env[`${prefix}_NAME`] || id,
           enabled: Boolean(channel.enabled),
+          staged: Boolean(channel.staged),
           protocol: env[`${prefix}_PROTOCOL`] || 'openai-compatible',
           priority: channel.priority ?? 0,
           modelCount: (channel.models ?? []).length,
@@ -81,7 +91,7 @@ export function createPrivateConfigManager(config) {
         const channel = routes.channels[index]
         const prefix = envPrefix(id)
         const enabledByEnv = !/^(false|0)$/i.test(env[`${prefix}_ENABLED`] ?? 'true')
-        if (channel.enabled !== false && enabledByEnv) {
+        if ((channel.enabled !== false && enabledByEnv) || channel.staged === true) {
           throw new ConfigMutationError('channel_must_be_disabled', 409, 'Disable the channel before deleting it')
         }
         if ([...(routes.stableAliases ?? []), ...(routes.pinnedAliases ?? [])].some(route => route.channel === id)) {
@@ -91,10 +101,55 @@ export function createPrivateConfigManager(config) {
         for (const key of Object.keys(env)) if (key.startsWith(`${prefix}_`)) delete env[key]
         return { id, deleted: true }
       })
+    },
+    async syncModels(requestedIds = []) {
+      if (modelSyncActive) throw new ConfigMutationError('model_sync_in_progress', 409, 'A model synchronization is already in progress')
+      modelSyncActive = true
+      try {
+        const current = loadConfig(root, { allowEmptyEnabledChannels: true })
+        let selected
+        try {
+          selected = selectChannelsForSync(current.channels, requestedIds)
+        } catch (error) {
+          throw new ConfigMutationError('invalid_sync_channels', 400, error instanceof Error ? error.message : 'Invalid channels requested for synchronization')
+        }
+        if (!selected.length) throw new ConfigMutationError('no_sync_channels', 400, 'No channels are available for model synchronization')
+        const discoveries = new Map()
+        try {
+          for (const channel of selected) discoveries.set(channel.id, await fetchChannelModels(channel, { fetchImpl }))
+        } catch (error) {
+          throw new ConfigMutationError('model_sync_failed', 502, error instanceof Error ? error.message : 'Model synchronization failed')
+        }
+        const { routes, summaries } = synchronizeRouteModels(current.routes, discoveries)
+        const originalRoutes = fs.readFileSync(routesPath, 'utf8')
+        const nextRoutes = JSON.stringify(routes, null, 2) + '\n'
+        if (nextRoutes === originalRoutes) return { changed: false, channels: summaries, revision: currentRevision(), restartRequired: false }
+        const revision = digest(fs.readFileSync(envPath, 'utf8'), nextRoutes)
+        const backupDir = path.join(root, 'runtime', 'config-revisions', `${timestamp()}-${revision}`)
+        fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 })
+        fs.writeFileSync(path.join(backupDir, 'routes.local.json'), originalRoutes, { mode: 0o600 })
+        try {
+          atomicWrite(routesPath, nextRoutes)
+          loadConfig(root, { allowEmptyEnabledChannels: true })
+        } catch (error) {
+          atomicWrite(routesPath, originalRoutes)
+          throw new ConfigMutationError('configuration_validation_failed', 400, error instanceof Error ? error.message : 'Configuration validation failed')
+        }
+        return {
+          changed: true,
+          channels: summaries,
+          backup: path.relative(root, path.join(backupDir, 'routes.local.json')).replaceAll('\\', '/'),
+          revision,
+          restartRequired: revision !== initialRevision
+        }
+      } finally {
+        modelSyncActive = false
+      }
     }
   }
 
   function mutate(change) {
+    if (modelSyncActive) throw new ConfigMutationError('model_sync_in_progress', 409, 'Configuration changes are paused while model synchronization is in progress')
     const originalEnv = fs.readFileSync(envPath, 'utf8')
     const originalRoutes = fs.readFileSync(routesPath, 'utf8')
     const env = parseEnv(originalEnv)
@@ -161,6 +216,10 @@ function validateChannelInput(input, { partial = false, requireApiKey = false } 
   if (input.enabled !== undefined) {
     if (typeof input.enabled !== 'boolean') throw new ConfigMutationError('invalid_enabled', 400, 'Channel enabled must be a boolean')
     result.enabled = input.enabled
+  }
+  if (input.staged !== undefined) {
+    if (typeof input.staged !== 'boolean') throw new ConfigMutationError('invalid_staged', 400, 'Channel staged must be a boolean')
+    result.staged = input.staged
   }
   return result
 }

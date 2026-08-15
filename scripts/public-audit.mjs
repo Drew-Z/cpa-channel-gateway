@@ -17,7 +17,7 @@ const secretPatterns = [
   ['credentialed-url', /https?:\/\/[^\s/:]+:[^\s/@]+@[^\s/]+/]
 ]
 const assignmentPattern = /(?:^|[\r\n])\s*(?:[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)|["'](?:apiKey|token|secret|password)["'])\s*[:=]\s*["']?([^\s,"'#}]{8,})/gi
-const placeholderPattern = /replace|example|dummy|fixture|test|process\.env|env\[|invalid|secret-(?:chat|responses|claude)|<[^>]+>/i
+const placeholderPattern = /replace|example|dummy|fixture|legacy-|(?:gateway|management|old|new|free\d*)-key$|test|process\.env|env\[|invalid|secret-(?:chat|responses|claude)|<[^>]+>/i
 
 const trackedPaths = gitText(['ls-files', '-z']).split('\0').filter(Boolean)
 for (const trackedPath of trackedPaths) {
