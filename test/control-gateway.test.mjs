@@ -368,6 +368,7 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.notEqual(first.headers['content-security-policy'], second.headers['content-security-policy'])
   assert.match(first.body, /id="addChannelForm"/)
   assert.match(first.body, /id="usage"/)
+  assert.match(first.body, /channel-discovery/)
   assert.match(first.body, /\/admin\/api\/usage/)
   assert.match(first.body, /\/admin\/api\/model-sync/)
   assert.match(first.body, /待测试渠道/)

@@ -30,6 +30,57 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       const revision = currentRevision()
       return { revision, restartRequired: revision !== initialRevision }
     },
+    discoverChannels() {
+      const env = parseEnv(fs.readFileSync(envPath, 'utf8'))
+      const diskRoutes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+      const diskIds = new Set((diskRoutes.channels ?? []).map(channel => String(channel.id).toLowerCase()))
+      const runtimeIds = new Set(config.channels.map(channel => channel.id))
+      const grouped = new Map()
+      for (const key of Object.keys(env)) {
+        const match = /^CHANNEL_([A-Z][A-Z0-9_]*)_(NAME|BASE_URL|API_KEY|PROTOCOL|ENABLED)$/.exec(key)
+        if (!match) continue
+        const id = match[1].toLowerCase().replaceAll('_', '-')
+        const entry = grouped.get(id) ?? { id, prefix: match[1], values: {} }
+        entry.values[match[2]] = env[key]?.trim() ?? ''
+        grouped.set(id, entry)
+      }
+      const unregistered = []
+      const pendingRestart = []
+      for (const entry of grouped.values()) {
+        const values = entry.values
+        const missing = []
+        if (!values.NAME) missing.push('NAME')
+        if (!values.BASE_URL) missing.push('BASE_URL')
+        if (!values.API_KEY || values.API_KEY.includes('replace-me') || values.API_KEY.includes('replace-with')) missing.push('API_KEY')
+        if (!values.PROTOCOL) missing.push('PROTOCOL')
+        if (values.BASE_URL) {
+          try {
+            const url = new URL(values.BASE_URL)
+            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) missing.push('BASE_URL')
+          } catch {
+            missing.push('BASE_URL')
+          }
+        }
+        if (values.PROTOCOL && !PROTOCOLS.has(values.PROTOCOL)) missing.push('PROTOCOL')
+        const summary = {
+          id: entry.id,
+          name: values.NAME || entry.id,
+          baseUrl: values.BASE_URL || '',
+          protocol: values.PROTOCOL || 'openai-compatible',
+          enabledByEnv: !/^(false|0)$/i.test(values.ENABLED ?? 'true'),
+          hasApiKey: Boolean(values.API_KEY),
+          ready: missing.length === 0,
+          missing
+        }
+        if (!diskIds.has(entry.id)) unregistered.push(summary)
+        else if (!runtimeIds.has(entry.id)) pendingRestart.push(summary)
+      }
+      return {
+        unregistered: unregistered.sort((left, right) => left.id.localeCompare(right.id)),
+        pendingRestart: pendingRestart.sort((left, right) => left.id.localeCompare(right.id)),
+        restartRequired: this.status().restartRequired
+      }
+    },
     createChannel(input) {
       return mutate(({ routes, env }) => {
         const id = normalizeChannelId(input.id)
@@ -42,6 +93,26 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
         env[`${prefix}_BASE_URL`] = values.baseUrl
         env[`${prefix}_API_KEY`] = values.apiKey
         env[`${prefix}_PROTOCOL`] = values.protocol
+        env[`${prefix}_ENABLED`] = 'false'
+        routes.channels ??= []
+        routes.channels.push({ id, enabled: false, staged: true, priority: values.priority, models: [] })
+        return { id, name: values.name, enabled: false, staged: true, protocol: values.protocol, priority: values.priority, modelCount: 0, hasApiKey: true }
+      })
+    },
+    importChannel(idValue) {
+      return mutate(({ routes, env }) => {
+        const id = normalizeChannelId(idValue)
+        if ((routes.channels ?? []).some(channel => channel.id === id)) {
+          throw new ConfigMutationError('channel_exists', 409, `Channel already exists: ${id}`)
+        }
+        const prefix = envPrefix(id)
+        const values = validateChannelInput({
+          name: env[`${prefix}_NAME`],
+          baseUrl: env[`${prefix}_BASE_URL`],
+          apiKey: env[`${prefix}_API_KEY`],
+          protocol: env[`${prefix}_PROTOCOL`] || 'openai-compatible',
+          priority: 0
+        }, { requireApiKey: true })
         env[`${prefix}_ENABLED`] = 'false'
         routes.channels ??= []
         routes.channels.push({ id, enabled: false, staged: true, priority: values.priority, models: [] })

@@ -74,6 +74,27 @@ test('admin model synchronization is read-only upstream, revisioned, and marks d
   assert.equal(loadConfig(root).channels[0].models.some(model => model.upstream === 'model-b'), true)
 })
 
+test('discovers env-only channels and imports them as staged without exposing the API key', () => {
+  const root = fixtureRoot()
+  fs.appendFileSync(path.join(root, 'config', 'channels.local.env'), '\n' + [
+    'CHANNEL_NEW_NAME=New Channel',
+    'CHANNEL_NEW_BASE_URL=https://new.example.test/v1',
+    'CHANNEL_NEW_API_KEY=fixture-new-channel-key',
+    'CHANNEL_NEW_PROTOCOL=responses',
+    'CHANNEL_NEW_ENABLED=true'
+  ].join('\n') + '\n')
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const discovered = manager.discoverChannels()
+  assert.equal(discovered.unregistered[0].id, 'new')
+  assert.equal(discovered.unregistered[0].ready, true)
+  assert.equal(JSON.stringify(discovered).includes('fixture-new-channel-key'), false)
+
+  const imported = manager.importChannel('new')
+  assert.equal(imported.staged, true)
+  assert.equal(loadConfig(root).channels.find(channel => channel.id === 'new').runtimeEnabled, true)
+  assert.ok(manager.discoverChannels().pendingRestart.some(channel => channel.id === 'new'))
+})
+
 function fixtureRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-config-manager-'))
   fs.mkdirSync(path.join(root, 'config'))
