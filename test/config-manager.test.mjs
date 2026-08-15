@@ -74,6 +74,33 @@ test('admin model synchronization is read-only upstream, revisioned, and marks d
   assert.equal(loadConfig(root).channels[0].models.some(model => model.upstream === 'model-b'), true)
 })
 
+test('a newly created staged channel can be synchronized without enabling it', async () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root), {
+    fetchImpl: async (url, options) => {
+      assert.equal(url.toString(), 'https://new.example.test/v1/models')
+      assert.equal(options.headers.Authorization, 'Bearer new_channel_key_123456')
+      return { ok: true, status: 200, json: async () => ({ data: [{ id: 'new-model' }] }) }
+    }
+  })
+  const created = manager.createChannel({
+    id: 'new',
+    name: 'New Channel',
+    baseUrl: 'https://new.example.test/v1',
+    apiKey: 'new_channel_key_123456',
+    protocol: 'openai-compatible',
+    priority: 5
+  })
+  const synced = await manager.syncModels(['new'])
+  assert.equal(created.staged, true)
+  assert.equal(synced.changed, true)
+  assert.equal(synced.channels[0].discovered, 1)
+  const loaded = loadConfig(root)
+  assert.equal(loaded.channels.find(channel => channel.id === 'new').staged, true)
+  assert.equal(loaded.channels.find(channel => channel.id === 'new').enabled, false)
+  assert.equal(loaded.channels.find(channel => channel.id === 'new').models[0].upstream, 'new-model')
+})
+
 test('discovers env-only channels and imports them as staged without exposing the API key', () => {
   const root = fixtureRoot()
   fs.appendFileSync(path.join(root, 'config', 'channels.local.env'), '\n' + [
