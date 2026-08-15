@@ -320,6 +320,9 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.equal(first.headers['cache-control'], 'no-store')
   assert.match(first.headers['content-security-policy'], /script-src 'nonce-/)
   assert.notEqual(first.headers['content-security-policy'], second.headers['content-security-policy'])
+  assert.match(first.body, /id="addChannelForm"/)
+  assert.match(first.body, /mode:'same-origin'/)
+  assert.match(first.body, /headers\['x-csrf-token'\]=csrf/)
 })
 
 const GATEWAY_KEY = 'fixture_gateway_key_that_is_long_enough_123456'
