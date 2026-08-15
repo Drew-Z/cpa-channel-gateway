@@ -130,6 +130,13 @@ test('busy channels return 429 without creating another upstream request', async
   })
   assert.equal(afterRelease.statusCode, 200)
   assert.equal(upstreamCalls, 2)
+  const usage = gateway.usageMonitor.snapshot()
+  assert.equal(usage.summary.total, 3)
+  assert.equal(usage.summary.success, 2)
+  assert.equal(usage.summary.failure, 1)
+  assert.equal(usage.summary.successRate, 66.67)
+  assert.equal(usage.logicalModels[0].total, 3)
+  assert.equal(usage.physicalModels[0].total, 2)
 })
 
 test('client disconnect releases the channel reservation', async t => {
@@ -178,6 +185,10 @@ test('client disconnect releases the channel reservation', async t => {
   })
   assert.equal(afterDisconnect.statusCode, 200)
   assert.equal(upstreamCalls, 2)
+  const usage = gateway.usageMonitor.snapshot()
+  assert.equal(usage.summary.total, 2)
+  assert.equal(usage.summary.success, 1)
+  assert.equal(usage.summary.cancelled, 1)
 })
 
 test('an upstream transport failure is not replayed on another candidate', async t => {
@@ -298,6 +309,35 @@ test('admin session protects status and runs a redacted exact-model canary', asy
   assert.equal(upstreamBody.model, 'shared-model')
   assert.match(upstreamBody.input, /秋夜读书/)
 
+  const beforeUsage = await request({ port: address.port, method: 'GET', path: '/admin/api/usage', headers: { cookie } })
+  assert.equal(beforeUsage.statusCode, 200)
+  assert.equal(JSON.parse(beforeUsage.body).summary.total, 0)
+
+  const production = await request({
+    port: address.port,
+    path: '/v1/responses',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'coding-main', input: 'real business request' }
+  })
+  assert.equal(production.statusCode, 200)
+
+  const usageResult = await request({ port: address.port, method: 'GET', path: '/admin/api/usage', headers: { cookie } })
+  const usage = JSON.parse(usageResult.body)
+  assert.equal(usage.summary.total, 1)
+  assert.equal(usage.summary.success, 1)
+  assert.equal(usage.models[0].id, 'coding-main')
+  assert.equal(usage.logicalModels[0].id, 'shared-model')
+  assert.equal(usage.physicalModels[0].id, 'free/shared-model')
+
+  const unknownModel = await request({
+    port: address.port,
+    path: '/v1/responses',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'unknown-model', input: 'invalid route' }
+  })
+  assert.equal(unknownModel.statusCode, 404)
+  assert.equal(gateway.usageMonitor.snapshot().summary.total, 1)
+
   const logicalRejected = await request({
     port: address.port,
     path: '/admin/api/tests',
@@ -321,6 +361,8 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.headers['content-security-policy'], /script-src 'nonce-/)
   assert.notEqual(first.headers['content-security-policy'], second.headers['content-security-policy'])
   assert.match(first.body, /id="addChannelForm"/)
+  assert.match(first.body, /id="usage"/)
+  assert.match(first.body, /\/admin\/api\/usage/)
   assert.match(first.body, /mode:'same-origin'/)
   assert.match(first.body, /headers\['x-csrf-token'\]=csrf/)
 })

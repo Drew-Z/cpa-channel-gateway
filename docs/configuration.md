@@ -41,6 +41,16 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道。请求必须带会话 CSRF token 和同源 `Origin`；API key 只写入服务器，不在响应中返回。成功响应为 `202`，包含脱敏的 `revision` 与 `restartRequired: true`；当前进程不会静默热切换，需按部署流程重启以应用新 revision。所有变更先备份到 `runtime/config-revisions/`，验证失败自动恢复。
 
+`GET /admin/api/usage` 返回最近 24 小时真实业务请求的低敏聚合结果。统计口径如下：
+
+- 完整返回 `2xx` 为成功；上游非 `2xx`、transport 错误、无可用候选和全部候选繁忙为失败；客户端主动断开为取消。
+- 成功率为 `success / total`，因此取消也计入总请求数。
+- 同时按逻辑模型、客户端请求入口、实际 `<channel>/<upstream-model>` 和渠道聚合；管理台任务型测活不计入。
+- 原始低敏事件保存在 `runtime/usage-events.jsonl` 并定期压缩，只保留计算滚动窗口所需的短期记录。文件不包含提示词、响应正文、HTTP 请求头、密钥、用户标识、请求 ID 或错误正文。
+- 私有配置路径不可用时使用进程内统计；磁盘写入失败时管理 API 报告 `storage: memory-fallback`，但统计故障不会改变业务请求结果。
+
+完整字段、边界和测试契约见 [24 小时模型使用监控](usage-monitoring.md)。
+
 ## Routes
 
 模型级 `protocol` 可以覆盖渠道默认值。同一物理渠道的所有协议仍使用同一个 HAProxy listener，因此共享一个并发槽。

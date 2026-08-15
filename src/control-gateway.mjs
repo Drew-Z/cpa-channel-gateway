@@ -3,6 +3,7 @@ import http from 'node:http'
 import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol } from './canary.mjs'
 import { ConfigMutationError, createPrivateConfigManager } from './config-manager.mjs'
 import { createModelScheduler, GatewayRoutingError } from './scheduler.mjs'
+import { createUsageMonitor } from './usage-monitor.mjs'
 
 const API_PATHS = new Set(['/v1/responses', '/v1/chat/completions', '/v1/messages'])
 const HOP_BY_HOP = new Set([
@@ -20,7 +21,10 @@ const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000
 const ADMIN_TEST_COOLDOWN_MS = 5_000
 const CANARY_PROMPT = '请写一首四句七言绝句，主题是秋夜读书。只输出诗题和诗句。'
 
-export function createControlGateway(config, { scheduler = createModelScheduler(config) } = {}) {
+export function createControlGateway(config, {
+  scheduler = createModelScheduler(config),
+  usageMonitor = createUsageMonitor(config)
+} = {}) {
   const maxRequestBytes = config.gateway.control.maxRequestBytes
   const cpaPort = config.gateway.internal.cpaPort
   const sessions = new Map()
@@ -70,10 +74,24 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
     const body = await readJsonBody(request, maxRequestBytes)
     const requestedModel = typeof body.model === 'string' ? body.model.trim() : ''
     if (!requestedModel) throw publicError('invalid_request', 400, 'Request body must include a model')
-    const selection = scheduler.reserve(requestedModel, {
-      requestId: request.headers['x-request-id'],
-      source: 'production'
-    })
+    let selection
+    try {
+      selection = scheduler.reserve(requestedModel, {
+        requestId: request.headers['x-request-id'],
+        source: 'production'
+      })
+    } catch (error) {
+      if (error instanceof GatewayRoutingError && ['all_candidates_busy', 'no_eligible_candidates'].includes(error.code)) {
+        const resolved = scheduler.catalog.resolve(requestedModel)
+        usageMonitor.record({
+          requestedModel,
+          upstreamModel: resolved?.candidates[0]?.upstreamModel,
+          outcome: 'failure',
+          transport: 'unassigned'
+        })
+      }
+      throw error
+    }
     const transport = url.pathname === '/v1/responses' && selection.candidate.protocol === 'responses'
       ? 'native-passthrough'
       : 'adapted'
@@ -83,7 +101,7 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
         ? selection.candidate.upstreamModel
         : selection.candidate.directAlias
     }
-    await proxyRequest({ request, response, url, outboundBody, selection, transport })
+    await proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel })
   }
 
   async function handleAdminRequest(request, response, url) {
@@ -119,6 +137,10 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
     }
     if (url.pathname === '/admin/api/models' && request.method === 'GET') {
       sendJson(response, 200, { data: adminModels() })
+      return
+    }
+    if (url.pathname === '/admin/api/usage' && request.method === 'GET') {
+      sendJson(response, 200, usageMonitor.snapshot({ hours: 24 }))
       return
     }
     if (url.pathname === '/admin/api/config' && request.method === 'GET') {
@@ -350,7 +372,7 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
       }))
   }
 
-  function proxyRequest({ request, response, url, outboundBody, selection, transport }) {
+  function proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel }) {
     return new Promise(resolve => {
       const payload = Buffer.from(JSON.stringify(outboundBody))
       const native = transport === 'native-passthrough'
@@ -371,9 +393,16 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
       let completed = false
       let clientClosed = false
       let upstreamRequest
-      const finish = () => {
+      const finish = outcome => {
         if (completed) return
         completed = true
+        usageMonitor.record({
+          requestedModel,
+          channelId: selection.candidate.channelId,
+          upstreamModel: selection.candidate.upstreamModel,
+          outcome,
+          transport
+        })
         selection.release()
         resolve()
       }
@@ -381,7 +410,7 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
         if (response.writableEnded) return
         clientClosed = true
         upstreamRequest?.destroy()
-        finish()
+        finish('cancelled')
       }
       response.once('close', onClientClose)
 
@@ -392,14 +421,15 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
         method: 'POST',
         headers
       }, upstreamResponse => {
-        scheduler.recordOutcome(selection, upstreamResponse.statusCode ?? 502, upstreamResponse.headers)
+        const statusCode = upstreamResponse.statusCode ?? 502
+        scheduler.recordOutcome(selection, statusCode, upstreamResponse.headers)
         const responseHeaders = filteredResponseHeaders(upstreamResponse.headers)
-        response.writeHead(upstreamResponse.statusCode ?? 502, responseHeaders)
-        upstreamResponse.once('end', finish)
-        upstreamResponse.once('close', finish)
+        response.writeHead(statusCode, responseHeaders)
+        upstreamResponse.once('end', () => finish(statusCode >= 200 && statusCode < 300 ? 'success' : 'failure'))
+        upstreamResponse.once('close', () => finish('failure'))
         upstreamResponse.once('error', error => {
           if (!clientClosed) response.destroy(error)
-          finish()
+          finish('failure')
         })
         upstreamResponse.pipe(response)
       })
@@ -414,7 +444,7 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
           if (!response.headersSent) sendJson(response, 502, { error: { code: 'upstream_unavailable', message: 'Upstream request failed' } })
           else response.destroy(error)
         }
-        finish()
+        finish('failure')
       })
       upstreamRequest.end(payload)
     })
@@ -423,6 +453,7 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
   return {
     server,
     scheduler,
+    usageMonitor,
     listen({ host = config.gateway.public.host, port } = {}) {
       const listenPort = port ?? Number(process.env[config.gateway.public.portEnv] || process.env.SERVER_PORT || process.env.PORT || config.gateway.public.defaultPort)
       return new Promise((resolve, reject) => {
@@ -600,15 +631,18 @@ function sendHtml(response, html, nonce) {
 function adminHtml(nonce) {
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA Channel Gateway</title>
-<style nonce="${nonce}">*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#f5f7fb;color:#152033;margin:0}main{max-width:1100px;margin:2rem auto;padding:0 1rem}section{background:#fff;border:1px solid #dce3ef;border-radius:8px;padding:1rem;margin:1rem 0;box-shadow:0 2px 10px #1520330d}h1{font-size:1.35rem}h2{font-size:1.05rem;margin:1.25rem 0 .7rem}button{border:0;border-radius:8px;padding:.6rem .9rem;background:#2458d6;color:#fff;cursor:pointer}button.secondary{background:#526078}button:disabled{opacity:.6;cursor:wait}input,select{padding:.6rem;border:1px solid #b8c3d5;border-radius:8px;width:100%;min-width:0;background:#fff;color:inherit}.toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:.65rem;align-items:end}.toolbar label{display:grid;gap:.25rem;font-size:.8rem;color:#637089}.toolbar button{width:100%}#channels,#models{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e8edf4;padding:.55rem;font-size:.9rem;white-space:nowrap}.muted{color:#637089}.error{color:#b42318}.ok{color:#067647}.busy{color:#b54708}</style></head>
+<style nonce="${nonce}">*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#f5f7fb;color:#152033;margin:0}main{max-width:1100px;margin:2rem auto;padding:0 1rem}section{background:#fff;border:1px solid #dce3ef;border-radius:8px;padding:1rem;margin:1rem 0;box-shadow:0 2px 10px #1520330d}h1{font-size:1.35rem}h2{font-size:1.05rem;margin:1.25rem 0 .7rem}h3{font-size:.95rem;margin:1rem 0 .5rem}button{border:0;border-radius:8px;padding:.6rem .9rem;background:#2458d6;color:#fff;cursor:pointer}button.secondary{background:#526078}button:disabled{opacity:.6;cursor:wait}input,select{padding:.6rem;border:1px solid #b8c3d5;border-radius:8px;width:100%;min-width:0;background:#fff;color:inherit}.toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:.65rem;align-items:end}.toolbar label{display:grid;gap:.25rem;font-size:.8rem;color:#637089}.toolbar button{width:100%}#channels,#models,#usage{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e8edf4;padding:.55rem;font-size:.9rem;white-space:nowrap}.muted{color:#637089}.error{color:#b42318}.ok{color:#067647}.busy{color:#b54708}</style></head>
 <body><main><h1>CPA Channel Gateway 管理台</h1><section id="login"><p class="muted">管理密钥只用于建立内存会话，重启后自动失效。</p><input id="key" type="password" autocomplete="current-password" placeholder="CPA_MANAGEMENT_KEY"><button id="loginButton">登录</button><p id="loginError" class="error"></p></section>
-<section id="app" hidden><p><button id="refreshButton">刷新状态</button> <button id="logoutButton" class="secondary">退出</button> <span id="summary" class="muted"></span></p><div id="channels"></div><h2>新增渠道</h2><form id="addChannelForm" class="toolbar"><label>渠道 ID<input id="channelId" required pattern="[a-z][a-z0-9-]{0,31}" maxlength="32" autocomplete="off"></label><label>名称<input id="channelName" required maxlength="80"></label><label>Base URL<input id="channelUrl" required type="url" autocomplete="url"></label><label>API key<input id="channelKey" required type="password" minlength="8" autocomplete="new-password"></label><label>协议<select id="channelProtocol"><option value="responses">responses</option><option value="openai-compatible">openai-compatible</option><option value="claude">claude</option></select></label><label>优先级<input id="channelPriority" required type="number" step="1" value="0"></label><button id="addChannelButton" type="submit">新增禁用渠道</button></form><p id="channelResult"></p><h2>模型测活</h2><div class="toolbar"><label>精确模型 ID<input id="model" placeholder="例如 free/gpt-4o" autocomplete="off"></label><button id="testButton" type="button">测试模型</button></div><p id="testResult"></p><h2>模型目录</h2><div id="models"></div></section></main>
+<section id="app" hidden><p><button id="refreshButton">刷新状态</button> <button id="logoutButton" class="secondary">退出</button> <span id="summary" class="muted"></span></p><div id="channels"></div><h2>最近 24 小时</h2><p class="muted">仅统计真实业务请求；管理台模型测活不计入。成功率按成功请求数除以全部请求数计算。</p><div id="usage"></div><h2>新增渠道</h2><form id="addChannelForm" class="toolbar"><label>渠道 ID<input id="channelId" required pattern="[a-z][a-z0-9-]{0,31}" maxlength="32" autocomplete="off"></label><label>名称<input id="channelName" required maxlength="80"></label><label>Base URL<input id="channelUrl" required type="url" autocomplete="url"></label><label>API key<input id="channelKey" required type="password" minlength="8" autocomplete="new-password"></label><label>协议<select id="channelProtocol"><option value="responses">responses</option><option value="openai-compatible">openai-compatible</option><option value="claude">claude</option></select></label><label>优先级<input id="channelPriority" required type="number" step="1" value="0"></label><button id="addChannelButton" type="submit">新增禁用渠道</button></form><p id="channelResult"></p><h2>模型测活</h2><div class="toolbar"><label>精确模型 ID<input id="model" placeholder="例如 free/gpt-4o" autocomplete="off"></label><button id="testButton" type="button">测试模型</button></div><p id="testResult"></p><h2>模型目录</h2><div id="models"></div></section></main>
 <script nonce="${nonce}">
 let csrf='';
 const $=id=>document.getElementById(id);
 async function call(path, options={}){const method=(options.method||'GET').toUpperCase();const headers={'content-type':'application/json',...(options.headers||{})};if(!['GET','HEAD','OPTIONS'].includes(method)&&csrf)headers['x-csrf-token']=csrf;const r=await fetch(path,{...options,mode:'same-origin',credentials:'same-origin',headers});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error?.message||'请求失败');return data}
 async function login(){try{const data=await call('/admin/api/session',{method:'POST',body:JSON.stringify({key:$('key').value})});csrf=data.csrfToken;$('login').hidden=true;$('app').hidden=false;await refresh()}catch(e){$('loginError').textContent=e.message}}
-async function refresh(){try{const [status,models]=await Promise.all([call('/admin/api/status'),call('/admin/api/models')]);$('summary').textContent='当前预约 '+status.reservations.length+' 个';$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td class="'+(c.busy?'busy':'')+'">'+(c.busy?'busy':'idle')+'</td><td>'+c.modelCount+'</td><td>'+esc(c.health)+'</td><td><button class="toggleChannel" data-id="'+esc(c.id)+'" data-enabled="'+(!c.enabled)+'">'+(c.enabled?'停用':'启用')+'</button> '+(c.enabled||c.busy?'':'<button class="deleteChannel secondary" data-id="'+esc(c.id)+'">删除</button>')+'</td></tr>').join('')+'</table>';$('models').innerHTML='<table><tr><th>公开 ID</th><th>候选</th></tr>'+models.data.map(m=>'<tr><td>'+esc(m.id)+'</td><td>'+m.candidates.map(c=>esc(c.channel)+'/'+esc(c.upstreamModel)+' ['+esc(c.protocol)+(c.busy?', busy':'')+']').join('<br>')+'</td></tr>').join('')+'</table>'}catch(e){$('summary').textContent=e.message}}
+async function refresh(){try{const [status,models,usage]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage')]);$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次';$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td class="'+(c.busy?'busy':'')+'">'+(c.busy?'busy':'idle')+'</td><td>'+c.modelCount+'</td><td>'+esc(c.health)+'</td><td><button class="toggleChannel" data-id="'+esc(c.id)+'" data-enabled="'+(!c.enabled)+'">'+(c.enabled?'停用':'启用')+'</button> '+(c.enabled||c.busy?'':'<button class="deleteChannel secondary" data-id="'+esc(c.id)+'">删除</button>')+'</td></tr>').join('')+'</table>';$('usage').innerHTML=usageHtml(usage);$('models').innerHTML='<table><tr><th>公开 ID</th><th>候选</th></tr>'+models.data.map(m=>'<tr><td>'+esc(m.id)+'</td><td>'+m.candidates.map(c=>esc(c.channel)+'/'+esc(c.upstreamModel)+' ['+esc(c.protocol)+(c.busy?', busy':'')+']').join('<br>')+'</td></tr>').join('')+'</table>'}catch(e){$('summary').textContent=e.message}}
+function usageHtml(data){const s=data.summary;const overall='<table><tr><th>请求</th><th>成功</th><th>失败</th><th>取消</th><th>成功率</th><th>存储</th></tr><tr><td>'+s.total+'</td><td>'+s.success+'</td><td>'+s.failure+'</td><td>'+s.cancelled+'</td><td>'+rate(s.successRate)+'</td><td>'+esc(data.storage)+'</td></tr></table>';if(!s.total)return overall+'<p class="muted">最近 24 小时还没有真实业务请求。</p>';const logical=data.logicalModels.length?'<h3>逻辑模型</h3>'+statsTable(data.logicalModels):'';const requested=data.models.length?'<h3>请求入口</h3>'+statsTable(data.models):'';const physical=data.physicalModels.length?'<h3>实际渠道模型</h3>'+statsTable(data.physicalModels):'';return overall+logical+requested+physical}
+function statsTable(items){return '<table><tr><th>模型</th><th>请求</th><th>成功</th><th>失败</th><th>取消</th><th>成功率</th><th>最后请求</th></tr>'+items.map(item=>'<tr><td>'+esc(item.id)+'</td><td>'+item.total+'</td><td>'+item.success+'</td><td>'+item.failure+'</td><td>'+item.cancelled+'</td><td>'+rate(item.successRate)+'</td><td>'+esc(item.lastSeenAt||'-')+'</td></tr>').join('')+'</table>'}
+function rate(value){return value===null?'—':value.toFixed(2)+'%'}
 async function addChannel(){const button=$('addChannelButton');if(!$('addChannelForm').reportValidity())return;button.disabled=true;try{const data=await call('/admin/api/channels',{method:'POST',body:JSON.stringify({id:$('channelId').value,name:$('channelName').value,baseUrl:$('channelUrl').value,apiKey:$('channelKey').value,protocol:$('channelProtocol').value,priority:Number($('channelPriority').value)})});$('channelResult').className='ok';$('channelResult').textContent='已写入 revision '+data.revision+'，请重启应用后生效';$('channelKey').value='';await refresh()}catch(e){$('channelResult').className='error';$('channelResult').textContent=e.message}finally{button.disabled=false}}
 async function toggleChannel(id,enabled){try{const data=await call('/admin/api/channels/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify({enabled})});$('channelResult').className='ok';$('channelResult').textContent='已写入 revision '+data.revision+'，请重启应用后生效';await refresh()}catch(e){$('channelResult').className='error';$('channelResult').textContent=e.message}}
 async function deleteChannel(id){if(!confirm('确认删除 '+id+'？'))return;try{const data=await call('/admin/api/channels/'+encodeURIComponent(id),{method:'DELETE'});$('channelResult').className='ok';$('channelResult').textContent='已删除 revision '+data.revision+'，请重启应用后生效';await refresh()}catch(e){$('channelResult').className='error';$('channelResult').textContent=e.message}}
