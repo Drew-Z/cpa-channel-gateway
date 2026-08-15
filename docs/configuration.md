@@ -33,6 +33,12 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 启用时 Token 必填且至少 32 个字符；关闭时可以留空。校验摘要、生成 release、日志和 Git 均不得输出 Token。Tunnel 的 hostname 与 `http://127.0.0.1:<SERVER_PORT>` route 由 Cloudflare Dashboard 管理，不写入渠道路由文件。
 
+## Admin UI
+
+`CPA_MANAGEMENT_KEY` 是独立于 `GATEWAY_API_KEY` 的本地管理密钥，长度至少 32 个字符；为空时 `/admin` 返回 404。启用后，管理员在同一公网端口访问 `/admin`，登录会建立仅存于内存的 HttpOnly/Secure/SameSite 会话。管理 API 的变更请求还需要匹配会话 CSRF token 和同源 `Origin`。
+
+当前管理台提供只读渠道/模型状态和任务型测活。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
+
 ## Routes
 
 模型级 `protocol` 可以覆盖渠道默认值。同一物理渠道的所有协议仍使用同一个 HAProxy listener，因此共享一个并发槽。

@@ -244,6 +244,84 @@ test('models endpoint exposes logical, stable, and direct ids', async t => {
   assert.deepEqual(ids, ['coding-main', 'free/shared-model', 'shared-model'])
 })
 
+test('admin session protects status and runs a redacted exact-model canary', async t => {
+  let upstreamBody
+  const upstream = http.createServer(async (request, response) => {
+    upstreamBody = await jsonBody(request)
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"output_text":"秋夜读书灯映寒窗"}')
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+  const config = fixtureConfig(upstreamAddress.port)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const unauthorized = await request({ port: address.port, method: 'GET', path: '/admin/api/status' })
+  assert.equal(unauthorized.statusCode, 401)
+
+  const login = await request({
+    port: address.port,
+    path: '/admin/api/session',
+    body: { key: config.managementKey }
+  })
+  assert.equal(login.statusCode, 200)
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+
+  const session = await request({ port: address.port, method: 'GET', path: '/admin/api/session', headers: { cookie } })
+  assert.equal(session.statusCode, 200)
+  assert.equal(JSON.parse(session.body).csrfToken, csrf)
+
+  const missingCsrf = await request({
+    port: address.port,
+    path: '/admin/api/tests',
+    headers: { cookie, origin: `http://127.0.0.1:${address.port}` },
+    body: { model: 'free/shared-model' }
+  })
+  assert.equal(missingCsrf.statusCode, 403)
+
+  const tested = await request({
+    port: address.port,
+    path: '/admin/api/tests',
+    headers: { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf },
+    body: { model: 'free/shared-model' }
+  })
+  assert.equal(tested.statusCode, 200)
+  const summary = JSON.parse(tested.body)
+  assert.equal(summary.ok, true)
+  assert.equal(summary.transport, 'native-passthrough')
+  assert.equal(summary.contentLength, 8)
+  assert.equal(summary.content, undefined)
+  assert.equal(upstreamBody.model, 'shared-model')
+  assert.match(upstreamBody.input, /秋夜读书/)
+
+  const logicalRejected = await request({
+    port: address.port,
+    path: '/admin/api/tests',
+    headers: { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf },
+    body: { model: 'shared-model' }
+  })
+  assert.equal(logicalRejected.statusCode, 400)
+  assert.equal(JSON.parse(logicalRejected.body).error.code, 'exact_model_required')
+})
+
+test('admin page is no-store and uses a per-response CSP nonce', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const first = await request({ port: address.port, method: 'GET', path: '/admin' })
+  const second = await request({ port: address.port, method: 'GET', path: '/admin' })
+  assert.equal(first.statusCode, 200)
+  assert.equal(first.headers['cache-control'], 'no-store')
+  assert.match(first.headers['content-security-policy'], /script-src 'nonce-/)
+  assert.notEqual(first.headers['content-security-policy'], second.headers['content-security-policy'])
+})
+
 const GATEWAY_KEY = 'fixture_gateway_key_that_is_long_enough_123456'
 
 function fixtureConfig(listener) {

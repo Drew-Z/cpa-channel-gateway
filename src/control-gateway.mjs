@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
+import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol } from './canary.mjs'
 import { createModelScheduler, GatewayRoutingError } from './scheduler.mjs'
 
 const API_PATHS = new Set(['/v1/responses', '/v1/chat/completions', '/v1/messages'])
@@ -14,10 +15,16 @@ const HOP_BY_HOP = new Set([
   'transfer-encoding',
   'upgrade'
 ])
+const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000
+const ADMIN_TEST_COOLDOWN_MS = 5_000
+const CANARY_PROMPT = '请写一首四句七言绝句，主题是秋夜读书。只输出诗题和诗句。'
 
 export function createControlGateway(config, { scheduler = createModelScheduler(config) } = {}) {
   const maxRequestBytes = config.gateway.control.maxRequestBytes
   const cpaPort = config.gateway.internal.cpaPort
+  const sessions = new Map()
+  const lastTests = new Map()
+  const lastTestStarted = new Map()
   const server = http.createServer((request, response) => {
     handleRequest(request, response).catch(error => {
       if (response.headersSent) {
@@ -39,6 +46,10 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
     const url = new URL(request.url ?? '/', 'http://gateway.local')
     if (request.method === 'GET' && url.pathname === '/healthz') {
       sendJson(response, 200, { ready: true })
+      return
+    }
+    if (url.pathname === '/admin' || url.pathname.startsWith('/admin/')) {
+      await handleAdminRequest(request, response, url)
       return
     }
     if (!isAuthorized(request, config.gatewayKey)) {
@@ -71,6 +82,244 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
         : selection.candidate.directAlias
     }
     await proxyRequest({ request, response, url, outboundBody, selection, transport })
+  }
+
+  async function handleAdminRequest(request, response, url) {
+    if (!config.managementKey) {
+      sendJson(response, 404, { error: { code: 'admin_disabled', message: 'Admin access is disabled' } })
+      return
+    }
+    if (['/admin', '/admin/'].includes(url.pathname) && request.method === 'GET') {
+      const nonce = crypto.randomBytes(18).toString('base64')
+      sendHtml(response, adminHtml(nonce), nonce)
+      return
+    }
+    if (url.pathname === '/admin/api/session' && request.method === 'POST') {
+      await loginAdmin(request, response)
+      return
+    }
+    const session = requireAdminSession(request)
+    if (url.pathname === '/admin/api/session' && request.method === 'GET') {
+      sendJson(response, 200, { ok: true, csrfToken: session.csrfToken })
+      return
+    }
+    if (url.pathname === '/admin/api/session' && request.method === 'DELETE') {
+      requireAdminMutation(request, session)
+      sessions.delete(session.token)
+      sendJson(response, 200, { ok: true }, {
+        'set-cookie': 'cpa_admin=; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=0'
+      })
+      return
+    }
+    if (url.pathname === '/admin/api/status' && request.method === 'GET') {
+      sendJson(response, 200, adminStatus())
+      return
+    }
+    if (url.pathname === '/admin/api/models' && request.method === 'GET') {
+      sendJson(response, 200, { data: adminModels() })
+      return
+    }
+    if (url.pathname === '/admin/api/tests' && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      const body = await readJsonBody(request, maxRequestBytes)
+      sendJson(response, 200, await runAdminTest(body))
+      return
+    }
+    sendJson(response, 404, { error: { code: 'not_found', message: 'Admin route not found' } })
+  }
+
+  async function loginAdmin(request, response) {
+    if (!config.managementKey) {
+      sendJson(response, 404, { error: { code: 'admin_disabled', message: 'Admin access is disabled' } })
+      return
+    }
+    const body = await readJsonBody(request, maxRequestBytes)
+    const provided = typeof body.key === 'string' ? body.key : ''
+    if (!safeEqual(provided, config.managementKey)) {
+      sendJson(response, 401, { error: { code: 'invalid_management_key', message: 'Invalid management key' } })
+      return
+    }
+    const token = crypto.randomBytes(32).toString('base64url')
+    const csrfToken = crypto.randomBytes(24).toString('base64url')
+    sessions.set(token, { token, csrfToken, expiresAt: Date.now() + ADMIN_SESSION_TTL_MS })
+    sendJson(response, 200, { ok: true, csrfToken }, {
+      'set-cookie': `cpa_admin=${token}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=${ADMIN_SESSION_TTL_MS / 1000}`
+    })
+  }
+
+  async function runAdminTest(body) {
+    const requestedModel = typeof body.model === 'string' ? body.model.trim() : ''
+    if (!requestedModel) throw publicError('invalid_request', 400, 'Test body must include a model')
+    const resolved = scheduler.catalog.resolve(requestedModel)
+    if (!resolved) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${requestedModel}`)
+    if (resolved.kind !== 'direct') throw publicError('exact_model_required', 400, 'Manual tests require an exact channel/model id')
+    const previousStartedAt = lastTestStarted.get(requestedModel) ?? 0
+    if (Date.now() - previousStartedAt < ADMIN_TEST_COOLDOWN_MS) {
+      throw publicError('test_rate_limited', 429, 'This model was tested too recently')
+    }
+    const selection = scheduler.reserve(requestedModel, { source: 'manual-test' })
+    lastTestStarted.set(requestedModel, Date.now())
+    const startedAt = Date.now()
+    const protocol = normalizeCanaryProtocol(selection.candidate.protocol)
+    const requestShape = buildCanaryRequest(protocol, selection.candidate.upstreamModel, CANARY_PROMPT)
+    const transport = protocol === 'responses' && selection.candidate.protocol === 'responses'
+      ? 'native-passthrough'
+      : 'adapted'
+    const outboundBody = {
+      ...requestShape.body,
+      model: transport === 'native-passthrough' ? selection.candidate.upstreamModel : selection.candidate.directAlias
+    }
+    try {
+      let result
+      try {
+        result = await dispatchPayload({
+          url: new URL(requestShape.path, 'http://gateway.local'),
+          outboundBody,
+          selection,
+          transport,
+          incomingHeaders: canaryHeaders(protocol)
+        })
+      } catch {
+        return rememberTest(requestedModel, {
+          ok: false,
+          status: 'failed',
+          error: 'transport_error',
+          statusCode: null,
+          protocol: selection.candidate.protocol,
+          transport,
+          latencyMs: Date.now() - startedAt
+        })
+      }
+      scheduler.recordOutcome(selection, result.statusCode, result.headers)
+      if (result.statusCode < 200 || result.statusCode >= 300) {
+        return rememberTest(requestedModel, {
+          ok: false,
+          status: 'failed',
+          error: classifyCanaryError(result.statusCode),
+          statusCode: result.statusCode,
+          protocol: selection.candidate.protocol,
+          transport,
+          latencyMs: Date.now() - startedAt
+        })
+      }
+      let parsed
+      try { parsed = JSON.parse(result.body) } catch { parsed = null }
+      const content = extractCanaryContent(protocol, parsed)
+      if (typeof content !== 'string' || content.trim().length < 8) {
+        return rememberTest(requestedModel, {
+          ok: false,
+          status: 'failed',
+          error: 'empty_content',
+          statusCode: result.statusCode,
+          protocol: selection.candidate.protocol,
+          transport,
+          latencyMs: Date.now() - startedAt
+        })
+      }
+      return rememberTest(requestedModel, {
+        ok: true,
+        status: 'success',
+        statusCode: result.statusCode,
+        protocol: selection.candidate.protocol,
+        transport,
+        latencyMs: Date.now() - startedAt,
+        contentLength: content.trim().length
+      })
+    } finally {
+      selection.release()
+    }
+  }
+
+  function dispatchPayload({ url, outboundBody, selection, transport, incomingHeaders }) {
+    const payload = Buffer.from(JSON.stringify(outboundBody))
+    const native = transport === 'native-passthrough'
+    const target = native
+      ? {
+          host: config.gateway.internal.host,
+          port: selection.candidate.channel.listener,
+          path: `${appendPath(selection.candidate.channel.upstream.pathname, url.pathname === '/v1/responses' ? '/responses' : url.pathname)}${url.search}`,
+          authorization: `Bearer ${selection.candidate.channel.apiKey}`
+        }
+      : {
+          host: config.gateway.internal.host,
+          port: cpaPort,
+          path: `${url.pathname}${url.search}`,
+          authorization: `Bearer ${config.gatewayKey}`
+        }
+    return new Promise((resolve, reject) => {
+      const upstreamRequest = http.request({
+        host: target.host,
+        port: target.port,
+        path: target.path,
+        method: 'POST',
+        headers: forwardHeaders(incomingHeaders, payload.length, target.authorization)
+      }, upstreamResponse => {
+        const chunks = []
+        let size = 0
+        upstreamResponse.on('data', chunk => {
+          size += chunk.length
+          if (size > maxRequestBytes) {
+            upstreamResponse.destroy(new Error('Canary response is too large'))
+            return
+          }
+          chunks.push(chunk)
+        })
+        upstreamResponse.once('error', reject)
+        upstreamResponse.once('end', () => resolve({
+          statusCode: upstreamResponse.statusCode ?? 502,
+          headers: upstreamResponse.headers,
+          body: Buffer.concat(chunks).toString('utf8')
+        }))
+      })
+      upstreamRequest.setTimeout(config.gateway.timeouts.serverSeconds * 1000, () => upstreamRequest.destroy(new Error('Upstream request timed out')))
+      upstreamRequest.once('error', error => {
+        scheduler.recordTransportError(selection)
+        reject(error)
+      })
+      upstreamRequest.end(payload)
+    })
+  }
+
+  function adminStatus() {
+    const snapshot = scheduler.snapshot()
+    return {
+      ready: true,
+      configRevision: config.gateway.schemaVersion,
+      reservations: snapshot.reservations,
+      lastTests: Object.fromEntries(lastTests),
+      channels: config.channels.map(channel => ({
+        id: channel.id,
+        name: channel.name,
+        enabled: channel.enabled,
+        modelCount: channel.models.length,
+        busy: snapshot.reservations.some(item => item.channelId === channel.id),
+        health: snapshot.channels[channel.id]?.health ?? 'unknown',
+        cooldownUntil: snapshot.channels[channel.id]?.cooldownUntil ?? null
+      }))
+    }
+  }
+
+  function rememberTest(modelId, result) {
+    const summary = { ...result, testedAt: new Date().toISOString() }
+    lastTests.set(modelId, summary)
+    return summary
+  }
+
+  function adminModels() {
+    return [...scheduler.catalog.logicalModels.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([id, candidates]) => ({
+        id,
+        candidates: candidates.map(candidate => ({
+          channel: candidate.channelId,
+          upstreamModel: candidate.upstreamModel,
+          directId: candidate.directAlias,
+          protocol: candidate.protocol,
+          priority: candidate.priority,
+          busy: scheduler.reservations.isBusy(candidate.channelId),
+          lastTest: lastTests.get(candidate.directAlias) ?? null
+        }))
+      }))
   }
 
   function proxyRequest({ request, response, url, outboundBody, selection, transport }) {
@@ -161,6 +410,22 @@ export function createControlGateway(config, { scheduler = createModelScheduler(
       return new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
     }
   }
+
+  function requireAdminSession(request) {
+    const token = parseCookie(request.headers.cookie).cpa_admin
+    const session = token ? sessions.get(token) : null
+    if (!session || session.expiresAt <= Date.now()) {
+      if (token) sessions.delete(token)
+      throw publicError('admin_unauthorized', 401, 'Admin session is missing or expired')
+    }
+    return session
+  }
+
+  function requireAdminMutation(request, session) {
+    if (!sameOrigin(request)) throw publicError('invalid_origin', 403, 'Admin request origin is not allowed')
+    const csrf = request.headers['x-csrf-token']
+    if (typeof csrf !== 'string' || !safeEqual(csrf, session.csrfToken)) throw publicError('invalid_csrf', 403, 'CSRF validation failed')
+  }
 }
 
 function readJsonBody(request, limit) {
@@ -234,7 +499,8 @@ function filteredResponseHeaders(incoming) {
 
 function appendPath(basePath, suffix) {
   const base = basePath === '/' ? '' : basePath.replace(/\/+$/, '')
-  return `${base}${suffix}` || '/'
+  const path = suffix.startsWith('/') ? suffix : `/${suffix}`
+  return `${base}${path}` || '/'
 }
 
 function isAuthorized(request, expected) {
@@ -242,9 +508,79 @@ function isAuthorized(request, expected) {
   const bearer = /^Bearer\s+(.+)$/i.exec(authorization)?.[1]
   const provided = bearer ?? request.headers['x-api-key']
   if (typeof provided !== 'string') return false
-  const left = Buffer.from(provided)
-  const right = Buffer.from(expected)
+  return safeEqual(provided, expected)
+}
+
+function safeEqual(leftValue, rightValue) {
+  const left = Buffer.from(String(leftValue ?? ''))
+  const right = Buffer.from(String(rightValue ?? ''))
   return left.length === right.length && crypto.timingSafeEqual(left, right)
+}
+
+function parseCookie(value = '') {
+  return Object.fromEntries(value.split(';').map(item => item.trim().split('='))
+    .filter(([name, content]) => name && content)
+    .map(([name, ...content]) => [name, content.join('=')]))
+}
+
+function sameOrigin(request) {
+  const origin = request.headers.origin
+  if (typeof origin !== 'string') return false
+  try {
+    const parsed = new URL(origin)
+    const host = String(request.headers.host ?? '').toLowerCase()
+    return parsed.host.toLowerCase() === host && ['http:', 'https:'].includes(parsed.protocol)
+  } catch {
+    return false
+  }
+}
+
+function canaryHeaders(protocol) {
+  return protocol === 'claude'
+    ? { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'user-agent': 'cpa-channel-gateway/1.0' }
+    : { 'content-type': 'application/json', 'user-agent': 'cpa-channel-gateway/1.0' }
+}
+
+function classifyCanaryError(statusCode) {
+  if (statusCode === 401 || statusCode === 403) return 'authentication_failed'
+  if (statusCode === 402) return 'payment_blocked'
+  if (statusCode === 429) return 'rate_limited'
+  if (statusCode >= 500) return 'upstream_server_error'
+  if ([400, 404, 405, 422].includes(statusCode)) return 'protocol_or_path_error'
+  return 'unexpected_status'
+}
+
+function sendHtml(response, html, nonce) {
+  if (response.headersSent || response.destroyed) return
+  const body = Buffer.from(html)
+  response.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': String(body.length),
+    'cache-control': 'no-store',
+    'content-security-policy': `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`,
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY'
+  })
+  response.end(body)
+}
+
+function adminHtml(nonce) {
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA Channel Gateway</title>
+<style nonce="${nonce}">body{font-family:system-ui,sans-serif;background:#f5f7fb;color:#152033;margin:0}main{max-width:1100px;margin:2rem auto;padding:0 1rem}section{background:#fff;border:1px solid #dce3ef;border-radius:12px;padding:1rem;margin:1rem 0;box-shadow:0 2px 10px #1520330d}h1{font-size:1.35rem}button{border:0;border-radius:8px;padding:.6rem .9rem;background:#2458d6;color:#fff;cursor:pointer}input{padding:.6rem;border:1px solid #b8c3d5;border-radius:8px;width:min(100%,28rem)}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e8edf4;padding:.55rem;font-size:.9rem}.muted{color:#637089}.error{color:#b42318}.ok{color:#067647}.busy{color:#b54708}</style></head>
+<body><main><h1>CPA Channel Gateway 管理台</h1><section id="login"><p class="muted">管理密钥只用于建立内存会话，重启后自动失效。</p><input id="key" type="password" autocomplete="current-password" placeholder="CPA_MANAGEMENT_KEY"><button id="loginButton">登录</button><p id="loginError" class="error"></p></section>
+<section id="app" hidden><p><button id="refreshButton">刷新状态</button> <span id="summary" class="muted"></span></p><div id="channels"></div><h2>模型测活</h2><p class="muted">固定任务：生成一首秋夜读书七言绝句；只保存状态摘要，不保存诗词正文。</p><input id="model" placeholder="精确模型 ID，例如 free/gpt-4o"><button id="testButton">测试模型</button><p id="testResult"></p><h2>模型目录</h2><div id="models"></div></section></main>
+<script nonce="${nonce}">
+let csrf='';
+const $=id=>document.getElementById(id);
+async function call(path, options={}){const r=await fetch(path,{credentials:'same-origin',...options,headers:{'content-type':'application/json',...(options.headers||{})}});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error?.message||'请求失败');return data}
+async function login(){try{const data=await call('/admin/api/session',{method:'POST',body:JSON.stringify({key:$('key').value})});csrf=data.csrfToken;$('login').hidden=true;$('app').hidden=false;await refresh()}catch(e){$('loginError').textContent=e.message}}
+async function refresh(){try{const [status,models]=await Promise.all([call('/admin/api/status'),call('/admin/api/models')]);$('summary').textContent='当前预约 '+status.reservations.length+' 个';$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>状态</th><th>模型数</th><th>健康</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td class="'+(c.busy?'busy':'')+'">'+(c.busy?'busy':'idle')+'</td><td>'+c.modelCount+'</td><td>'+esc(c.health)+'</td></tr>').join('')+'</table>';$('models').innerHTML='<table><tr><th>公开 ID</th><th>候选</th></tr>'+models.data.map(m=>'<tr><td>'+esc(m.id)+'</td><td>'+m.candidates.map(c=>esc(c.channel)+'/'+esc(c.upstreamModel)+' ['+esc(c.protocol)+(c.busy?', busy':'')+']').join('<br>')+'</td></tr>').join('')+'</table>'}catch(e){$('summary').textContent=e.message}}
+async function testModel(){try{const data=await call('/admin/api/tests',{method:'POST',headers:{'x-csrf-token':csrf,'origin':location.origin},body:JSON.stringify({model:$('model').value})});$('testResult').className=data.ok?'ok':'error';$('testResult').textContent=JSON.stringify(data)}catch(e){$('testResult').className='error';$('testResult').textContent=e.message}finally{await refresh()}}
+function esc(v){return String(v).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+$('loginButton').onclick=login;$('refreshButton').onclick=refresh;$('testButton').onclick=testModel;
+</script></body></html>`
 }
 
 function sendJson(response, statusCode, value, extraHeaders = {}) {
@@ -253,6 +589,9 @@ function sendJson(response, statusCode, value, extraHeaders = {}) {
   response.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': String(body.length),
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
     ...extraHeaders
   })
   response.end(body)

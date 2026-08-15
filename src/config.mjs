@@ -33,6 +33,7 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
   if (routes.schemaVersion !== 1) errors.push('routes schemaVersion must be 1')
   const gatewayKey = requireSecret(env, 'GATEWAY_API_KEY', errors, 32)
   const managementKey = env.CPA_MANAGEMENT_KEY?.trim() ?? ''
+  if (managementKey && managementKey.length < 32) errors.push('CPA_MANAGEMENT_KEY must contain at least 32 characters when admin access is enabled')
   const tunnelSettings = gateway.cloudflareTunnel ?? {}
   const tunnelEnabledEnv = String(tunnelSettings.enabledEnv ?? '')
   const tunnelCredentialEnv = String(tunnelSettings.tokenEnv ?? '')

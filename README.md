@@ -15,6 +15,7 @@ HAProxy listener 均绑定到容器回环地址。
 - 私有渠道 URL、密钥、激活配置、日志和二进制不会进入 Git。
 - 配置生成按内容寻址，支持原子激活和一次回滚。
 - canary 使用真实小任务，不使用 `hi`、`你好` 等无意义提示词。
+- 开启 `CPA_MANAGEMENT_KEY` 后，可在同一公网端口的 `/admin` 使用管理台查看渠道状态、逻辑模型候选和执行精确渠道模型测活。
 
 ## 运行拓扑
 
@@ -87,6 +88,10 @@ npm run import:legacy -- /absolute/path/to/channels.local.env
 | Additional Arguments | 留空 |
 
 将面板主 allocation 的端口作为环境变量 `SERVER_PORT`。只需要一个公网 allocation；第二个 allocation 不需要使用。
+
+### 管理台
+
+`CPA_MANAGEMENT_KEY` 留空时 `/admin` 不开放。填写独立的 32 字符以上随机管理密钥并重启后，访问同一域名的 `/admin` 登录。管理台的会话只保存在 Node 内存中，重启后失效；测活必须填写精确的 `<channel>/<upstream-model-id>`，避免逻辑模型候选变化造成误判。测活使用固定诗词任务、同一渠道互斥租约和相同协议路径，只保存状态摘要、transport、延迟与正文长度，不保存诗词正文。
 
 首次启动会：
 

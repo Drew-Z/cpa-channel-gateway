@@ -12,7 +12,9 @@ Router MVP is implemented in the working tree:
 - CPA now listens only on the internal loopback port and Node owns the single public port;
 - cancellation, streaming lifetime, authentication replacement, header filtering, and no-replay behavior have integration coverage.
 
-Persistent health state, manual WebUI tests, configuration jobs, hot apply/rollback, and the WebUI remain in later phases below.
+Persistent health state, configuration jobs, channel/model editing, and hot apply/rollback remain in later phases below.
+
+The first admin slice is now also implemented: same-port `/admin`, in-memory HttpOnly admin sessions, CSRF/origin checks for tests, logical-model candidate status, and exact-candidate poetry canaries with redacted summaries. Channel CRUD, model grouping edits, and runtime apply remain later-phase work.
 
 ## Phase 1: Contracts and Pure Logic
 
