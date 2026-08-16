@@ -22,7 +22,121 @@ The private configuration slice now supports atomic, revisioned channel create/u
 
 运维导入也支持安全合并：`npm run merge:legacy -- <legacy-env>` 只更新旧格式文件中的渠道字段，保留现有密钥、Tunnel、启用状态、模型目录和别名，并将新增渠道置为禁用；写入前会创建私有 revision 备份。`npm run sync:models -- <channel-id>...` 可在不启用渠道的情况下显式同步指定模型目录，便于先目录发现、再任务型测活、最后启用。
 
-## Phase 1: Contracts and Pure Logic
+## Remaining Roadmap (2026-08-17)
+
+后续工作按依赖顺序推进。每一阶段独立提交、独立回滚；在前一阶段的验收证据完整前，
+不提前开始依赖它的下一阶段。现有单公网端口、单渠道互斥、无自动重放、无周期探测、
+固定诗词测活和私密字段不落 Git/日志的约束保持不变。
+
+### Stage 0: Production Rehearsal Gate
+
+目标是先证明当前 `8bd9633` 基线在真实翼龙容器中成立，而不是继续叠加未部署代码。
+
+- 通过 `AUTO_UPDATE=1` 重启容器，确认启动日志加载目标提交并输出 ready release。
+- 在管理台确认 `runtime.available=true`、`controlState.storage=persistent`、运行 revision
+  与磁盘 revision 一致。
+- 选择一个已启用的精确渠道模型执行固定诗词 canary；只核对状态、transport、延迟和
+  正文长度，不查看或保存正文。
+- 对同一可用模型各执行一个流式和非流式真实小任务，确认流式生命周期持有租约、
+  非流式不会被强制改成流式。
+- 验证同 digest apply 不重启内部进程但会提交 loaded revision；再验证一次正常的有变更
+  apply。生产环境的故障注入或私有配置改动必须单独取得批准；失败回滚先在可丢弃夹具中
+  演练。
+
+验收证据：Console 的低敏 ready/apply 结果、管理台状态、一次精确 canary 摘要、流式和
+非流式请求结果。任何 Cookie、密钥、请求正文、响应正文和上游原始错误都不进入记录。
+
+### Stage 1: Structured Private Revisions, Audit, and Rollback
+
+目标是让变更历史真正可检查、可解释、可恢复，而不是只有备份目录。
+
+- 引入 `config/providers.local.json` 存放渠道 URL、API key、协议、启用状态和优先级；
+  `channels.local.env` 最终只保留网关、管理和 Tunnel 等进程级密钥。迁移必须显式执行、
+  先备份、支持 dry-run，并在过渡期兼容旧 env，不在输出中展示私密值。
+- 每个 `runtime/config-revisions/<revision>/` 增加 manifest：父 revision、时间、操作类型、
+  受影响的渠道/模型 ID、内容 digest 和验证结果。URL 只记录“已变化”，API key 只记录
+  “已替换”，不保存值。
+- 新增有界的 `runtime/audit-events.jsonl`，只记录 job ID、操作类型、结果、revision、
+  耗时和分类错误码；不记录请求体、提示词、正文、Header、URL、密钥或会话标识。
+- 提供已认证的 revision 列表、结构化脱敏 diff 和 rollback API。rollback 必须进入同一
+  FIFO 队列，排空租约，生成并验证 release，成功激活后才更新 loaded revision；失败时
+  恢复当前配置和运行时。
+- 管理台增加 Changes 视图，展示当前/待应用 revision、脱敏 diff、历史和显式确认的回滚。
+
+验收条件：迁移前后生成配置语义一致；损坏 revision、并发 apply/rollback、排空超时和
+readiness 失败均保留原运行配置；公开审计扫描证明历史、API 和 UI 中没有私密值。
+
+### Stage 2: Explicit Logical Models and Candidate Priority
+
+目标是完成 PRD 中“不同上游 ID 由操作者显式合并”的能力，同时保留现有精确路由。
+
+- 增加版本化 `logicalModels` 配置：logical ID、enabled、候选 channel/upstream-model、
+  候选 enabled 和 priority。相同 upstream ID 仍可自动成组；不同 ID 永不模糊推断。
+- 提供 schema v1 到新 schema 的确定性迁移和回滚；旧 `<channel>/<model>` 直接 ID 保持
+  可用，现有 exact stable/pinned alias 不被静默改写。
+- stable alias 可显式指向逻辑模型或精确候选；pinned alias 继续只允许精确、带审批引用
+  的目标。`coding-main`/`coding-backup` 仍是固定指针，不根据健康状态自动漂移。
+- 增加逻辑组 CRUD、候选优先级/启用状态和 alias 目标 API，全部走原子验证与 FIFO 作业。
+- 管理台 Models/Routing 视图支持建组、拆组、排序、冲突检查和精确 canary。
+
+验收条件：两个不同 ID 的候选可组成一个逻辑模型；直接 ID、固定 alias 和 pinned alias
+兼容；禁用/忙碌候选不会绕过渠道互斥；无效或循环引用不会写入私有配置。
+
+### Stage 3: Evidence-Based Scheduling and Conservative Circuit Breaking
+
+目标是补齐设计稿中的同优先级决胜项和故障状态机，但不引入自动重放或额外探测流量。
+
+- 在 `runtime/control-state.json` 中持久化有界、脱敏的候选结果统计：成功/失败计数、
+  连续瞬态失败数和 EWMA 延迟；不保存 request ID、正文或 Header。
+- 候选排序固定为：健康状态、operator priority、最小样本门槛后的成功率、EWMA 延迟、
+  channel ID。所有时间与衰减规则使用可注入时钟并做确定性测试。
+- timeout/5xx 达到保守阈值后进入 open cooldown；冷却结束后的下一次真实或人工请求作为
+  half-open，不生成后台探测。成功关闭 circuit，失败重新打开。
+- 管理台只展示低敏统计和“为何选择/排除候选”的分类原因，避免把评分解释成模型能力排名。
+
+验收条件：排序测试覆盖样本不足、并列、过期统计、进程重启和 half-open；已经发出的
+生成请求始终只执行一次；只有一个候选时也不会因统计异常形成永久锁死。
+
+### Stage 4: WebUI MVP on Stable APIs
+
+API 契约稳定后再把当前内联页面迁移到 Vite + React + TypeScript；构建产物仍由同一个
+Node 进程在 `/admin` 提供，不增加服务、数据库或公网端口。
+
+- 建立 Overview、Channels、Models、Routing、Changes 五个工作视图。
+- 使用紧凑表格、明确状态、`lucide-react` 图标和可访问的确认对话框；保留 Base URL/
+  gateway key 快捷复制、30 秒重新掩码以及渠道密钥只写不读。
+- 对 busy、cooling、disabled、draining、test/apply/rollback running、成功和失败提供完整状态。
+- 使用 Playwright 在桌面和移动视口验证布局、交互、无重叠、键盘操作、CSP 和浏览器控制台。
+
+验收条件：日常渠道、模型、路由、变更和回滚操作无需手改文件；页面首屏不是营销页，
+无嵌套卡片和密钥泄露；构建后仍保持单端口部署。
+
+### Stage 5: Protocol Matrix and Operational Closeout
+
+- 用 fixture upstream 完整覆盖 Responses SSE/JSON、Chat Completions 流式/非流式、Claude
+  Messages、认证替换、Header 过滤、客户端断开、超时和畸形响应。
+- 真实环境按“请求 profile”而不是穷举所有模型执行一次固定任务 canary，确认 native 与
+  adapted 标签准确；不创建周期性探测。
+- 增加 release 保留策略，只清理未被 active/previous/revision 引用的旧 release；增加
+  usage/audit 文件压缩与容量上限。
+- 增加 apply 耗时、排空超时、队列深度和子进程异常退出等低敏运维指标，并更新部署、
+  迁移、恢复和故障处理文档。
+
+最终门槛：`npm test`、`npm run check`、`npm run audit:public`、语法检查、桌面/移动截图、
+一次真实精确 canary、流式与非流式请求、正常 apply 和可证明的失败回滚全部通过。
+
+### Explicit Non-Goals
+
+- 不自动切换 `coding-main`/`coding-backup`；需要多候选调度时使用 logical model ID。
+- 不重放已发送的生成请求，不做周期测活，不伪造 Codex/Claude 私有身份。
+- 不做模糊模型等价推断、多租户、计费、配额或数据库迁移。
+
+## Historical Build Phases
+
+以下内容保留最初的构建顺序和验收依据；当前剩余工作的执行顺序以上面的 Remaining
+Roadmap 为准。
+
+### Phase 1: Contracts and Pure Logic
 
 - Add versioned schemas for private providers, logical models, candidates, and redacted health state.
 - Add migration from current channel environment entries to `providers.local.json` without logging secrets.
@@ -38,7 +152,7 @@ npm run check
 npm run audit:public
 ```
 
-## Phase 2: Public Control Gateway
+### Phase 2: Public Control Gateway
 
 - Move CPA from the public allocation to a fixed internal listener.
 - Add the Node public server for gateway authentication, `/v1/models`, request parsing, model rewrite, and response streaming.
@@ -64,7 +178,7 @@ Critical tests:
 - native requests preserve the actual client request envelope except for model, auth, target, and transport framing;
 - adapted requests can never be reported as `native-passthrough`.
 
-## Phase 3: Admin API and Configuration Jobs
+### Phase 3: Admin API and Configuration Jobs
 
 - Add admin session, CSRF, origin checks, rate limits, and redacted error handling.
 - Add channel CRUD with disable/drain/delete lifecycle.
@@ -75,7 +189,7 @@ Critical tests:
 - Add private revision backups and redacted audit events.
 - Refactor child supervision so internal CPA/HAProxy can be replaced without restarting the public parent.
 
-## Phase 4: WebUI
+### Phase 4: WebUI
 
 - Use Vite, React, TypeScript, the project's own compact design tokens, and `lucide-react` icons.
 - Build Overview, Channels, Models, Routing, and Changes views.
@@ -83,7 +197,7 @@ Critical tests:
 - Keep secrets write-only and response bodies absent from the UI.
 - Verify desktop and mobile layout with Playwright screenshots; this is an operator tool, so favor dense tables and predictable controls over promotional cards.
 
-## Phase 5: Protocol-Fidelity Validation
+### Phase 5: Protocol-Fidelity Validation
 
 - Preserve the one-port Pterodactyl deployment and existing Cloudflare Tunnel origin.
 - Add migration and rollback documentation.
