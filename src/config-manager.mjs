@@ -6,7 +6,10 @@ import { parseEnv, serializeEnv } from './env.mjs'
 import { fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from './model-sync.mjs'
 
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
+const MODEL_ID = /^[^\s/][^\r\n]{0,254}$/
+const ALIAS = /^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$/
 const PROTOCOLS = new Set(['openai-compatible', 'responses', 'claude'])
+const MODEL_STATUSES = new Set(['active', 'stale', 'disabled'])
 
 export class ConfigMutationError extends Error {
   constructor(code, statusCode, message) {
@@ -29,6 +32,18 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
     status() {
       const revision = currentRevision()
       return { revision, restartRequired: revision !== initialRevision }
+    },
+    routing() {
+      const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+      return {
+        stableAliases: (routes.stableAliases ?? []).map(({ alias, channel, model }) => ({ alias, channel, model })),
+        pinnedAliases: (routes.pinnedAliases ?? []).map(({ alias, channel, model, approvalRef }) => ({ alias, channel, model, approvalRef })),
+        models: (routes.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => ({
+          channel: channel.id,
+          model: model.upstream,
+          status: model.status ?? 'active'
+        })))
+      }
     },
     discoverChannels() {
       const env = parseEnv(fs.readFileSync(envPath, 'utf8'))
@@ -152,6 +167,54 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
           modelCount: (channel.models ?? []).length,
           hasApiKey: Boolean(env[`${prefix}_API_KEY`])
         }
+      })
+    },
+    updateModelStatus(channelValue, modelValue, statusValue) {
+      return mutate(({ routes }) => {
+        const channelId = normalizeChannelId(channelValue)
+        const modelId = normalizeModelId(modelValue)
+        const status = String(statusValue ?? '').trim()
+        if (!MODEL_STATUSES.has(status)) throw new ConfigMutationError('invalid_model_status', 400, `Unsupported model status: ${status}`)
+        const channel = (routes.channels ?? []).find(item => item.id === channelId)
+        if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${channelId}`)
+        const model = (channel.models ?? []).find(item => item.upstream === modelId)
+        if (!model) throw new ConfigMutationError('model_not_found', 404, `Unknown model: ${channelId}/${modelId}`)
+        if (status === 'disabled') {
+          const references = [...(routes.stableAliases ?? []), ...(routes.pinnedAliases ?? [])]
+            .filter(route => route.channel === channelId && route.model === modelId)
+            .map(route => route.alias)
+          if (references.length) {
+            throw new ConfigMutationError('model_has_aliases', 409, `Move aliases before disabling this model: ${references.join(', ')}`)
+          }
+        }
+        model.status = status
+        return { channel: channelId, model: modelId, status }
+      })
+    },
+    setStableAlias(aliasValue, channelValue, modelValue) {
+      return mutate(({ routes }) => {
+        const alias = normalizeAlias(aliasValue)
+        const channelId = normalizeChannelId(channelValue)
+        const modelId = normalizeModelId(modelValue)
+        const channel = (routes.channels ?? []).find(item => item.id === channelId)
+        if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${channelId}`)
+        const model = (channel.models ?? []).find(item => item.upstream === modelId)
+        if (!model) throw new ConfigMutationError('model_not_found', 404, `Unknown model: ${channelId}/${modelId}`)
+        if (model.status === 'disabled') throw new ConfigMutationError('model_disabled', 409, 'A disabled model cannot receive a stable alias')
+        routes.stableAliases ??= []
+        const current = routes.stableAliases.find(item => item.alias === alias)
+        if (!current) {
+          const conflicts = [
+            ...(routes.pinnedAliases ?? []).map(item => item.alias),
+            ...(routes.channels ?? []).flatMap(item => (item.models ?? []).flatMap(entry => entry.aliases ?? []))
+          ]
+          if (conflicts.includes(alias)) throw new ConfigMutationError('alias_conflict', 409, `Alias is already in use: ${alias}`)
+          routes.stableAliases.push({ alias, channel: channelId, model: modelId })
+        } else {
+          current.channel = channelId
+          current.model = modelId
+        }
+        return { alias, channel: channelId, model: modelId }
       })
     },
     deleteChannel(idValue) {
@@ -299,6 +362,18 @@ function normalizeChannelId(value) {
   const id = String(value ?? '').trim().toLowerCase()
   if (!CHANNEL_ID.test(id)) throw new ConfigMutationError('invalid_channel_id', 400, 'Channel id must match [a-z][a-z0-9-]{0,31}')
   return id
+}
+
+function normalizeModelId(value) {
+  const model = String(value ?? '').trim()
+  if (!MODEL_ID.test(model)) throw new ConfigMutationError('invalid_model_id', 400, 'Model id is invalid')
+  return model
+}
+
+function normalizeAlias(value) {
+  const alias = String(value ?? '').trim()
+  if (!ALIAS.test(alias)) throw new ConfigMutationError('invalid_alias', 400, 'Alias is invalid')
+  return alias
 }
 
 function envPrefix(id) {

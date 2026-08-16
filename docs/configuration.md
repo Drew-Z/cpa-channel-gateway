@@ -37,9 +37,9 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 `CPA_MANAGEMENT_KEY` 是独立于 `GATEWAY_API_KEY` 的本地管理密钥，长度至少 32 个字符；为空时 `/admin` 返回 404。启用后，管理员在同一公网端口访问 `/admin`，登录会建立仅存于内存的 HttpOnly/Secure/SameSite 会话。管理 API 的变更请求还需要匹配会话 CSRF token 和同源 `Origin`。
 
-当前管理台提供只读渠道/模型状态和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
+当前管理台提供渠道/模型状态、路由管理和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
 
-管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道。请求必须带会话 CSRF token 和同源 `Origin`；API key 只写入服务器，不在响应中返回。成功响应为 `202`，包含脱敏的 `revision` 与 `restartRequired: true`；当前进程不会静默热切换，需按部署流程重启以应用新 revision。所有变更先备份到 `runtime/config-revisions/`，验证失败自动恢复。
+管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名请求体为 `{ "alias", "channel", "model" }`。禁用仍被 stable/pinned alias 引用的模型会返回 `409 model_has_aliases`。请求必须带会话 CSRF token 和同源 `Origin`；API key 只写入服务器，不在响应中返回。成功响应为 `202`，包含脱敏的 `revision` 与 `restartRequired: true`；当前进程不会静默热切换，需按部署流程重启以应用新 revision。所有变更先备份到 `runtime/config-revisions/`，验证失败自动恢复。
 
 `GET /admin/api/usage` 返回最近 24 小时真实业务请求的低敏聚合结果。统计口径如下：
 

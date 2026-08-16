@@ -354,6 +354,62 @@ test('admin session protects status and runs a redacted exact-model canary', asy
   assert.equal(JSON.parse(logicalRejected.body).error.code, 'exact_model_required')
 })
 
+test('admin API updates model status and stable aliases through the private config manager', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const calls = []
+  const configManager = {
+    status: () => ({ revision: 'pending-revision', restartRequired: true }),
+    routing: () => ({
+      stableAliases: [{ alias: 'coding-main', channel: 'free', model: 'shared-model' }],
+      pinnedAliases: [],
+      models: [{ channel: 'free', model: 'shared-model', status: 'disabled' }]
+    }),
+    updateModelStatus: (channel, model, status) => {
+      calls.push({ operation: 'model', channel, model, status })
+      return { channel, model, status, revision: 'next-model-revision', restartRequired: true }
+    },
+    setStableAlias: (alias, channel, model) => {
+      calls.push({ operation: 'alias', alias, channel, model })
+      return { alias, channel, model, revision: 'next-alias-revision', restartRequired: true }
+    }
+  }
+  const gateway = createControlGateway(config, { configManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+
+  const status = await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })
+  assert.equal(JSON.parse(status.body).stableAliases[0].alias, 'coding-main')
+  const models = await request({ port: address.port, method: 'GET', path: '/admin/api/models', headers: { cookie } })
+  assert.equal(JSON.parse(models.body).data[0].candidates[0].status, 'disabled')
+
+  const modelUpdate = await request({
+    port: address.port,
+    method: 'PATCH',
+    path: '/admin/api/models',
+    headers,
+    body: { channel: 'free', model: 'shared-model', status: 'active' }
+  })
+  assert.equal(modelUpdate.statusCode, 202)
+  const aliasUpdate = await request({
+    port: address.port,
+    method: 'PUT',
+    path: '/admin/api/stable-aliases',
+    headers,
+    body: { alias: 'coding-backup', channel: 'free', model: 'shared-model' }
+  })
+  assert.equal(aliasUpdate.statusCode, 202)
+  assert.deepEqual(calls, [
+    { operation: 'model', channel: 'free', model: 'shared-model', status: 'active' },
+    { operation: 'alias', alias: 'coding-backup', channel: 'free', model: 'shared-model' }
+  ])
+})
+
 test('admin page is no-store and uses a per-response CSP nonce', async t => {
   const config = fixtureConfig(19001)
   config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
@@ -370,10 +426,13 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.body, /新增并同步模型/)
   assert.match(first.body, /<select id="syncChannelIds"/)
   assert.match(first.body, /<select id="model"/)
+  assert.match(first.body, /设为 coding-main/)
+  assert.match(first.body, /\/admin\/api\/stable-aliases/)
+  assert.match(first.body, /method:'PATCH'/)
   assert.match(first.body, /healthLabel/)
   assert.match(first.body, /candidate\.channel\+'\/'/)
   assert.match(first.body, /请先从下拉框选择一个精确模型/)
-  assert.match(first.body, /当前忙碌渠道会暂时不可选/)
+  assert.match(first.body, /忙碌或已禁用模型不能测活/)
   assert.match(first.body, /id="usage"/)
   assert.match(first.body, /channel-discovery/)
   assert.match(first.body, /\/admin\/api\/usage/)

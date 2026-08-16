@@ -55,6 +55,36 @@ test('stable aliases may temporarily point to a disabled channel', () => {
   assert.equal(config.stableAliases[0].channel, 'sample')
 })
 
+test('model status and stable alias changes are revisioned and prevent broken routes', () => {
+  const root = fixtureRoot()
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+  routes.channels[0].models.push({ upstream: 'model-b', protocol: 'responses', aliases: ['sample/model-b'] })
+  fs.writeFileSync(routesPath, JSON.stringify(routes, null, 2))
+  const manager = createPrivateConfigManager(loadConfig(root))
+
+  const main = manager.setStableAlias('coding-main', 'sample', 'model-a')
+  assert.equal(main.alias, 'coding-main')
+  assert.equal(main.restartRequired, true)
+  assert.throws(
+    () => manager.updateModelStatus('sample', 'model-a', 'disabled'),
+    error => error.code === 'model_has_aliases'
+  )
+
+  manager.setStableAlias('coding-main', 'sample', 'model-b')
+  const disabled = manager.updateModelStatus('sample', 'model-a', 'disabled')
+  assert.equal(disabled.status, 'disabled')
+  assert.throws(
+    () => manager.setStableAlias('coding-backup', 'sample', 'model-a'),
+    error => error.code === 'model_disabled'
+  )
+
+  const routing = manager.routing()
+  assert.deepEqual(routing.stableAliases, [{ alias: 'coding-main', channel: 'sample', model: 'model-b' }])
+  assert.equal(routing.models.find(item => item.model === 'model-a').status, 'disabled')
+  assert.equal(loadConfig(root).channels[0].models.find(model => model.upstream === 'model-a').status, 'disabled')
+})
+
 test('admin model synchronization is read-only upstream, revisioned, and marks discovered inventory', async () => {
   const root = fixtureRoot()
   const config = loadConfig(root)
