@@ -64,6 +64,8 @@ export function createModelScheduler(config, {
   const validCandidateKeys = new Set([...catalog.allModels.values()].flat().map(candidate => candidate.key))
   const channelState = restoreChannelState(initialState.channels, validChannelIds)
   const candidateState = restoreCandidateState(initialState.candidates, validCandidateKeys)
+  const drainingChannels = new Set()
+  const suppressedCandidates = new Set()
 
   function reserve(modelId, metadata = {}) {
     const resolved = catalog.resolve(modelId)
@@ -79,7 +81,7 @@ export function createModelScheduler(config, {
         candidateCount: resolved.candidates.length
       })
     }
-    const eligible = modeCandidates.filter(candidate => isEligible(candidate, channelState, candidateState, now(), metadata.source ?? 'production'))
+    const eligible = modeCandidates.filter(candidate => isEligible(candidate, channelState, candidateState, drainingChannels, suppressedCandidates, now(), metadata.source ?? 'production'))
     if (!eligible.length) {
       throw new GatewayRoutingError('no_eligible_candidates', 503, `No eligible channel is available for model: ${modelId}`)
     }
@@ -134,6 +136,33 @@ export function createModelScheduler(config, {
     notifyStateChange()
   }
 
+  function drainChannel(channelId) {
+    const id = String(channelId ?? '').trim()
+    if (!validChannelIds.has(id) || drainingChannels.has(id)) return false
+    drainingChannels.add(id)
+    return true
+  }
+
+  function resumeChannel(channelId) {
+    return drainingChannels.delete(String(channelId ?? '').trim())
+  }
+
+  function suppressCandidate(channelId, upstreamModel) {
+    const matches = candidatesFor(channelId, upstreamModel)
+    for (const candidate of matches) suppressedCandidates.add(candidate.key)
+    return matches.length > 0
+  }
+
+  function resumeCandidate(channelId, upstreamModel) {
+    const matches = candidatesFor(channelId, upstreamModel)
+    for (const candidate of matches) suppressedCandidates.delete(candidate.key)
+    return matches.length > 0
+  }
+
+  function candidatesFor(channelId, upstreamModel) {
+    return [...catalog.allModels.values()].flat().filter(candidate => candidate.channelId === channelId && candidate.upstreamModel === upstreamModel)
+  }
+
   function clearExpiredCooldowns() {
     const timestamp = now()
     let changed = false
@@ -162,18 +191,31 @@ export function createModelScheduler(config, {
     reserve,
     recordOutcome,
     recordTransportError,
+    drainChannel,
+    resumeChannel,
+    suppressCandidate,
+    resumeCandidate,
+    isChannelDraining(channelId) {
+      return drainingChannels.has(String(channelId ?? '').trim())
+    },
+    isCandidateSuppressed(channelId, upstreamModel) {
+      return candidatesFor(channelId, upstreamModel).some(candidate => suppressedCandidates.has(candidate.key))
+    },
     snapshot() {
       return {
         reservations: reservations.snapshot(),
         channels: Object.fromEntries(channelState),
-        candidates: Object.fromEntries(candidateState)
+        candidates: Object.fromEntries(candidateState),
+        draining: [...drainingChannels].sort(),
+        suppressedCandidates: [...suppressedCandidates].sort()
       }
     }
   }
 }
 
-function isEligible(candidate, channelState, candidateState, now, source) {
+function isEligible(candidate, channelState, candidateState, drainingChannels, suppressedCandidates, now, source) {
   if (candidate.channel.staged && source !== 'manual-test') return false
+  if (drainingChannels.has(candidate.channelId) || suppressedCandidates.has(candidate.key)) return false
   const channel = channelState.get(candidate.channelId)
   if (BLOCKED_CHANNEL_STATES.has(channel?.health)) return false
   if (channel?.health === 'cooling' && channel.cooldownUntil > now) return false

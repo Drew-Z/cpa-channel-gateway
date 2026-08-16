@@ -75,6 +75,38 @@ test('restores validated health state and persists expired cooldown cleanup', ()
   assert.equal(changes.length, 2)
 })
 
+test('drains a channel without interrupting an existing lease', () => {
+  const scheduler = createModelScheduler(fixtureConfig())
+  const active = scheduler.reserve('shared-model')
+  assert.equal(active.candidate.channelId, 'alpha')
+  assert.equal(scheduler.drainChannel('alpha'), true)
+  assert.deepEqual(scheduler.snapshot().draining, ['alpha'])
+
+  const alternate = scheduler.reserve('shared-model')
+  assert.equal(alternate.candidate.channelId, 'beta')
+  alternate.release()
+  active.release()
+
+  assert.equal(scheduler.resumeChannel('alpha'), true)
+  const resumed = scheduler.reserve('shared-model')
+  assert.equal(resumed.candidate.channelId, 'alpha')
+  resumed.release()
+})
+
+test('suppresses a pending model disable while keeping other models on the channel available', () => {
+  const scheduler = createModelScheduler(fixtureConfig())
+  assert.equal(scheduler.suppressCandidate('alpha', 'shared-model'), true)
+  assert.equal(scheduler.isCandidateSuppressed('alpha', 'shared-model'), true)
+  const other = scheduler.reserve('alpha/other-model')
+  assert.equal(other.candidate.upstreamModel, 'other-model')
+  other.release()
+  const alternate = scheduler.reserve('shared-model')
+  assert.equal(alternate.candidate.channelId, 'beta')
+  alternate.release()
+  assert.equal(scheduler.resumeCandidate('alpha', 'shared-model'), true)
+  assert.equal(scheduler.isCandidateSuppressed('alpha', 'shared-model'), false)
+})
+
 test('staged channels are available only to manual exact-model tests', () => {
   const config = fixtureConfig()
   config.channels.push({ ...channel('staged', 200, [model('staged', 'new-model', 200)]), enabled: false, staged: true, runtimeEnabled: true })

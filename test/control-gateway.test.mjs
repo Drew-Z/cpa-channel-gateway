@@ -289,6 +289,34 @@ test('models endpoint exposes logical, stable, and direct ids', async t => {
   assert.doesNotMatch(result.body, /upstream\.example\.test/)
 })
 
+test('channel updates enter drain mode before the pending restart', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const configManager = {
+    status: () => ({ revision: 'pending-revision', restartRequired: true }),
+    routing: () => ({ stableAliases: config.stableAliases, pinnedAliases: [], models: [] }),
+    updateChannel: id => ({ id, name: 'Free', enabled: false, staged: false, priority: 100, modelCount: 1 })
+  }
+  const gateway = createControlGateway(config, { configManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+
+  const update = await request({ port: address.port, method: 'PATCH', path: '/admin/api/channels/free', headers, body: { enabled: false } })
+  assert.equal(update.statusCode, 202)
+  assert.equal(JSON.parse(update.body).enabled, false)
+  assert.throws(() => gateway.scheduler.reserve('shared-model'), error => error.code === 'no_eligible_candidates')
+
+  const status = JSON.parse((await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })).body)
+  assert.deepEqual(status.draining, ['free'])
+  assert.equal(status.channels[0].draining, true)
+  assert.equal(status.controlJobs.recent.at(-1).type, 'channel-update')
+  assert.equal(status.controlJobs.recent.at(-1).status, 'completed')
+})
+
 test('restores persisted health and canary summaries into the admin status', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-control-restore-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

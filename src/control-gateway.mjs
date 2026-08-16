@@ -3,6 +3,7 @@ import http from 'node:http'
 import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol } from './canary.mjs'
 import { ConfigMutationError, createPrivateConfigManager } from './config-manager.mjs'
 import { createControlState } from './control-state.mjs'
+import { createControlJobQueue } from './control-jobs.mjs'
 import { isCanaryEligible } from './model-metadata.mjs'
 import { createModelScheduler, GatewayRoutingError } from './scheduler.mjs'
 import { createUsageMonitor } from './usage-monitor.mjs'
@@ -38,6 +39,7 @@ export function createControlGateway(config, {
   const cpaPort = config.gateway.internal.cpaPort
   const sessions = new Map()
   const loginFailures = new Map()
+  const controlJobs = createControlJobQueue()
   const lastTests = new Map(Object.entries(controlState.lastTests()))
   const lastTestStarted = new Map()
   const server = http.createServer((request, response) => {
@@ -168,14 +170,20 @@ export function createControlGateway(config, {
       requireAdminMutation(request, session)
       requireConfigManager()
       const body = await readJsonBody(request, maxRequestBytes)
-      sendJson(response, 202, configManager.updateModelStatus(body.channel, body.model, body.status))
+      const result = await controlJobs.run('model-update', () => {
+        const updated = configManager.updateModelStatus(body.channel, body.model, body.status)
+        if (updated.status === 'disabled') scheduler.suppressCandidate?.(body.channel, body.model)
+        else scheduler.resumeCandidate?.(body.channel, body.model)
+        return updated
+      })
+      sendJson(response, 202, result)
       return
     }
     if (url.pathname === '/admin/api/stable-aliases' && request.method === 'PUT') {
       requireAdminMutation(request, session)
       requireConfigManager()
       const body = await readJsonBody(request, maxRequestBytes)
-      sendJson(response, 202, configManager.setStableAlias(body.alias, body.channel, body.model))
+      sendJson(response, 202, await controlJobs.run('alias-update', () => configManager.setStableAlias(body.alias, body.channel, body.model)))
       return
     }
     if (url.pathname === '/admin/api/usage' && request.method === 'GET') {
@@ -195,25 +203,31 @@ export function createControlGateway(config, {
         : Array.isArray(body.channelIds)
           ? body.channelIds
           : []
-      sendJson(response, 200, await configManager.syncModels(requestedIds))
+      sendJson(response, 200, await controlJobs.run('model-sync', () => configManager.syncModels(requestedIds)))
       return
     }
     if (url.pathname === '/admin/api/channels' && request.method === 'POST') {
       requireAdminMutation(request, session)
       requireConfigManager()
       const body = await readJsonBody(request, maxRequestBytes)
-      const created = configManager.createChannel(body)
-      const sync = body.sync === true ? await configManager.syncModels([created.id]) : null
-      sendJson(response, sync ? 200 : 202, { ...created, sync })
+      const result = await controlJobs.run('channel-create', async () => {
+        const created = configManager.createChannel(body)
+        const sync = body.sync === true ? await configManager.syncModels([created.id]) : null
+        return { ...created, sync }
+      })
+      sendJson(response, result.sync ? 200 : 202, result)
       return
     }
     if (url.pathname === '/admin/api/channels/import' && request.method === 'POST') {
       requireAdminMutation(request, session)
       requireConfigManager()
       const body = await readJsonBody(request, maxRequestBytes)
-      const imported = configManager.importChannel(body.id)
-      const sync = body.sync === true ? await configManager.syncModels([imported.id]) : null
-      sendJson(response, 200, { imported, sync })
+      const result = await controlJobs.run('channel-import', async () => {
+        const imported = configManager.importChannel(body.id)
+        const sync = body.sync === true ? await configManager.syncModels([imported.id]) : null
+        return { imported, sync }
+      })
+      sendJson(response, 200, result)
       return
     }
     const channelRoute = /^\/admin\/api\/channels\/([a-z][a-z0-9-]{0,31})$/.exec(url.pathname)
@@ -221,14 +235,25 @@ export function createControlGateway(config, {
       requireAdminMutation(request, session)
       requireConfigManager()
       const body = await readJsonBody(request, maxRequestBytes)
-      sendJson(response, 202, configManager.updateChannel(channelRoute[1], body))
+      const result = await controlJobs.run('channel-update', () => {
+        const updated = configManager.updateChannel(channelRoute[1], body)
+        if (updated.staged || updated.enabled === false) scheduler.drainChannel?.(channelRoute[1])
+        else if (updated.enabled === true) scheduler.resumeChannel?.(channelRoute[1])
+        return updated
+      })
+      sendJson(response, 202, result)
       return
     }
     if (channelRoute && request.method === 'DELETE') {
       requireAdminMutation(request, session)
       requireConfigManager()
       if (scheduler.reservations.isBusy(channelRoute[1])) throw publicError('channel_busy', 409, 'A busy channel cannot be deleted')
-      sendJson(response, 202, configManager.deleteChannel(channelRoute[1]))
+      const result = await controlJobs.run('channel-delete', () => {
+        const deleted = configManager.deleteChannel(channelRoute[1])
+        scheduler.drainChannel?.(channelRoute[1])
+        return deleted
+      })
+      sendJson(response, 202, result)
       return
     }
     if (url.pathname === '/admin/api/tests' && request.method === 'POST') {
@@ -431,6 +456,9 @@ export function createControlGateway(config, {
       stableAliases: routing.stableAliases,
       pinnedAliases: routing.pinnedAliases,
       reservations: snapshot.reservations,
+      controlJobs: controlJobs.status(),
+      draining: snapshot.draining ?? [],
+      suppressedCandidates: snapshot.suppressedCandidates ?? [],
       lastTests: Object.fromEntries(lastTests),
       controlState: controlState.status(),
       channels: config.channels.map(channel => ({
@@ -442,6 +470,7 @@ export function createControlGateway(config, {
         runtimeEnabled: channel.runtimeEnabled,
         modelCount: channel.models.length,
         busy: snapshot.reservations.some(item => item.channelId === channel.id),
+        draining: (snapshot.draining ?? []).includes(channel.id),
         health: snapshot.channels[channel.id]?.health ?? 'unknown',
         cooldownUntil: snapshot.channels[channel.id]?.cooldownUntil ?? null
       }))
@@ -485,6 +514,8 @@ export function createControlGateway(config, {
             channelEnabled: model.channelEnabled ?? Boolean(loaded?.channel.enabled),
             status: model.status ?? loaded?.model.status ?? 'active',
             busy: loaded ? scheduler.reservations.isBusy(model.channel) : false,
+            draining: scheduler.isChannelDraining?.(model.channel) ?? false,
+            suppressed: scheduler.isCandidateSuppressed?.(model.channel, model.model) ?? false,
             lastTest: lastTests.get(directId) ?? null
           }
         })
@@ -501,6 +532,8 @@ export function createControlGateway(config, {
           channelEnabled: Boolean(candidate.channel.enabled),
           status: candidate.model.status ?? 'active',
           busy: scheduler.reservations.isBusy(candidate.channelId),
+          draining: scheduler.isChannelDraining?.(candidate.channelId) ?? false,
+          suppressed: scheduler.isCandidateSuppressed?.(candidate.channelId, candidate.upstreamModel) ?? false,
           lastTest: lastTests.get(candidate.directAlias) ?? null
         }))
     const groups = new Map()
@@ -604,6 +637,7 @@ export function createControlGateway(config, {
     server,
     scheduler,
     usageMonitor,
+    controlJobs,
     listen({ host = config.gateway.public.host, port } = {}) {
       const listenPort = port ?? Number(process.env[config.gateway.public.portEnv] || process.env.SERVER_PORT || process.env.PORT || config.gateway.public.defaultPort)
       return new Promise((resolve, reject) => {
@@ -827,17 +861,17 @@ let csrf='';let restartRequired=false;let modelCandidates=new Map();let gatewayK
 const $=id=>document.getElementById(id);
 async function call(path, options={}){const method=(options.method||'GET').toUpperCase();const headers={'content-type':'application/json',...(options.headers||{})};if(!['GET','HEAD','OPTIONS'].includes(method)&&csrf)headers['x-csrf-token']=csrf;const r=await fetch(path,{...options,mode:'same-origin',credentials:'same-origin',headers});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error?.message||'请求失败');return data}
 async function login(){try{const data=await call('/admin/api/session',{method:'POST',body:JSON.stringify({key:$('key').value})});csrf=data.csrfToken;$('login').hidden=true;$('app').hidden=false;await refresh()}catch(e){$('loginError').textContent=e.message}}
-async function refresh(){try{const [status,models,usage,discovery,connection]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage'),call('/admin/api/channel-discovery'),call('/admin/api/connection')]);restartRequired=status.restartRequired===true;const revisionText=restartRequired?'；待重启 '+(status.pendingRevision||status.configRevision||'-')+'，运行中 '+(status.loadedRevision||'未知'):'；运行配置 '+(status.loadedRevision||status.configRevision||'未知');const storageText=status.controlState?.storage==='memory-fallback'?'；健康状态持久化已退化为内存':'';$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次'+revisionText+storageText;$('summary').className=status.controlState?.storage==='memory-fallback'?'busy':'muted';renderConnection(connection);$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>Base URL</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td class="'+(c.busy?'busy':'')+'">'+channelState(c)+(c.busy?' / 当前忙碌':'')+'</td><td>'+c.modelCount+'</td><td>'+esc(healthLabel(c.health))+'</td><td>'+channelActions(c)+'</td></tr>').join('')+'</table>';$('discovery').innerHTML=discoveryHtml(discovery);$('usage').innerHTML=usageHtml(usage);$('routing').innerHTML=routingHtml(status.stableAliases||[]);$('models').innerHTML=modelsHtml(models.data);populateSyncChannelSelect(status.channels);populateModelSelect(models.data)}catch(e){$('summary').textContent=e.message}}
+async function refresh(){try{const [status,models,usage,discovery,connection]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage'),call('/admin/api/channel-discovery'),call('/admin/api/connection')]);restartRequired=status.restartRequired===true;const revisionText=restartRequired?'；待重启 '+(status.pendingRevision||status.configRevision||'-')+'，运行中 '+(status.loadedRevision||'未知'):'；运行配置 '+(status.loadedRevision||status.configRevision||'未知');const storageText=status.controlState?.storage==='memory-fallback'?'；健康状态持久化已退化为内存':'';const jobText=status.controlJobs?.active?'；配置任务 '+status.controlJobs.active.type+(status.controlJobs.queued?'，等待 '+status.controlJobs.queued:''):status.controlJobs?.queued?'；等待配置任务 '+status.controlJobs.queued:'';$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次'+revisionText+storageText+jobText;$('summary').className=status.controlState?.storage==='memory-fallback'?'busy':'muted';renderConnection(connection);$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>Base URL</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td class="'+(c.busy||c.draining?'busy':'')+'">'+channelState(c)+(c.busy?' / 当前忙碌':'')+'</td><td>'+c.modelCount+'</td><td>'+esc(healthLabel(c.health))+'</td><td>'+channelActions(c)+'</td></tr>').join('')+'</table>';$('discovery').innerHTML=discoveryHtml(discovery);$('usage').innerHTML=usageHtml(usage);$('routing').innerHTML=routingHtml(status.stableAliases||[]);$('models').innerHTML=modelsHtml(models.data);populateSyncChannelSelect(status.channels);populateModelSelect(models.data)}catch(e){$('summary').textContent=e.message}}
 function populateSyncChannelSelect(channels){const select=$('syncChannelIds');const previous=select.value;select.replaceChildren(new Option('全部生产渠道',''));for(const channel of channels.slice().sort((left,right)=>left.id.localeCompare(right.id))){const state=channel.staged?'待测试':channel.enabled?'生产启用':'已停用';select.add(new Option(channel.id+' ['+state+']',channel.id))}if(channels.some(channel=>channel.id===previous))select.value=previous}
 function healthLabel(value){return ({healthy:'健康',unknown:'未测试',degraded:'降级',cooling:'冷却中','auth-failed':'认证失败','payment-blocked':'支付受限'}[value]||value||'未测试')}
-function populateModelSelect(groups){const select=$('model');const previous=select.value;select.replaceChildren(new Option('请选择要测试或管理的精确模型',''));const candidates=groups.flatMap(group=>group.candidates||[]).filter((candidate,index,list)=>list.findIndex(item=>item.directId===candidate.directId)===index).sort((left,right)=>left.channel.localeCompare(right.channel)||left.upstreamModel.localeCompare(right.upstreamModel));modelCandidates=new Map();const byChannel=new Map();for(const candidate of candidates){const optionGroup=byChannel.get(candidate.channel)||(()=>{const created=document.createElement('optgroup');created.label=candidate.channel;select.append(created);byChannel.set(candidate.channel,created);return created})();const states=[modelKindLabel(candidate.kind),streamingLabel(candidate.streaming)];if(candidate.staged)states.push('待测试');if(candidate.channelEnabled===false&&!candidate.staged)states.push('已停用');if(candidate.status==='stale')states.push('stale');if(candidate.status==='disabled')states.push('已禁用');if(candidate.busy)states.push('当前忙碌');const directId=candidate.directId||candidate.channel+'/'+candidate.upstreamModel;modelCandidates.set(directId,candidate);const option=new Option(directId+' ['+states.join('，')+']',directId);option.title=directId;optionGroup.append(option)}if(modelCandidates.has(previous))select.value=previous;updateModelButtons();$('testHint').textContent=restartRequired?'配置已更新；仍可继续调整路由，重启后再执行模型测活':candidates.length?'请选择一个精确模型；忙碌或已禁用模型不能测活；仅生成型且具备测活资格的模型可执行固定任务':'暂无模型，请先同步模型目录'}
+function populateModelSelect(groups){const select=$('model');const previous=select.value;select.replaceChildren(new Option('请选择要测试或管理的精确模型',''));const candidates=groups.flatMap(group=>group.candidates||[]).filter((candidate,index,list)=>list.findIndex(item=>item.directId===candidate.directId)===index).sort((left,right)=>left.channel.localeCompare(right.channel)||left.upstreamModel.localeCompare(right.upstreamModel));modelCandidates=new Map();const byChannel=new Map();for(const candidate of candidates){const optionGroup=byChannel.get(candidate.channel)||(()=>{const created=document.createElement('optgroup');created.label=candidate.channel;select.append(created);byChannel.set(candidate.channel,created);return created})();const states=[modelKindLabel(candidate.kind),streamingLabel(candidate.streaming)];if(candidate.staged)states.push('待测试');if(candidate.channelEnabled===false&&!candidate.staged)states.push('已停用');if(candidate.status==='stale')states.push('stale');if(candidate.status==='disabled')states.push('已禁用');if(candidate.busy)states.push('当前忙碌');if(candidate.draining)states.push('排空中');if(candidate.suppressed)states.push('配置待应用');const directId=candidate.directId||candidate.channel+'/'+candidate.upstreamModel;modelCandidates.set(directId,candidate);const option=new Option(directId+' ['+states.join('，')+']',directId);option.title=directId;optionGroup.append(option)}if(modelCandidates.has(previous))select.value=previous;updateModelButtons();$('testHint').textContent=restartRequired?'配置已更新；仍可继续调整路由，重启后再执行模型测活':candidates.length?'请选择一个精确模型；忙碌或已禁用模型不能测活；仅生成型且具备测活资格的模型可执行固定任务':'暂无模型，请先同步模型目录'}
 function selectedModel(){return modelCandidates.get($('model').value)}
-function updateModelButtons(){const candidate=selectedModel();const unavailable=!candidate;const disabled=candidate?.status==='disabled';const generation=candidate?.kind==='generation';const canary=generation&&candidate?.canaryEligible!==false;$('testButton').disabled=restartRequired||unavailable||disabled||Boolean(candidate?.busy)||!canary;$('setMainButton').disabled=unavailable||disabled||!generation;$('setBackupButton').disabled=unavailable||disabled||!generation;$('toggleModelButton').disabled=unavailable;$('toggleModelButton').textContent=disabled?'恢复模型':'禁用模型'}
+function updateModelButtons(){const candidate=selectedModel();const unavailable=!candidate;const disabled=candidate?.status==='disabled';const generation=candidate?.kind==='generation';const canary=generation&&candidate?.canaryEligible!==false;$('testButton').disabled=restartRequired||unavailable||disabled||Boolean(candidate?.busy)||Boolean(candidate?.draining)||Boolean(candidate?.suppressed)||!canary;$('setMainButton').disabled=unavailable||disabled||!generation;$('setBackupButton').disabled=unavailable||disabled||!generation;$('toggleModelButton').disabled=unavailable;$('toggleModelButton').textContent=disabled?'恢复模型':'禁用模型'}
 function modelKindLabel(value){return ({generation:'生成',embedding:'向量',rerank:'重排',audio:'音频',image:'图像',video:'视频',ocr:'OCR',moderation:'审核'}[value]||value||'生成')}
 function streamingLabel(value){return ({both:'流式/非流式', 'stream-only':'仅流式', 'non-stream-only':'仅非流式'}[value]||'流式/非流式')}
-function modelsHtml(groups){const rows=groups.flatMap(group=>group.candidates||[]);if(!rows.length)return '<p class="muted">暂无模型目录。</p>';return '<table><tr><th>精确模型</th><th>类型</th><th>请求模式</th><th>状态</th><th>测活</th></tr>'+rows.map(item=>'<tr><td><code>'+esc(item.directId)+'</code></td><td>'+esc(modelKindLabel(item.kind))+'</td><td>'+esc(streamingLabel(item.streaming))+'</td><td>'+esc(item.staged?'待测试':item.channelEnabled===false?'已停用':item.status||'active')+'</td><td>'+esc(item.canaryEligible&&item.kind==='generation'?'可用':'不适用')+'</td></tr>').join('')+'</table>'}
+function modelsHtml(groups){const rows=groups.flatMap(group=>group.candidates||[]);if(!rows.length)return '<p class="muted">暂无模型目录。</p>';return '<table><tr><th>精确模型</th><th>类型</th><th>请求模式</th><th>状态</th><th>测活</th></tr>'+rows.map(item=>'<tr><td><code>'+esc(item.directId)+'</code></td><td>'+esc(modelKindLabel(item.kind))+'</td><td>'+esc(streamingLabel(item.streaming))+'</td><td>'+esc(item.draining?'排空中':item.suppressed?'配置待应用':item.staged?'待测试':item.channelEnabled===false?'已停用':item.status||'active')+'</td><td>'+esc(item.canaryEligible&&item.kind==='generation'?'可用':'不适用')+'</td></tr>').join('')+'</table>'}
 function routingHtml(aliases){if(!aliases.length)return '<p class="muted">尚未配置稳定别名。</p>';return '<h3>稳定别名</h3><table><tr><th>别名</th><th>当前目标</th></tr>'+aliases.map(item=>'<tr><td><code>'+esc(item.alias)+'</code></td><td><code>'+esc(item.channel+'/'+item.model)+'</code></td></tr>').join('')+'</table>'}
-function channelState(c){return c.staged?'待测试':c.enabled?'生产启用':'已停用'}
+function channelState(c){return c.draining?'排空中':c.staged?'待测试':c.enabled?'生产启用':'已停用'}
 function channelActions(c){const id=esc(c.id);let actions='';if(c.staged)actions='<button class="channelAction" data-id="'+id+'" data-mode="production">设为生产</button> <button class="channelAction secondary" data-id="'+id+'" data-mode="disabled">移出待测</button>';else if(c.enabled)actions='<button class="channelAction secondary" data-id="'+id+'" data-mode="disabled">停用</button>';else actions='<button class="channelAction" data-id="'+id+'" data-mode="staged">设为待测试</button> <button class="channelAction secondary" data-id="'+id+'" data-mode="production">直接启用</button>';if(!c.enabled&&!c.staged&&!c.busy)actions+=' <button class="deleteChannel secondary" data-id="'+id+'">删除</button>';return actions}
 function discoveryHtml(data){let html='';if(data.pendingRestart.length)html+='<h3>已写入配置，等待重启</h3><table><tr><th>渠道</th><th>Base URL</th><th>协议</th><th>状态</th></tr>'+data.pendingRestart.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td>'+esc(c.protocol)+'</td><td class="busy">重启后加载</td></tr>').join('')+'</table>';if(data.unregistered.length)html+='<h3>env 中发现、尚未登记</h3><table><tr><th>渠道</th><th>Base URL</th><th>协议</th><th>操作</th></tr>'+data.unregistered.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td>'+esc(c.protocol)+'</td><td>'+ (c.ready?'<button class="importChannel" data-id="'+esc(c.id)+'" data-sync="false">导入待测试</button> <button class="importChannel secondary" data-id="'+esc(c.id)+'" data-sync="true">导入并同步</button>':'<span class="error">缺少 '+esc(c.missing.join(', '))+'</span>')+'</td></tr>').join('')+'</table>';return html||'<p class="muted">没有发现新的 env 渠道。</p>'}
 function usageHtml(data){const s=data.summary;const overall='<table><tr><th>请求</th><th>成功</th><th>失败</th><th>取消</th><th>成功率</th><th>存储</th></tr><tr><td>'+s.total+'</td><td>'+s.success+'</td><td>'+s.failure+'</td><td>'+s.cancelled+'</td><td>'+rate(s.successRate)+'</td><td>'+esc(data.storage)+'</td></tr></table>';if(!s.total)return overall+'<p class="muted">最近 24 小时还没有真实业务请求。</p>';const logical=data.logicalModels.length?'<h3>逻辑模型</h3>'+statsTable(data.logicalModels):'';const requested=data.models.length?'<h3>请求入口</h3>'+statsTable(data.models):'';const physical=data.physicalModels.length?'<h3>实际渠道模型</h3>'+statsTable(data.physicalModels):'';return overall+logical+requested+physical}

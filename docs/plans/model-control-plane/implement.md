@@ -12,7 +12,7 @@ Router MVP is implemented in the working tree:
 - CPA now listens only on the internal loopback port and Node owns the single public port;
 - cancellation, streaming lifetime, authentication replacement, header filtering, and no-replay behavior have integration coverage.
 
-Persistent health state and redacted canary summaries now live in the Git-ignored `runtime/control-state.json`; stale transient health and cooldown entries are discarded on restore, while release-scoped failures are retained only for the same configuration digest. Configuration jobs, channel/model editing, and hot apply/rollback remain in later phases below.
+Persistent health state and redacted canary summaries now live in the Git-ignored `runtime/control-state.json`; stale transient health and cooldown entries are discarded on restore, while release-scoped failures are retained only for the same configuration digest. Configuration writes and model synchronization now share a low-sensitivity FIFO control-job queue, and pending channel/model changes drain new reservations without interrupting existing leases. Internal child replacement, readiness checks, and hot apply/rollback remain in later phases below.
 
 The first admin slice is now also implemented: same-port `/admin`, in-memory HttpOnly admin sessions, CSRF/origin checks for tests, logical-model candidate status, exact-candidate poetry canaries with redacted summaries, revisioned stable-alias moves, and persistent model enable/disable controls. Logical grouping edits and runtime apply remain later-phase work.
 
