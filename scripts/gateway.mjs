@@ -7,6 +7,7 @@ import { generateRelease, activateRelease, rollbackRelease } from '../src/genera
 import { loadConfig } from '../src/config.mjs'
 import { createControlGateway } from '../src/control-gateway.mjs'
 import { createRuntimeChildren } from '../src/runtime-children.mjs'
+import { createRuntimeManager } from '../src/runtime-manager.mjs'
 import { childOutcome, terminateChildren, waitForHttpOk } from '../src/supervisor.mjs'
 
 const root = path.resolve(process.env.GATEWAY_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url))))
@@ -64,7 +65,6 @@ async function start(rootDir) {
   const children = []
   const outcomes = []
   let controlGateway = null
-  let appliedGenerated = generated
   let resolveRuntimeFailure
   const runtimeFailure = new Promise(resolve => { resolveRuntimeFailure = resolve })
   const abortController = new AbortController()
@@ -81,31 +81,12 @@ async function start(rootDir) {
     readyTimeoutMs: 15_000,
     onFailure: error => resolveRuntimeFailure({ type: 'error', label: 'Internal runtime', error })
   })
-  const runtimeManager = {
-    status: () => ({ ...runtimeChildren.status(), available: true }),
-    apply: async () => {
-      const next = generateRelease(rootDir)
-      const previous = appliedGenerated
-      const result = await runtimeChildren.replace(next, {
-        drain: async () => { controlGateway.scheduler.drainAll() },
-        waitForIdle: () => controlGateway.scheduler.waitForIdle({ timeoutMs: next.gateway.queue.timeoutSeconds * 1000 }),
-        resume: async () => { controlGateway.scheduler.resumeAll() },
-        commit: async release => {
-          controlGateway.reloadConfig(release, { markApplied: false })
-          activateRelease(rootDir, release)
-          controlGateway.markConfigApplied()
-          appliedGenerated = release
-        },
-        rollback: async () => {
-          controlGateway.reloadConfig(previous, { markApplied: false })
-          activateRelease(rootDir, previous)
-          appliedGenerated = previous
-        }
-      })
-      if (!result.changed) controlGateway.markConfigApplied()
-      return result
-    }
-  }
+  const runtimeManager = createRuntimeManager({
+    rootDir,
+    initialGenerated: generated,
+    runtimeChildren,
+    getControlGateway: () => controlGateway
+  })
 
   try {
     const publicPort = Number(process.env[generated.gateway.public.portEnv] || process.env.SERVER_PORT || process.env.PORT || generated.gateway.public.defaultPort)

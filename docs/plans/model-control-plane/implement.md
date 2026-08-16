@@ -32,6 +32,9 @@ The private configuration slice now supports atomic, revisioned channel create/u
 
 目标是先证明当前 `8bd9633` 基线在真实翼龙容器中成立，而不是继续叠加未部署代码。
 
+本地可丢弃夹具已经直接覆盖正常切换、同 digest revision 提交、active pointer 提交失败
+恢复旧 release，以及排空超时不触碰当前运行时；真实翼龙环境的下列验证仍是部署门槛。
+
 - 通过 `AUTO_UPDATE=1` 重启容器，确认启动日志加载目标提交并输出 ready release。
 - 在管理台确认 `runtime.available=true`、`controlState.storage=persistent`、运行 revision
   与磁盘 revision 一致。

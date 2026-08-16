@@ -40,8 +40,14 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       }
     },
     markApplied() {
+      const previousRevision = loadedRevision
       loadedRevision = currentRevision()
-      return this.status()
+      try {
+        return this.status()
+      } catch (error) {
+        loadedRevision = previousRevision
+        throw error
+      }
     },
     routing() {
       const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
