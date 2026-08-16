@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import http from 'node:http'
 import test from 'node:test'
+import vm from 'node:vm'
 import { createControlGateway } from '../src/control-gateway.mjs'
 
 test('native Responses forwarding preserves reviewed client headers and replaces secrets', async t => {
@@ -416,6 +417,14 @@ test('admin API updates model status and stable aliases through the private conf
 
   const status = await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })
   assert.equal(JSON.parse(status.body).stableAliases[0].alias, 'coding-main')
+  const connection = await request({ port: address.port, method: 'GET', path: '/admin/api/connection', headers: { cookie } })
+  const connectionData = JSON.parse(connection.body)
+  assert.equal(connection.statusCode, 200)
+  assert.equal(connectionData.baseUrl, `http://127.0.0.1:${address.port}/v1`)
+  assert.equal(connectionData.apiKey, undefined)
+  assert.match(connectionData.apiKeyMasked, /^fixt\*+3456$/)
+  const revealedConnection = await request({ port: address.port, method: 'GET', path: '/admin/api/connection?reveal=1', headers: { cookie } })
+  assert.equal(JSON.parse(revealedConnection.body).apiKey, GATEWAY_KEY)
   const models = await request({ port: address.port, method: 'GET', path: '/admin/api/models', headers: { cookie } })
   const modelGroups = JSON.parse(models.body).data
   assert.equal(modelGroups.find(group => group.id === 'shared-model').candidates[0].status, 'disabled')
@@ -502,6 +511,13 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.body, /<th>Base URL<\/th>/)
   assert.match(first.body, /mode:'same-origin'/)
   assert.match(first.body, /headers\['x-csrf-token'\]=csrf/)
+  assert.match(first.body, /客户端连接/)
+  assert.match(first.body, /复制 Base URL/)
+  assert.match(first.body, /复制 API key/)
+  assert.doesNotMatch(first.body, new RegExp(GATEWAY_KEY))
+  const script = /<script nonce="[^"]+">([\s\S]+)<\/script>/.exec(first.body)?.[1]
+  assert.ok(script)
+  assert.doesNotThrow(() => new vm.Script(script))
 })
 
 test('rate limits repeated failed admin logins', async t => {

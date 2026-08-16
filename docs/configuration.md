@@ -41,9 +41,9 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 CPA 的 Codex 兼容头由 `gateway.json` 中的 `cpa.disableCodexCloaking` 控制。当前值为 `false`，因此 CPA 的 `codex-api-key` 适配路径会使用 CPA 内置的标准 Codex `User-Agent`/`Originator` 头，适用于只做浅层客户端兼容检查的上游。它不会伪造具体 Codex Desktop 版本，也不能证明请求来自真实客户端；`identity-confuse` 仍关闭。Responses 客户端直连同协议渠道时走网关的 native passthrough，保留该次真实请求的低敏头部。需要改变该策略时只改公开 `gateway.json`，重新生成并重启，不要把浏览器 Cookie、LocalStorage 或会话令牌写入任何 CPA 配置。
 
-当前管理台提供渠道/模型状态、路由管理和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
+当前管理台提供渠道/模型状态、路由管理和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。登录后“客户端连接”区域还会根据当前访问域名生成带 `/v1` 的 Base URL，并提供复制按钮；`GATEWAY_API_KEY` 默认仅显示掩码，显式点击“显示”或“复制 API key”时才通过已认证会话取回，不写入初始 HTML。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
 
-管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名请求体为 `{ "alias", "channel", "model" }`。禁用仍被 stable/pinned alias 引用的模型会返回 `409 model_has_aliases`。请求必须带会话 CSRF token 和同源 `Origin`；API key 只写入服务器，不在响应中返回。成功响应为 `202`，包含脱敏的 `revision` 与 `restartRequired: true`；当前进程不会静默热切换，需按部署流程重启以应用新 revision。所有变更先备份到 `runtime/config-revisions/`，验证失败自动恢复。
+管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名请求体为 `{ "alias", "channel", "model" }`。禁用仍被 stable/pinned alias 引用的模型会返回 `409 model_has_aliases`。请求必须带会话 CSRF token 和同源 `Origin`；新增渠道的 API key 只写入服务器，不在变更响应中返回。成功响应为 `202`，包含脱敏的 `revision` 与 `restartRequired: true`；当前进程不会静默热切换，需按部署流程重启以应用新 revision。所有变更先备份到 `runtime/config-revisions/`，验证失败自动恢复。
 
 `GET /admin/api/usage` 返回最近 24 小时真实业务请求的低敏聚合结果。统计口径如下：
 
