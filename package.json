@@ -19,6 +19,7 @@
     "replace:legacy": "node scripts/import-legacy-env.mjs --replace",
     "sync:models": "node scripts/sync-models.mjs",
     "canary": "node scripts/canary.mjs",
+    "verify:deployment": "node scripts/verify-deployment.mjs",
     "install:runtime": "node scripts/install-runtime.mjs",
     "start": "node scripts/gateway.mjs start",
     "test": "node --test"

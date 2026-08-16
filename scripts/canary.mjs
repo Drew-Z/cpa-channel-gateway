@@ -14,7 +14,7 @@ const result = await post(resolveCanaryUrl(process.env.GATEWAY_BASE_URL, port, r
   Authorization: `Bearer ${apiKey}`,
   ...(protocol === 'claude' ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' } : {})
 })
-if (result.status < 200 || result.status >= 300) throw new Error(`Canary failed with HTTP ${result.status}: ${sanitize(result.body)}`)
+if (result.status < 200 || result.status >= 300) throw new Error(`Canary failed with HTTP ${result.status}`)
 let parsed
 try { parsed = JSON.parse(result.body) } catch { throw new Error('Canary returned invalid JSON') }
 const content = extractCanaryContent(protocol, parsed)
@@ -34,11 +34,4 @@ function post(url, body, headers) {
     req.on('error', reject)
     req.end(body)
   })
-}
-
-function sanitize(value) {
-  return String(value)
-    .replaceAll(/Bearer\s+[^\s"']+/gi, 'Bearer [redacted]')
-    .replaceAll(/sk-[A-Za-z0-9._-]+/g, '[redacted]')
-    .slice(0, 500)
 }

@@ -219,3 +219,24 @@ npm run install:runtime
 ```
 
 `install:runtime` 只下载/构建运行时，不请求任何模型。
+
+### 部署验收脚本
+
+容器已经通过面板环境变量持有管理密钥时，可在翼龙 Console 执行默认只读检查：
+
+```bash
+npm run verify:deployment
+```
+
+该命令检查 `/healthz`、内部 runtime supervisor、持久化 control state 和 loaded/pending
+revision，不输出管理密钥、gateway key、Cookie、CSRF token、请求/响应正文或上游原始错误。
+只有显式设置非敏感的精确模型 ID 时才会发送固定诗词任务：
+
+```bash
+DEPLOYMENT_CANARY_MODEL='channel/model' npm run verify:deployment
+```
+
+同时设置 `DEPLOYMENT_BUSINESS_MODEL='channel/model'` 时，会使用容器已有的
+`GATEWAY_API_KEY` 各执行一次固定任务的非流式和流式请求，只输出状态、正文长度、
+content type 和响应字节数。脚本默认不会应用配置；只有经过批准后显式设置
+`DEPLOYMENT_APPLY=1`，才会在发现 pending revision 时调用 runtime apply。
