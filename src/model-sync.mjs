@@ -100,9 +100,9 @@ export function synchronizeRouteModels(routes, discoveries) {
       const hasCanonical = prior.some(model => (model.aliases ?? []).includes(canonical))
       for (const [index, model] of prior.entries()) {
         if (index === 0 && !hasCanonical) {
-          models.push({ ...model, aliases: [...new Set([...(model.aliases ?? []), canonical])], status: 'active' })
+          models.push({ ...model, aliases: [...new Set([...(model.aliases ?? []), canonical])], status: synchronizedModelStatus(model) })
         } else {
-          models.push({ ...model, status: 'active' })
+          models.push({ ...model, status: synchronizedModelStatus(model) })
         }
       }
     }
@@ -111,7 +111,7 @@ export function synchronizeRouteModels(routes, discoveries) {
       const prior = existingByUpstream.get(model)
       if (!prior) continue
       const first = models.find(item => item.upstream === model)
-      if (first) first.status = 'stale'
+      if (first && first.status !== 'disabled') first.status = 'stale'
     }
 
     summaries.push({
@@ -127,6 +127,10 @@ export function synchronizeRouteModels(routes, discoveries) {
   })
 
   return { routes: { ...routes, channels }, summaries }
+}
+
+function synchronizedModelStatus(model) {
+  return model.status === 'disabled' ? 'disabled' : 'active'
 }
 
 export function canonicalModelAlias(channelId, upstream) {

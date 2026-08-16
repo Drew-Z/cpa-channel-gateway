@@ -94,3 +94,17 @@ test('preserves stale models until stable or pinned aliases move away from them'
   assert.equal(result.routes.channels[0].models.find(model => model.upstream === 'old-model').status, 'stale')
   assert.equal(result.routes.channels[0].models.find(model => model.upstream === 'new-model').status, 'active')
 })
+
+test('preserves disabled model decisions during catalog synchronization', () => {
+  const routes = {
+    schemaVersion: 1,
+    channels: [{ id: 'sample', models: [{ upstream: 'blocked-model', status: 'disabled', aliases: ['sample/blocked-model'] }] }],
+    stableAliases: [],
+    pinnedAliases: []
+  }
+  const result = synchronizeRouteModels(routes, new Map([['sample', ['blocked-model', 'new-model']]]))
+  const blocked = result.routes.channels[0].models.find(model => model.upstream === 'blocked-model')
+  const added = result.routes.channels[0].models.find(model => model.upstream === 'new-model')
+  assert.equal(blocked.status, 'disabled')
+  assert.equal(added.status, 'active')
+})

@@ -55,6 +55,21 @@ test('staged channels are available only to manual exact-model tests', () => {
   testLease.release()
 })
 
+test('disabled models are absent from public catalog and cannot be reserved', () => {
+  const config = fixtureConfig()
+  config.channels[0].models[0].status = 'disabled'
+  const scheduler = createModelScheduler(config)
+  const publicIds = scheduler.catalog.listPublicModels().map(item => item.id)
+  assert.ok(!publicIds.includes('alpha/shared-model'))
+  assert.throws(
+    () => scheduler.reserve('alpha/shared-model'),
+    error => error instanceof GatewayRoutingError && error.code === 'model_not_found'
+  )
+  const logical = scheduler.reserve('shared-model')
+  assert.equal(logical.candidate.channelId, 'beta')
+  logical.release()
+})
+
 function fixtureConfig() {
   const alpha = channel('alpha', 100, [
     model('alpha', 'shared-model', 100),

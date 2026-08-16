@@ -87,6 +87,22 @@ test('accepts namespaced upstream model ids and permits empty enabled channels o
   assert.equal(loadConfig(root, { allowEmptyEnabledChannels: true }).channels[0].models.length, 0)
 })
 
+test('accepts disabled models without exposing them through generated CPA config', () => {
+  const root = fixtureRoot()
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+  routes.channels[0].models.push({
+    upstream: 'retired-model',
+    status: 'disabled',
+    aliases: ['chat/retired-model']
+  })
+  routes.stableAliases.push({ alias: 'retired-main', channel: 'chat', model: 'retired-model' })
+  fs.writeFileSync(routesPath, JSON.stringify(routes))
+  assert.equal(loadConfig(root).channels[0].models.find(model => model.upstream === 'retired-model').status, 'disabled')
+  const generated = generateRelease(root)
+  assert.doesNotMatch(generated.cpa, /retired-model|chat\/retired-model/)
+})
+
 test('requires a private token only when Cloudflare Tunnel is enabled', () => {
   const enabledRoot = fixtureRoot()
   const enabledEnv = path.join(enabledRoot, 'config', 'channels.local.env')

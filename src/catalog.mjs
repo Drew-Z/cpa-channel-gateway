@@ -19,9 +19,10 @@ export function buildModelCatalog(config) {
         channel,
         model
       }
-      candidatesByKey.set(candidate.key, candidate)
       if (!allModels.has(model.upstream)) allModels.set(model.upstream, [])
       allModels.get(model.upstream).push(candidate)
+      if (model.status === 'disabled') continue
+      candidatesByKey.set(candidate.key, candidate)
       if (channel.enabled) {
         if (!logicalModels.has(model.upstream)) logicalModels.set(model.upstream, [])
         logicalModels.get(model.upstream).push(candidate)

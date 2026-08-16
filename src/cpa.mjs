@@ -64,7 +64,7 @@ export function buildCpaConfig(config, channels, routes, runtimePaths) {
 
 function protocolViews(channels, protocol) {
   return channels
-    .map(channel => ({ ...channel, models: channel.models.filter(model => model.protocol === protocol) }))
+    .map(channel => ({ ...channel, models: channel.models.filter(model => model.protocol === protocol && model.status !== 'disabled') }))
     .filter(channel => channel.models.length > 0)
 }
 
@@ -100,16 +100,16 @@ function renderNativeKey(lines, config, channel, routes, { codex }) {
 
 function renderChannelModels(lines, channel, routes) {
   const modelEntries = []
-  for (const model of channel.models) {
+  for (const model of channel.models.filter(item => item.status !== 'disabled')) {
     for (const alias of model.aliases) modelEntries.push(renderModel(model, alias))
   }
   for (const route of routes.stableAliases.filter(item => item.channel === channel.id)) {
     const model = channel.models.find(item => item.upstream === route.model)
-    if (model) modelEntries.push(renderModel(model, route.alias))
+    if (model && model.status !== 'disabled') modelEntries.push(renderModel(model, route.alias))
   }
   for (const route of routes.pinnedAliases.filter(item => item.channel === channel.id)) {
     const model = channel.models.find(item => item.upstream === route.model)
-    if (model) modelEntries.push(renderModel(model, route.alias))
+    if (model && model.status !== 'disabled') modelEntries.push(renderModel(model, route.alias))
   }
   for (const entry of modelEntries) lines.push(...entry)
 }

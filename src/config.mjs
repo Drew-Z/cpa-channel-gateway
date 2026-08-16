@@ -80,7 +80,7 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
       else if (!aliases.includes(`${id}/${upstreamModel}`)) aliases.push(`${id}/${upstreamModel}`)
       for (const alias of aliases) validateAlias(alias, `${id}.models[${modelIndex}]`, seenAliases, errors)
       const status = model.status ?? 'active'
-      if (!['active', 'stale'].includes(status)) errors.push(`${id}.models[${modelIndex}].status is not supported: ${status}`)
+      if (!['active', 'stale', 'disabled'].includes(status)) errors.push(`${id}.models[${modelIndex}].status is not supported: ${status}`)
       models.push({
         upstream: upstreamModel,
         protocol: modelProtocol,
