@@ -1,3 +1,5 @@
+import { normalizeModelKind, normalizeStreamingMode, isGenerationModel } from './model-metadata.mjs'
+
 const MODEL_ID = /^[^\s/][^\r\n]{0,254}$/
 
 export function buildModelCatalogUrl(upstream) {
@@ -92,7 +94,15 @@ export function synchronizeRouteModels(routes, discoveries) {
       const prior = existingByUpstream.get(upstream)
       if (!prior?.length) {
         added += 1
-        models.push({ upstream, aliases: [canonicalModelAlias(channel.id, upstream)], status: 'active' })
+        const kind = normalizeModelKind(undefined, upstream)
+        models.push({
+          upstream,
+          aliases: [canonicalModelAlias(channel.id, upstream)],
+          kind,
+          streaming: normalizeStreamingMode(undefined),
+          canaryEligible: isGenerationModel({ kind, canaryEligible: true }),
+          status: 'active'
+        })
         continue
       }
 

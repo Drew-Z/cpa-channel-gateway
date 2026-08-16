@@ -1,3 +1,5 @@
+import { isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
+
 export function buildModelCatalog(config) {
   const logicalModels = new Map()
   const exactAliases = new Map()
@@ -8,6 +10,7 @@ export function buildModelCatalog(config) {
 
   for (const channel of config.channels.filter(item => item.runtimeEnabled ?? item.enabled)) {
     for (const model of channel.models) {
+      const kind = normalizeModelKind(model.kind, model.upstream)
       const candidate = {
         key: `${channel.id}\0${model.upstream}\0${model.protocol}`,
         channelId: channel.id,
@@ -16,6 +19,9 @@ export function buildModelCatalog(config) {
         protocol: model.protocol,
         priority: model.priority ?? channel.priority ?? 0,
         directAlias: `${channel.id}/${model.upstream}`,
+        kind,
+        streaming: normalizeStreamingMode(model.streaming),
+        canaryEligible: model.canaryEligible ?? isGenerationModel({ kind }),
         channel,
         model
       }
@@ -23,19 +29,19 @@ export function buildModelCatalog(config) {
       allModels.get(model.upstream).push(candidate)
       if (model.status === 'disabled') continue
       candidatesByKey.set(candidate.key, candidate)
-      if (channel.enabled) {
+      if (channel.enabled && isGenerationModel(candidate)) {
         if (!logicalModels.has(model.upstream)) logicalModels.set(model.upstream, [])
         logicalModels.get(model.upstream).push(candidate)
         for (const alias of model.aliases) exactAliases.set(alias, candidate)
       } else if (channel.staged) {
-        stagedExactAliases.set(candidate.directAlias, candidate)
+        if (isGenerationModel(candidate)) stagedExactAliases.set(candidate.directAlias, candidate)
       }
     }
   }
 
   for (const route of [...config.stableAliases, ...config.pinnedAliases]) {
     const candidate = findCandidate(config, candidatesByKey, route.channel, route.model)
-    if (candidate) routeAliases.set(route.alias, candidate)
+    if (candidate && isGenerationModel(candidate)) routeAliases.set(route.alias, candidate)
   }
 
   for (const candidates of logicalModels.values()) candidates.sort(compareCandidates)

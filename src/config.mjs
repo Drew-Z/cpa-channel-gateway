@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { readEnvFile } from './env.mjs'
+import { MODEL_KINDS, STREAMING_MODES, isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
 
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const MODEL_NAME = /^[^\s/][^\r\n]{0,254}$/
@@ -81,6 +82,12 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
       for (const alias of aliases) validateAlias(alias, `${id}.models[${modelIndex}]`, seenAliases, errors)
       const status = model.status ?? 'active'
       if (!['active', 'stale', 'disabled'].includes(status)) errors.push(`${id}.models[${modelIndex}].status is not supported: ${status}`)
+      const kind = normalizeModelKind(model.kind, upstreamModel)
+      if (model.kind !== undefined && !MODEL_KINDS.has(String(model.kind).trim().toLowerCase())) errors.push(`${id}.models[${modelIndex}].kind is not supported: ${model.kind}`)
+      const streaming = normalizeStreamingMode(model.streaming)
+      if (model.streaming !== undefined && !STREAMING_MODES.has(String(model.streaming).trim().toLowerCase())) errors.push(`${id}.models[${modelIndex}].streaming is not supported: ${model.streaming}`)
+      const canaryEligible = model.canaryEligible === undefined ? isGenerationModel({ kind, canaryEligible: true }) : model.canaryEligible
+      if (typeof canaryEligible !== 'boolean') errors.push(`${id}.models[${modelIndex}].canaryEligible must be boolean`)
       models.push({
         upstream: upstreamModel,
         protocol: modelProtocol,
@@ -91,6 +98,9 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
         inputModalities: normalizeModalities(model.inputModalities, ['text']),
         outputModalities: normalizeModalities(model.outputModalities, ['text']),
         thinkingLevels: normalizeThinking(model.thinkingLevels),
+        kind,
+        streaming,
+        canaryEligible,
         status
       })
     }
@@ -123,7 +133,11 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
       const model = String(entry.model ?? '').trim()
       const channel = channelById.get(channelId)
       if (!channel) errors.push(`${field}[${index}] references unknown channel ${channelId}`)
-      else if (!channel.models.some(item => item.upstream === model)) errors.push(`${field}[${index}] references unknown model ${channelId}/${model}`)
+      else {
+        const target = channel.models.find(item => item.upstream === model)
+        if (!target) errors.push(`${field}[${index}] references unknown model ${channelId}/${model}`)
+        else if (!isGenerationModel(target)) errors.push(`${field}[${index}] must reference a generation model: ${channelId}/${model}`)
+      }
       const approvalRef = String(entry.approvalRef ?? '').trim()
       if (pinned && !approvalRef) errors.push(`${field}[${index}] requires approvalRef`)
       return { alias, channel: channelId, model, approvalRef: pinned ? approvalRef : undefined }
@@ -197,7 +211,9 @@ function normalizeThinking(values) {
 function validateGateway(gateway, errors) {
   const q = gateway.queue ?? {}
   const tunnel = gateway.cloudflareTunnel ?? {}
+  const cpa = gateway.cpa ?? {}
   if (typeof gateway.cpa?.localModelCatalog !== 'boolean') errors.push('cpa.localModelCatalog must be boolean')
+  if (cpa.disableCodexCloaking !== undefined && typeof cpa.disableCodexCloaking !== 'boolean') errors.push('cpa.disableCodexCloaking must be boolean')
   if (!ENV_NAME.test(tunnel.enabledEnv ?? '')) errors.push('cloudflareTunnel.enabledEnv must be an environment variable name')
   if (!ENV_NAME.test(tunnel.tokenEnv ?? '')) errors.push('cloudflareTunnel.tokenEnv must be an environment variable name')
   if (tunnel.metricsHost !== '127.0.0.1') errors.push('cloudflareTunnel.metricsHost must be 127.0.0.1')

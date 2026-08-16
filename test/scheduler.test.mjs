@@ -70,6 +70,73 @@ test('disabled models are absent from public catalog and cannot be reserved', ()
   logical.release()
 })
 
+test('filters candidates by requested streaming mode without silent downgrade', () => {
+  const config = fixtureConfig()
+  config.channels[0].models[0].streaming = 'stream-only'
+  config.channels[1].models[0].streaming = 'non-stream-only'
+  const scheduler = createModelScheduler(config)
+
+  const stream = scheduler.reserve('shared-model', { streaming: 'stream' })
+  assert.equal(stream.candidate.channelId, 'alpha')
+  stream.release()
+
+  const nonStream = scheduler.reserve('shared-model', { streaming: 'non-stream' })
+  assert.equal(nonStream.candidate.channelId, 'beta')
+  nonStream.release()
+
+  const onlyStream = { ...fixtureConfig(), channels: [fixtureConfig().channels[0]] }
+  onlyStream.channels[0].models[0].streaming = 'stream-only'
+  const streamOnlyScheduler = createModelScheduler(onlyStream)
+  assert.throws(
+    () => streamOnlyScheduler.reserve('shared-model', { streaming: 'non-stream' }),
+    error => error instanceof GatewayRoutingError && error.code === 'streaming_not_supported' && error.statusCode === 422
+  )
+})
+
+test('reports unavailable instead of unsupported when the only streaming candidate is blocked', () => {
+  const config = fixtureConfig()
+  config.channels[0].models[0].streaming = 'stream-only'
+  config.channels[1].models[0].streaming = 'non-stream-only'
+  const scheduler = createModelScheduler(config)
+  const failed = scheduler.reserve('shared-model', { streaming: 'stream' })
+  scheduler.recordOutcome(failed, 401)
+  failed.release()
+
+  assert.throws(
+    () => scheduler.reserve('shared-model', { streaming: 'stream' }),
+    error => error instanceof GatewayRoutingError && error.code === 'no_eligible_candidates' && error.statusCode === 503
+  )
+})
+
+test('marks protocol status errors as misconfigured candidates', () => {
+  for (const statusCode of [400, 422]) {
+    const scheduler = createModelScheduler(fixtureConfig())
+    const failed = scheduler.reserve('shared-model')
+    scheduler.recordOutcome(failed, statusCode)
+    failed.release()
+    const next = scheduler.reserve('shared-model')
+    assert.equal(next.candidate.channelId, 'beta')
+    next.release()
+  }
+})
+
+test('non-generation models remain auditable but are absent from public routing', () => {
+  const config = fixtureConfig()
+  config.channels[0].models.push({
+    upstream: 'text-embedding-3-small',
+    kind: 'embedding',
+    aliases: ['alpha/text-embedding-3-small']
+  })
+  config.stableAliases.push({ alias: 'embedding-main', channel: 'alpha', model: 'text-embedding-3-small' })
+  const scheduler = createModelScheduler(config)
+  const publicIds = scheduler.catalog.listPublicModels().map(item => item.id)
+  assert.ok(!publicIds.includes('text-embedding-3-small'))
+  assert.ok(!publicIds.includes('alpha/text-embedding-3-small'))
+  assert.ok(!publicIds.includes('embedding-main'))
+  assert.ok(scheduler.catalog.allModels.get('text-embedding-3-small'))
+  assert.throws(() => scheduler.reserve('alpha/text-embedding-3-small'), error => error.code === 'model_not_found')
+})
+
 function fixtureConfig() {
   const alpha = channel('alpha', 100, [
     model('alpha', 'shared-model', 100),

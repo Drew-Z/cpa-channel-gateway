@@ -88,7 +88,7 @@ Critical tests:
 - Add fixture upstreams that capture request shape in memory and assert native header/body preservation without writing sensitive values.
 - Verify Responses SSE and non-SSE behavior, Chat Completions, Claude Messages, authentication replacement, and hop-by-hop header stripping.
 - Run the meaningful poetry canary through each enabled request profile and confirm that adapted requests are labeled correctly.
-- Keep CPA cloaking, identity confusion, and system-prompt substitution disabled in generated configuration tests.
+- Keep CPA identity confusion, Claude cloaking, and system-prompt substitution disabled in generated configuration tests; the documented Codex compatibility-header switch is explicitly covered by the generated configuration test.
 
 ## Delivery Slices
 

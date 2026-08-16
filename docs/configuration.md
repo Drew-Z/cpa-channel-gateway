@@ -35,7 +35,11 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 ## Admin UI
 
+管理台状态同时返回 `loadedRevision`（当前进程已加载）和 `pendingRevision`（磁盘私有配置当前 revision）。两者不同表示配置已写入但必须重启；管理台会继续允许批量路由调整，但会禁用模型测活，避免用旧进程验证新配置。失败登录按来源地址做短时限速，会返回 `429 admin_login_rate_limited` 和 `Retry-After`；会话只保存在内存并主动清理过期条目。
+
 `CPA_MANAGEMENT_KEY` 是独立于 `GATEWAY_API_KEY` 的本地管理密钥，长度至少 32 个字符；为空时 `/admin` 返回 404。启用后，管理员在同一公网端口访问 `/admin`，登录会建立仅存于内存的 HttpOnly/Secure/SameSite 会话。管理 API 的变更请求还需要匹配会话 CSRF token 和同源 `Origin`。
+
+CPA 的 Codex 兼容头由 `gateway.json` 中的 `cpa.disableCodexCloaking` 控制。当前值为 `false`，因此 CPA 的 `codex-api-key` 适配路径会使用 CPA 内置的标准 Codex `User-Agent`/`Originator` 头，适用于只做浅层客户端兼容检查的上游。它不会伪造具体 Codex Desktop 版本，也不能证明请求来自真实客户端；`identity-confuse` 仍关闭。Responses 客户端直连同协议渠道时走网关的 native passthrough，保留该次真实请求的低敏头部。需要改变该策略时只改公开 `gateway.json`，重新生成并重启，不要把浏览器 Cookie、LocalStorage 或会话令牌写入任何 CPA 配置。
 
 当前管理台提供渠道/模型状态、路由管理和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
 
@@ -94,6 +98,12 @@ npm run sync:models
 }
 ```
 
+模型能力元数据用于路由和管理台审核。`kind` 支持 `generation`、`embedding`、`rerank`、`audio`、`image`、`video`、`ocr`、`moderation`；缺省时按模型 ID 做保守推断，无法判断时按 `generation` 处理。只有 `generation` 模型会进入公开 `/v1/models`、生产调度和 stable/pinned alias；其他类型仍保留在管理台模型目录中供审计，但不会执行固定诗词测活。
+
+`streaming` 控制该模型接受的请求模式：`both`（默认）、`stream-only` 或 `non-stream-only`。客户端请求的 `stream: true` 会要求 `stream` 候选，省略或设置为 `false` 会要求 `non-stream` 候选；调度器会筛选支持该模式的健康渠道。如果渠道可用但没有任何候选支持请求模式，网关返回 `422 streaming_not_supported`，不会把流式请求静默改成非流式，也不会自动重放已发送的生成请求。网关会透传上游分块响应，流式客户端无需额外端口或单独别名。
+
+`canaryEligible` 默认对生成模型为 `true`，对明显的非生成模型为 `false`。它只控制管理台/脚本的任务型测活资格，不改变生成模型的公开路由；需要暂时跳过固定任务验收时可以显式设为 `false`。稳定别名仍只能指向 `generation` 模型。
+
 模型可设置 `status`：`active`（默认）、`stale` 或 `disabled`。`disabled` 用于明确淘汰或质量不达标的模型；它仍保留在私有 routes 和管理台审计数据中，但不会出现在公开模型目录、调度候选或生成的 CPA 模型配置中。目录同步会保留该决定，不会因为上游 `/models` 仍返回同一 ID 而自动恢复。
 
 渠道和模型都可以设置整数 `priority`，数值越大越优先；模型级值覆盖渠道级值。未配置时为 `0`，同健康状态和优先级下按渠道 ID 稳定排序。
@@ -110,7 +120,7 @@ npm run sync:models
 
 ## Stable and pinned aliases
 
-`stableAliases` 面向一般客户端切换，修改后客户端无需更换模型名。
+`stableAliases` 面向一般客户端切换，修改后客户端无需更换模型名。它是固定指针，不是自动故障转移：`coding-main` 或 `coding-backup` 指向的渠道不可用时会按该渠道返回错误，不会偷偷切到另一个渠道。需要跨渠道健康选择时使用逻辑模型 ID，或由管理员在验收后移动别名；因此两个别名不需要随每次请求频繁切换。
 
 `pinnedAliases` 面向 AI Daily 等受审批工作流，必须包含非空 `approvalRef`。网关不会替审批系统判断某个配置是否已获批准；它只防止 pinned alias 在配置中变成无来源的浮动路由。
 

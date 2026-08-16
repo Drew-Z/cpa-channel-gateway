@@ -51,6 +51,7 @@
     "maxRetryCredentials": 1,
     "maxRetryIntervalSeconds": 0,
     "sessionAffinity": true,
+    "disableCodexCloaking": false,
     "managementRemote": false,
     "managementPanel": false,
     "usageStatistics": false,

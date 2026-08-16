@@ -103,11 +103,11 @@ Turn the current single-tenant CPA + HAProxy deployment into a manageable model 
 - Requests arriving from a real client use transparent native forwarding whenever the selected channel supports the same wire protocol.
 - Native forwarding preserves the incoming request body and actual non-sensitive end-to-end client headers except for the selected model, upstream authentication, target host, and transport framing required for correct proxying.
 - Server-generated canaries use protocol-faithful public request shapes, streaming behavior, content negotiation, and an honest gateway client identifier.
-- The gateway must not synthesize a hard-coded set of official private headers or claim an official client identity for a server-generated request.
+- The gateway must not synthesize a hard-coded set of private headers or claim cryptographic client authenticity; the documented CPA compatibility flag may add CPA's own standard Codex headers on adapted traffic.
 - Gateway credentials, cookies, proxy headers, Cloudflare headers, hop-by-hop headers, and inbound host/authentication are stripped or replaced before forwarding.
 - Channels can select a reviewed request profile such as `responses-native`, `openai-chat`, or `claude-messages`; arbitrary user-defined header injection is not part of MVP.
 - Chat Completions and Claude channels that require CPA translation are labeled `adapted`; their tests verify compatibility rather than exact native client-wire behavior.
-- CPA cloaking and identity-confusion features remain disabled; request fidelity comes from protocol-correct construction or actual transparent passthrough.
+- CPA's standard Codex compatibility headers may be enabled for adapted Responses traffic when an upstream needs shallow client compatibility; identity-confusion and system-prompt substitution remain disabled. Request fidelity for native traffic still comes from actual transparent passthrough.
 
 ## Acceptance Criteria
 
@@ -132,4 +132,4 @@ Turn the current single-tenant CPA + HAProxy deployment into a manageable model 
 - Automatic capability claims inferred from a model name or `/models` result.
 - Replacing CPA's protocol adapters with a new implementation.
 - Uploading or copying the local Codex auth/config/state directory to the gateway server.
-- Static imitation of Codex request headers when the request did not originate from the real Codex process.
+- Static imitation of private Codex request headers beyond CPA's documented compatibility mode.

@@ -12,7 +12,7 @@
 | Git Repo Address | `https://github.com/Drew-Z/cpa-channel-gateway.git` |
 | Install Branch | `main` |
 | User Uploaded Files | 关闭 |
-| Auto Update | 关闭 |
+| Auto Update | `1` |
 | Git Username | 留空 |
 | Git Access Token | 留空 |
 | Additional Node Packages | 留空 |
@@ -96,7 +96,7 @@ npm run canary
 
 ## 6. 更新和回退
 
-保持 Auto Update 关闭。更新前备份两个 `config/*.local.*` 文件，在维护窗口手工拉取或重装 `main`，再重新启动。固定 CPA/HAProxy/cloudflared 版本改变时只重新安装对应运行时组件。
+保持 Auto Update 为 `1`。公开代码可由面板自动拉取，但私有配置不会从 Git 更新；更新前仍应备份两个 `config/*.local.*` 文件，并在代码更新后重启容器使新进程加载。固定 CPA/HAProxy/cloudflared 版本改变时只重新安装对应运行时组件。
 
 只替换渠道或模型时，先在可信本地副本中执行 `npm run sync:models`，审核并重新上传 `config/routes.local.json`。不要在自动启动流程中周期性同步模型目录。如果面板提供容器终端，再执行：
 

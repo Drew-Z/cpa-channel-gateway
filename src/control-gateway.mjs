@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import http from 'node:http'
 import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol } from './canary.mjs'
 import { ConfigMutationError, createPrivateConfigManager } from './config-manager.mjs'
+import { isCanaryEligible } from './model-metadata.mjs'
 import { createModelScheduler, GatewayRoutingError } from './scheduler.mjs'
 import { createUsageMonitor } from './usage-monitor.mjs'
 
@@ -19,6 +20,8 @@ const HOP_BY_HOP = new Set([
 ])
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000
 const ADMIN_TEST_COOLDOWN_MS = 5_000
+const ADMIN_LOGIN_WINDOW_MS = 5 * 60 * 1000
+const ADMIN_LOGIN_MAX_FAILURES = 5
 const CANARY_PROMPT = '请写一首四句七言绝句，主题是秋夜读书。只输出诗题和诗句。'
 
 export function createControlGateway(config, {
@@ -29,6 +32,7 @@ export function createControlGateway(config, {
   const maxRequestBytes = config.gateway.control.maxRequestBytes
   const cpaPort = config.gateway.internal.cpaPort
   const sessions = new Map()
+  const loginFailures = new Map()
   const lastTests = new Map()
   const lastTestStarted = new Map()
   const server = http.createServer((request, response) => {
@@ -40,7 +44,8 @@ export function createControlGateway(config, {
       const statusCode = error instanceof GatewayRoutingError || error instanceof ConfigMutationError ? error.statusCode : error.statusCode ?? 500
       const code = error instanceof GatewayRoutingError || error instanceof ConfigMutationError ? error.code : error.code ?? 'internal_error'
       sendJson(response, statusCode, { error: { code, message: publicErrorMessage(error, statusCode) } }, {
-        ...(code === 'all_candidates_busy' ? { 'retry-after': String(config.gateway.control.busyRetryAfterSeconds) } : {})
+        ...(code === 'all_candidates_busy' ? { 'retry-after': String(config.gateway.control.busyRetryAfterSeconds) } : {}),
+        ...(code === 'admin_login_rate_limited' ? { 'retry-after': String(Math.ceil((error.retryAfterMs ?? ADMIN_LOGIN_WINDOW_MS) / 1000)) } : {})
       })
     })
   })
@@ -78,10 +83,11 @@ export function createControlGateway(config, {
     try {
       selection = scheduler.reserve(requestedModel, {
         requestId: request.headers['x-request-id'],
-        source: 'production'
+        source: 'production',
+        streaming: body.stream === true ? 'stream' : 'non-stream'
       })
     } catch (error) {
-      if (error instanceof GatewayRoutingError && ['all_candidates_busy', 'no_eligible_candidates'].includes(error.code)) {
+      if (error instanceof GatewayRoutingError && ['all_candidates_busy', 'no_eligible_candidates', 'streaming_not_supported'].includes(error.code)) {
         const resolved = scheduler.catalog.resolve(requestedModel)
         usageMonitor.record({
           requestedModel,
@@ -226,11 +232,28 @@ export function createControlGateway(config, {
       return
     }
     const body = await readJsonBody(request, maxRequestBytes)
+    const now = Date.now()
+    pruneSessions(now)
+    pruneLoginFailures(now)
+    const clientKey = request.socket.remoteAddress ?? 'unknown'
+    const prior = loginFailures.get(clientKey)
+    if (prior?.blockedUntil > now) {
+      const error = publicError('admin_login_rate_limited', 429, 'Too many failed admin logins; try again later')
+      error.retryAfterMs = prior.blockedUntil - now
+      throw error
+    }
     const provided = typeof body.key === 'string' ? body.key : ''
     if (!safeEqual(provided, config.managementKey)) {
+      const failures = prior?.windowStartedAt > now - ADMIN_LOGIN_WINDOW_MS ? (prior.failures + 1) : 1
+      loginFailures.set(clientKey, {
+        failures,
+        windowStartedAt: failures === 1 ? now : prior.windowStartedAt,
+        blockedUntil: failures >= ADMIN_LOGIN_MAX_FAILURES ? now + ADMIN_LOGIN_WINDOW_MS : 0
+      })
       sendJson(response, 401, { error: { code: 'invalid_management_key', message: 'Invalid management key' } })
       return
     }
+    loginFailures.delete(clientKey)
     const token = crypto.randomBytes(32).toString('base64url')
     const csrfToken = crypto.randomBytes(24).toString('base64url')
     sessions.set(token, { token, csrfToken, expiresAt: Date.now() + ADMIN_SESSION_TTL_MS })
@@ -240,16 +263,25 @@ export function createControlGateway(config, {
   }
 
   async function runAdminTest(body) {
+    if (configManager?.status()?.restartRequired) {
+      throw publicError('restart_required', 409, 'Configuration has changed; restart the gateway before testing models')
+    }
     const requestedModel = typeof body.model === 'string' ? body.model.trim() : ''
     if (!requestedModel) throw publicError('invalid_request', 400, 'Test body must include a model')
+    const adminCandidate = findAdminCandidate(requestedModel)
     const resolved = scheduler.catalog.resolve(requestedModel)
-    if (!resolved) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${requestedModel}`)
+    if (!resolved && !adminCandidate) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${requestedModel}`)
+    if (!resolved && adminCandidate) throw publicError('canary_not_supported', 409, 'Fixed text canary is available only for eligible generation models')
     if (!['direct', 'staged-direct'].includes(resolved.kind)) throw publicError('exact_model_required', 400, 'Manual tests require an exact channel/model id')
+    if (!adminCandidate) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${requestedModel}`)
+    if (!isCanaryEligible(adminCandidate)) {
+      throw publicError('canary_not_supported', 409, 'Fixed text canary is available only for eligible generation models')
+    }
     const previousStartedAt = lastTestStarted.get(requestedModel) ?? 0
     if (Date.now() - previousStartedAt < ADMIN_TEST_COOLDOWN_MS) {
       throw publicError('test_rate_limited', 429, 'This model was tested too recently')
     }
-    const selection = scheduler.reserve(requestedModel, { source: 'manual-test' })
+    const selection = scheduler.reserve(requestedModel, { source: 'manual-test', streaming: 'non-stream' })
     lastTestStarted.set(requestedModel, Date.now())
     const startedAt = Date.now()
     const protocol = normalizeCanaryProtocol(selection.candidate.protocol)
@@ -379,6 +411,8 @@ export function createControlGateway(config, {
     return {
       ready: true,
       configRevision: configStatus?.revision ?? null,
+      loadedRevision: configStatus?.loadedRevision ?? null,
+      pendingRevision: configStatus?.pendingRevision ?? configStatus?.revision ?? null,
       restartRequired: configStatus?.restartRequired ?? false,
       stableAliases: routing.stableAliases,
       pinnedAliases: routing.pinnedAliases,
@@ -406,23 +440,62 @@ export function createControlGateway(config, {
   }
 
   function adminModels() {
-    const pendingModels = new Map((configManager?.routing().models ?? []).map(model => [`${model.channel}/${model.model}`, model.status]))
-    return [...scheduler.catalog.allModels.entries()]
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([id, candidates]) => ({
-        id,
-        candidates: candidates.map(candidate => ({
+    const pending = configManager?.routing()
+    const loadedCandidates = new Map(
+      [...scheduler.catalog.allModels.values()].flat().map(candidate => [candidate.directAlias, candidate])
+    )
+    const models = pending
+      ? pending.models.map(model => {
+          const directId = `${model.channel}/${model.model}`
+          const loaded = loadedCandidates.get(directId)
+          return {
+            channel: model.channel,
+            upstreamModel: model.model,
+            directId,
+            protocol: model.protocol ?? loaded?.protocol ?? 'unknown',
+            priority: model.priority ?? loaded?.priority ?? 0,
+            kind: model.kind ?? loaded?.kind ?? 'generation',
+            streaming: model.streaming ?? loaded?.streaming ?? 'both',
+            canaryEligible: model.canaryEligible ?? loaded?.canaryEligible ?? true,
+            staged: model.staged ?? Boolean(loaded?.channel.staged),
+            channelEnabled: model.channelEnabled ?? Boolean(loaded?.channel.enabled),
+            status: model.status ?? loaded?.model.status ?? 'active',
+            busy: loaded ? scheduler.reservations.isBusy(model.channel) : false,
+            lastTest: lastTests.get(directId) ?? null
+          }
+        })
+      : [...scheduler.catalog.allModels.values()].flat().map(candidate => ({
           channel: candidate.channelId,
           upstreamModel: candidate.upstreamModel,
           directId: candidate.directAlias,
           protocol: candidate.protocol,
           priority: candidate.priority,
+          kind: candidate.kind,
+          streaming: candidate.streaming,
+          canaryEligible: candidate.canaryEligible,
           staged: Boolean(candidate.channel.staged),
-          status: pendingModels.get(`${candidate.channelId}/${candidate.upstreamModel}`) ?? candidate.model.status ?? 'active',
+          channelEnabled: Boolean(candidate.channel.enabled),
+          status: candidate.model.status ?? 'active',
           busy: scheduler.reservations.isBusy(candidate.channelId),
           lastTest: lastTests.get(candidate.directAlias) ?? null
         }))
-      }))
+    const groups = new Map()
+    for (const candidate of models) {
+      const group = groups.get(candidate.upstreamModel) ?? []
+      group.push(candidate)
+      groups.set(candidate.upstreamModel, group)
+    }
+    return [...groups.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([id, candidates]) => ({ id, candidates: candidates.sort((left, right) => left.channel.localeCompare(right.channel) || left.directId.localeCompare(right.directId)) }))
+  }
+
+  function findAdminCandidate(directId) {
+    for (const candidates of scheduler.catalog.allModels.values()) {
+      const candidate = candidates.find(item => item.directAlias === directId)
+      if (candidate) return candidate
+    }
+    return null
   }
 
   function proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel }) {
@@ -524,6 +597,7 @@ export function createControlGateway(config, {
   }
 
   function requireAdminSession(request) {
+    pruneSessions()
     const token = parseCookie(request.headers.cookie).cpa_admin
     const session = token ? sessions.get(token) : null
     if (!session || session.expiresAt <= Date.now()) {
@@ -531,6 +605,18 @@ export function createControlGateway(config, {
       throw publicError('admin_unauthorized', 401, 'Admin session is missing or expired')
     }
     return session
+  }
+
+  function pruneSessions(now = Date.now()) {
+    for (const [token, session] of sessions) {
+      if (session.expiresAt <= now) sessions.delete(token)
+    }
+  }
+
+  function pruneLoginFailures(now = Date.now()) {
+    for (const [clientKey, attempt] of loginFailures) {
+      if (attempt.blockedUntil <= now && attempt.windowStartedAt <= now - ADMIN_LOGIN_WINDOW_MS) loginFailures.delete(clientKey)
+    }
   }
 
   function requireAdminMutation(request, session) {
@@ -692,20 +778,24 @@ let csrf='';let restartRequired=false;let modelCandidates=new Map();
 const $=id=>document.getElementById(id);
 async function call(path, options={}){const method=(options.method||'GET').toUpperCase();const headers={'content-type':'application/json',...(options.headers||{})};if(!['GET','HEAD','OPTIONS'].includes(method)&&csrf)headers['x-csrf-token']=csrf;const r=await fetch(path,{...options,mode:'same-origin',credentials:'same-origin',headers});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error?.message||'请求失败');return data}
 async function login(){try{const data=await call('/admin/api/session',{method:'POST',body:JSON.stringify({key:$('key').value})});csrf=data.csrfToken;$('login').hidden=true;$('app').hidden=false;await refresh()}catch(e){$('loginError').textContent=e.message}}
-async function refresh(){try{const [status,models,usage,discovery]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage'),call('/admin/api/channel-discovery')]);restartRequired=status.restartRequired===true;$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次'+(restartRequired?'；配置已更新，等待重启':'');$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>Base URL</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td class="'+(c.busy?'busy':'')+'">'+channelState(c)+(c.busy?' / 当前忙碌':'')+'</td><td>'+c.modelCount+'</td><td>'+esc(healthLabel(c.health))+'</td><td>'+channelActions(c)+'</td></tr>').join('')+'</table>';$('discovery').innerHTML=discoveryHtml(discovery);$('usage').innerHTML=usageHtml(usage);$('routing').innerHTML=routingHtml(status.stableAliases||[]);populateSyncChannelSelect(status.channels);populateModelSelect(models.data)}catch(e){$('summary').textContent=e.message}}
+async function refresh(){try{const [status,models,usage,discovery]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage'),call('/admin/api/channel-discovery')]);restartRequired=status.restartRequired===true;const revisionText=restartRequired?'；待重启 '+(status.pendingRevision||status.configRevision||'-')+'，运行中 '+(status.loadedRevision||'未知'):'；运行配置 '+(status.loadedRevision||status.configRevision||'未知');$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次'+revisionText;$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>Base URL</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td class="'+(c.busy?'busy':'')+'">'+channelState(c)+(c.busy?' / 当前忙碌':'')+'</td><td>'+c.modelCount+'</td><td>'+esc(healthLabel(c.health))+'</td><td>'+channelActions(c)+'</td></tr>').join('')+'</table>';$('discovery').innerHTML=discoveryHtml(discovery);$('usage').innerHTML=usageHtml(usage);$('routing').innerHTML=routingHtml(status.stableAliases||[]);$('models').innerHTML=modelsHtml(models.data);populateSyncChannelSelect(status.channels);populateModelSelect(models.data)}catch(e){$('summary').textContent=e.message}}
 function populateSyncChannelSelect(channels){const select=$('syncChannelIds');const previous=select.value;select.replaceChildren(new Option('全部生产渠道',''));for(const channel of channels.slice().sort((left,right)=>left.id.localeCompare(right.id))){const state=channel.staged?'待测试':channel.enabled?'生产启用':'已停用';select.add(new Option(channel.id+' ['+state+']',channel.id))}if(channels.some(channel=>channel.id===previous))select.value=previous}
 function healthLabel(value){return ({healthy:'健康',unknown:'未测试',degraded:'降级',cooling:'冷却中','auth-failed':'认证失败','payment-blocked':'支付受限'}[value]||value||'未测试')}
-function populateModelSelect(groups){const select=$('model');const previous=select.value;select.replaceChildren(new Option('请选择要测试或管理的精确模型',''));const candidates=groups.flatMap(group=>group.candidates||[]).filter((candidate,index,list)=>list.findIndex(item=>item.directId===candidate.directId)===index).sort((left,right)=>left.channel.localeCompare(right.channel)||left.upstreamModel.localeCompare(right.upstreamModel));modelCandidates=new Map();const byChannel=new Map();for(const candidate of candidates){const optionGroup=byChannel.get(candidate.channel)||(()=>{const created=document.createElement('optgroup');created.label=candidate.channel;select.append(created);byChannel.set(candidate.channel,created);return created})();const states=[];if(candidate.staged)states.push('待测试');if(candidate.status==='stale')states.push('stale');if(candidate.status==='disabled')states.push('已禁用');if(candidate.busy)states.push('当前忙碌');if(!states.length)states.push(candidate.protocol);const directId=candidate.directId||candidate.channel+'/'+candidate.upstreamModel;modelCandidates.set(directId,candidate);const option=new Option(directId+' ['+states.join('，')+']',directId);option.title=directId;optionGroup.append(option)}if(modelCandidates.has(previous))select.value=previous;updateModelButtons();$('testHint').textContent=restartRequired?'配置已更新；仍可继续调整路由，重启后再执行模型测活':candidates.length?'请选择一个精确模型；测试会发送固定诗词任务，忙碌或已禁用模型不能测活':'暂无可测模型，请先同步模型目录'}
+function populateModelSelect(groups){const select=$('model');const previous=select.value;select.replaceChildren(new Option('请选择要测试或管理的精确模型',''));const candidates=groups.flatMap(group=>group.candidates||[]).filter((candidate,index,list)=>list.findIndex(item=>item.directId===candidate.directId)===index).sort((left,right)=>left.channel.localeCompare(right.channel)||left.upstreamModel.localeCompare(right.upstreamModel));modelCandidates=new Map();const byChannel=new Map();for(const candidate of candidates){const optionGroup=byChannel.get(candidate.channel)||(()=>{const created=document.createElement('optgroup');created.label=candidate.channel;select.append(created);byChannel.set(candidate.channel,created);return created})();const states=[modelKindLabel(candidate.kind),streamingLabel(candidate.streaming)];if(candidate.staged)states.push('待测试');if(candidate.channelEnabled===false&&!candidate.staged)states.push('已停用');if(candidate.status==='stale')states.push('stale');if(candidate.status==='disabled')states.push('已禁用');if(candidate.busy)states.push('当前忙碌');const directId=candidate.directId||candidate.channel+'/'+candidate.upstreamModel;modelCandidates.set(directId,candidate);const option=new Option(directId+' ['+states.join('，')+']',directId);option.title=directId;optionGroup.append(option)}if(modelCandidates.has(previous))select.value=previous;updateModelButtons();$('testHint').textContent=restartRequired?'配置已更新；仍可继续调整路由，重启后再执行模型测活':candidates.length?'请选择一个精确模型；忙碌或已禁用模型不能测活；仅生成型且具备测活资格的模型可执行固定任务':'暂无模型，请先同步模型目录'}
 function selectedModel(){return modelCandidates.get($('model').value)}
-function updateModelButtons(){const candidate=selectedModel();const unavailable=!candidate;const disabled=candidate?.status==='disabled';$('testButton').disabled=restartRequired||unavailable||disabled||Boolean(candidate?.busy);$('setMainButton').disabled=unavailable||disabled;$('setBackupButton').disabled=unavailable||disabled;$('toggleModelButton').disabled=unavailable;$('toggleModelButton').textContent=disabled?'恢复模型':'禁用模型'}
+function updateModelButtons(){const candidate=selectedModel();const unavailable=!candidate;const disabled=candidate?.status==='disabled';const generation=candidate?.kind==='generation';const canary=generation&&candidate?.canaryEligible!==false;$('testButton').disabled=restartRequired||unavailable||disabled||Boolean(candidate?.busy)||!canary;$('setMainButton').disabled=unavailable||disabled||!generation;$('setBackupButton').disabled=unavailable||disabled||!generation;$('toggleModelButton').disabled=unavailable;$('toggleModelButton').textContent=disabled?'恢复模型':'禁用模型'}
+function modelKindLabel(value){return ({generation:'生成',embedding:'向量',rerank:'重排',audio:'音频',image:'图像',video:'视频',ocr:'OCR',moderation:'审核'}[value]||value||'生成')}
+function streamingLabel(value){return ({both:'流式/非流式', 'stream-only':'仅流式', 'non-stream-only':'仅非流式'}[value]||'流式/非流式')}
+function modelsHtml(groups){const rows=groups.flatMap(group=>group.candidates||[]);if(!rows.length)return '<p class="muted">暂无模型目录。</p>';return '<table><tr><th>精确模型</th><th>类型</th><th>请求模式</th><th>状态</th><th>测活</th></tr>'+rows.map(item=>'<tr><td><code>'+esc(item.directId)+'</code></td><td>'+esc(modelKindLabel(item.kind))+'</td><td>'+esc(streamingLabel(item.streaming))+'</td><td>'+esc(item.staged?'待测试':item.channelEnabled===false?'已停用':item.status||'active')+'</td><td>'+esc(item.canaryEligible&&item.kind==='generation'?'可用':'不适用')+'</td></tr>').join('')+'</table>'}
 function routingHtml(aliases){if(!aliases.length)return '<p class="muted">尚未配置稳定别名。</p>';return '<h3>稳定别名</h3><table><tr><th>别名</th><th>当前目标</th></tr>'+aliases.map(item=>'<tr><td><code>'+esc(item.alias)+'</code></td><td><code>'+esc(item.channel+'/'+item.model)+'</code></td></tr>').join('')+'</table>'}
 function channelState(c){return c.staged?'待测试':c.enabled?'生产启用':'已停用'}
 function channelActions(c){const id=esc(c.id);let actions='';if(c.staged)actions='<button class="channelAction" data-id="'+id+'" data-mode="production">设为生产</button> <button class="channelAction secondary" data-id="'+id+'" data-mode="disabled">移出待测</button>';else if(c.enabled)actions='<button class="channelAction secondary" data-id="'+id+'" data-mode="disabled">停用</button>';else actions='<button class="channelAction" data-id="'+id+'" data-mode="staged">设为待测试</button> <button class="channelAction secondary" data-id="'+id+'" data-mode="production">直接启用</button>';if(!c.enabled&&!c.staged&&!c.busy)actions+=' <button class="deleteChannel secondary" data-id="'+id+'">删除</button>';return actions}
 function discoveryHtml(data){let html='';if(data.pendingRestart.length)html+='<h3>已写入配置，等待重启</h3><table><tr><th>渠道</th><th>Base URL</th><th>协议</th><th>状态</th></tr>'+data.pendingRestart.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td>'+esc(c.protocol)+'</td><td class="busy">重启后加载</td></tr>').join('')+'</table>';if(data.unregistered.length)html+='<h3>env 中发现、尚未登记</h3><table><tr><th>渠道</th><th>Base URL</th><th>协议</th><th>操作</th></tr>'+data.unregistered.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td>'+esc(c.protocol)+'</td><td>'+ (c.ready?'<button class="importChannel" data-id="'+esc(c.id)+'" data-sync="false">导入待测试</button> <button class="importChannel secondary" data-id="'+esc(c.id)+'" data-sync="true">导入并同步</button>':'<span class="error">缺少 '+esc(c.missing.join(', '))+'</span>')+'</td></tr>').join('')+'</table>';return html||'<p class="muted">没有发现新的 env 渠道。</p>'}
 function usageHtml(data){const s=data.summary;const overall='<table><tr><th>请求</th><th>成功</th><th>失败</th><th>取消</th><th>成功率</th><th>存储</th></tr><tr><td>'+s.total+'</td><td>'+s.success+'</td><td>'+s.failure+'</td><td>'+s.cancelled+'</td><td>'+rate(s.successRate)+'</td><td>'+esc(data.storage)+'</td></tr></table>';if(!s.total)return overall+'<p class="muted">最近 24 小时还没有真实业务请求。</p>';const logical=data.logicalModels.length?'<h3>逻辑模型</h3>'+statsTable(data.logicalModels):'';const requested=data.models.length?'<h3>请求入口</h3>'+statsTable(data.models):'';const physical=data.physicalModels.length?'<h3>实际渠道模型</h3>'+statsTable(data.physicalModels):'';return overall+logical+requested+physical}
-function statsTable(items){return '<table><tr><th>模型</th><th>请求</th><th>成功</th><th>失败</th><th>取消</th><th>成功率</th><th>最后请求</th></tr>'+items.map(item=>'<tr><td>'+esc(item.id)+'</td><td>'+item.total+'</td><td>'+item.success+'</td><td>'+item.failure+'</td><td>'+item.cancelled+'</td><td>'+rate(item.successRate)+'</td><td>'+esc(item.lastSeenAt||'-')+'</td></tr>').join('')+'</table>'}
+function statsTable(items){return '<table><tr><th>模型</th><th>请求</th><th>成功</th><th>失败</th><th>取消</th><th>成功率</th><th>最后请求</th></tr>'+items.map(item=>'<tr><td>'+esc(item.id)+'</td><td>'+item.total+'</td><td>'+item.success+'</td><td>'+item.failure+'</td><td>'+item.cancelled+'</td><td>'+rate(item.successRate)+'</td><td title="'+esc(item.lastSeenAt||'-')+'">'+esc(formatTimestamp(item.lastSeenAt))+'</td></tr>').join('')+'</table>'}
 function rate(value){return value===null?'—':value.toFixed(2)+'%'}
 function formatLatency(value){return Number.isFinite(value)?value<1000?value+' ms':(value/1000).toFixed(1)+' s':'—'}
+function formatTimestamp(value){if(!value)return '-';const date=new Date(value);return Number.isNaN(date.getTime())?value:date.toLocaleString()}
 async function addChannel(sync=false){const button=sync?$('addAndSyncButton'):$('addChannelButton');if(!$('addChannelForm').reportValidity())return;button.disabled=true;try{const data=await call('/admin/api/channels',{method:'POST',body:JSON.stringify({id:$('channelId').value,name:$('channelName').value,baseUrl:$('channelUrl').value,apiKey:$('channelKey').value,protocol:$('channelProtocol').value,priority:Number($('channelPriority').value),sync})});$('channelResult').className='ok';$('channelResult').textContent='已写入 revision '+data.revision+(data.sync?.changed?'，模型目录已同步':'')+'，请重启应用后生效';$('channelKey').value='';await refresh()}catch(e){$('channelResult').className='error';$('channelResult').textContent=e.message}finally{button.disabled=false}}
 async function setChannelMode(id,mode){const patch=mode==='production'?{enabled:true,staged:false}:mode==='staged'?{enabled:false,staged:true}:{enabled:false,staged:false};try{const data=await call('/admin/api/channels/'+encodeURIComponent(id),{method:'PATCH',body:JSON.stringify(patch)});$('channelResult').className='ok';$('channelResult').textContent='已写入 revision '+data.revision+'，请重启应用后生效';await refresh()}catch(e){$('channelResult').className='error';$('channelResult').textContent=e.message}}
 async function syncModels(){const button=$('syncButton');const selected=$('syncChannelIds').value;const channels=selected?[selected]:[];button.disabled=true;$('syncResult').className='muted';$('syncResult').textContent='正在读取所选渠道的 /models…';try{const data=await call('/admin/api/model-sync',{method:'POST',body:JSON.stringify({channels})});const found=data.channels.reduce((sum,item)=>sum+item.discovered,0);$('syncResult').className='ok';$('syncResult').textContent='同步完成：发现 '+found+' 个模型'+(data.changed?'；已写入 revision '+data.revision+'，请重启应用后生效':'；目录无变化');await refresh()}catch(e){$('syncResult').className='error';$('syncResult').textContent=e.message}finally{button.disabled=false}}

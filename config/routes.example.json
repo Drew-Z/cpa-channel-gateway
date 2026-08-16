@@ -12,6 +12,9 @@
           "protocol": "responses",
           "priority": 100,
           "aliases": ["sample/example-coding-model"],
+          "kind": "generation",
+          "streaming": "both",
+          "canaryEligible": true,
           "inputModalities": ["text"],
           "outputModalities": ["text"]
         }

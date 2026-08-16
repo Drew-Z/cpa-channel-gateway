@@ -17,7 +17,7 @@ test('generates protocol-specific CPA sections and one HAProxy queue per channel
   assert.match(result.cpa, /alias: "ai-daily-v1"/)
   assert.match(result.cpa, /request-retry: 0/)
   assert.match(result.cpa, /identity-confuse: false/)
-  assert.match(result.cpa, /disable-codex-cloaking: true/)
+  assert.match(result.cpa, /disable-codex-cloaking: false/)
   assert.match(result.cpa, /^host: "127\.0\.0\.1"$/m)
   assert.match(result.cpa, /^port: 24675$/m)
   assert.doesNotMatch(result.cpa, /^\s+prefix:/m)
@@ -61,6 +61,13 @@ test('rejects duplicate aliases and non-serial queue settings', () => {
   gateway.queue.maxConnectionsPerChannel = 2
   fs.writeFileSync(gatewayPath, JSON.stringify(gateway))
   assert.throws(() => loadConfig(second), /must be exactly 1/)
+
+  const third = fixtureRoot()
+  const thirdGatewayPath = path.join(third, 'config', 'gateway.json')
+  const thirdGateway = JSON.parse(fs.readFileSync(thirdGatewayPath, 'utf8'))
+  thirdGateway.cpa.disableCodexCloaking = 'false'
+  fs.writeFileSync(thirdGatewayPath, JSON.stringify(thirdGateway))
+  assert.throws(() => loadConfig(third), /cpa\.disableCodexCloaking must be boolean/)
 })
 
 test('does not fall back to example secrets during normal validation', () => {
@@ -101,6 +108,26 @@ test('accepts disabled models without exposing them through generated CPA config
   assert.equal(loadConfig(root).channels[0].models.find(model => model.upstream === 'retired-model').status, 'disabled')
   const generated = generateRelease(root)
   assert.doesNotMatch(generated.cpa, /retired-model|chat\/retired-model/)
+})
+
+test('normalizes model capabilities and rejects non-generation stable aliases', () => {
+  const root = fixtureRoot()
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+  routes.channels[0].models.push({
+    upstream: 'text-embedding-3-small',
+    aliases: ['chat/text-embedding-3-small']
+  })
+  fs.writeFileSync(routesPath, JSON.stringify(routes))
+  const loaded = loadConfig(root)
+  const embedding = loaded.channels[0].models.find(model => model.upstream === 'text-embedding-3-small')
+  assert.equal(embedding.kind, 'embedding')
+  assert.equal(embedding.streaming, 'both')
+  assert.equal(embedding.canaryEligible, false)
+
+  routes.stableAliases.push({ alias: 'embedding-main', channel: 'chat', model: 'text-embedding-3-small' })
+  fs.writeFileSync(routesPath, JSON.stringify(routes))
+  assert.throws(() => loadConfig(root), /must reference a generation model/)
 })
 
 test('requires a private token only when Cloudflare Tunnel is enabled', () => {

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import { buildModelCatalog, compareCandidates } from './catalog.mjs'
+import { supportsStreaming } from './model-metadata.mjs'
 
 const BLOCKED_CHANNEL_STATES = new Set(['auth-failed', 'payment-blocked'])
 
@@ -59,7 +60,17 @@ export function createModelScheduler(config, { reservations = new ChannelReserva
   function reserve(modelId, metadata = {}) {
     const resolved = catalog.resolve(modelId)
     if (!resolved) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${modelId}`)
-    const eligible = resolved.candidates.filter(candidate => isEligible(candidate, channelState, candidateState, now(), metadata.source ?? 'production'))
+    const requestedStreaming = metadata.streaming
+    const modeCandidates = requestedStreaming
+      ? resolved.candidates.filter(candidate => supportsStreaming(candidate.model, requestedStreaming))
+      : resolved.candidates
+    if (!modeCandidates.length && requestedStreaming) {
+      throw new GatewayRoutingError('streaming_not_supported', 422, `No candidate supports ${requestedStreaming} requests for model: ${modelId}`, {
+        requestedStreaming,
+        candidateCount: resolved.candidates.length
+      })
+    }
+    const eligible = modeCandidates.filter(candidate => isEligible(candidate, channelState, candidateState, now(), metadata.source ?? 'production'))
     if (!eligible.length) {
       throw new GatewayRoutingError('no_eligible_candidates', 503, `No eligible channel is available for model: ${modelId}`)
     }
@@ -98,7 +109,7 @@ export function createModelScheduler(config, { reservations = new ChannelReserva
         cooldownUntil: retryAt(headers['retry-after'], now()),
         updatedAt: now()
       })
-    } else if ([404, 405].includes(statusCode)) {
+    } else if ([400, 404, 405, 422].includes(statusCode)) {
       candidateState.set(candidate.key, { health: 'misconfigured', updatedAt: now() })
     } else if (statusCode >= 500) {
       channelState.set(candidate.channelId, { ...previous, health: 'degraded', updatedAt: now() })

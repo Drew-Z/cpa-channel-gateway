@@ -232,7 +232,7 @@ The gateway supports fidelity without requiring a local test runner:
 2. **Protocol-faithful canary**: a server-generated test uses the same public API shape, SSE/non-SSE behavior, content negotiation, and error parsing expected for the selected protocol, but identifies itself honestly as the gateway.
 3. **Adapted transport**: when CPA must translate between Responses, Chat Completions, or Claude Messages, the result is labeled `adapted` and is not described as an exact native-client request.
 
-Reviewed channel profiles are limited to `responses-native`, `openai-chat`, and `claude-messages`. They define public protocol behavior, not copied private identity headers. CPA cloaking, identity confusion, and system-prompt substitution remain disabled.
+Reviewed channel profiles are limited to `responses-native`, `openai-chat`, and `claude-messages`. They define public protocol behavior, not copied private identity headers. CPA's standard Codex compatibility headers may be enabled for adapted Responses traffic; identity confusion, Claude cloaking, and system-prompt substitution remain disabled.
 
 Official OpenAI documentation confirms that custom providers can add headers, but it does not define Codex's internal header set as a stable public contract. The gateway therefore preserves headers actually received from clients and uses documented public protocol fields for server-generated requests. See [Advanced Configuration](https://learn.chatgpt.com/docs/config-file/config-advanced).
 

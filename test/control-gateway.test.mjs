@@ -48,6 +48,34 @@ test('native Responses forwarding preserves reviewed client headers and replaces
   assert.equal(captured.headers['cf-ray'], undefined)
 })
 
+test('rejects unsupported streaming mode before contacting the upstream', async t => {
+  let upstreamCalls = 0
+  const upstream = http.createServer((request, response) => {
+    upstreamCalls += 1
+    request.resume()
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"output_text":"unexpected"}')
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+  const config = fixtureConfig(upstreamAddress.port)
+  config.channels[0].models[0].streaming = 'non-stream-only'
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const result = await request({
+    port: address.port,
+    path: '/v1/responses',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'coding-main', input: 'streaming request', stream: true }
+  })
+  assert.equal(result.statusCode, 422)
+  assert.equal(JSON.parse(result.body).error.code, 'streaming_not_supported')
+  assert.equal(upstreamCalls, 0)
+  assert.equal(gateway.usageMonitor.snapshot().summary.failure, 1)
+})
+
 test('adapted traffic targets the exact CPA alias instead of another channel candidate', async t => {
   let captured
   const cpa = http.createServer(async (request, response) => {
@@ -363,7 +391,10 @@ test('admin API updates model status and stable aliases through the private conf
     routing: () => ({
       stableAliases: [{ alias: 'coding-main', channel: 'free', model: 'shared-model' }],
       pinnedAliases: [],
-      models: [{ channel: 'free', model: 'shared-model', status: 'disabled' }]
+      models: [
+        { channel: 'free', model: 'shared-model', status: 'disabled' },
+        { channel: 'future', model: 'pending-model', protocol: 'responses', kind: 'generation', streaming: 'both', canaryEligible: true, staged: true, channelEnabled: false, status: 'active' }
+      ]
     }),
     updateModelStatus: (channel, model, status) => {
       calls.push({ operation: 'model', channel, model, status })
@@ -386,7 +417,18 @@ test('admin API updates model status and stable aliases through the private conf
   const status = await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })
   assert.equal(JSON.parse(status.body).stableAliases[0].alias, 'coding-main')
   const models = await request({ port: address.port, method: 'GET', path: '/admin/api/models', headers: { cookie } })
-  assert.equal(JSON.parse(models.body).data[0].candidates[0].status, 'disabled')
+  const modelGroups = JSON.parse(models.body).data
+  assert.equal(modelGroups.find(group => group.id === 'shared-model').candidates[0].status, 'disabled')
+  assert.equal(modelGroups.find(group => group.id === 'pending-model').candidates[0].directId, 'future/pending-model')
+
+  const blockedTest = await request({
+    port: address.port,
+    path: '/admin/api/tests',
+    headers,
+    body: { model: 'free/shared-model' }
+  })
+  assert.equal(blockedTest.statusCode, 409)
+  assert.equal(JSON.parse(blockedTest.body).error.code, 'restart_required')
 
   const modelUpdate = await request({
     port: address.port,
@@ -408,6 +450,25 @@ test('admin API updates model status and stable aliases through the private conf
     { operation: 'model', channel: 'free', model: 'shared-model', status: 'active' },
     { operation: 'alias', alias: 'coding-backup', channel: 'free', model: 'shared-model' }
   ])
+})
+
+test('admin models honor an explicitly empty pending catalog', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const configManager = {
+    status: () => ({ revision: 'empty-pending-revision', restartRequired: true }),
+    routing: () => ({ stableAliases: [], pinnedAliases: [], models: [] })
+  }
+  const gateway = createControlGateway(config, { configManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const models = await request({ port: address.port, method: 'GET', path: '/admin/api/models', headers: { cookie } })
+
+  assert.equal(models.statusCode, 200)
+  assert.deepEqual(JSON.parse(models.body).data, [])
 })
 
 test('admin page is no-store and uses a per-response CSP nonce', async t => {
@@ -441,6 +502,31 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.body, /<th>Base URL<\/th>/)
   assert.match(first.body, /mode:'same-origin'/)
   assert.match(first.body, /headers\['x-csrf-token'\]=csrf/)
+})
+
+test('rate limits repeated failed admin logins', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const rejected = await request({
+      port: address.port,
+      path: '/admin/api/session',
+      body: { key: 'wrong-management-key' }
+    })
+    assert.equal(rejected.statusCode, 401)
+  }
+  const limited = await request({
+    port: address.port,
+    path: '/admin/api/session',
+    body: { key: config.managementKey }
+  })
+  assert.equal(limited.statusCode, 429)
+  assert.equal(JSON.parse(limited.body).error.code, 'admin_login_rate_limited')
+  assert.ok(Number(limited.headers['retry-after']) > 0)
 })
 
 const GATEWAY_KEY = 'fixture_gateway_key_that_is_long_enough_123456'

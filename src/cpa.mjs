@@ -1,4 +1,5 @@
 import { yamlList, yamlScalar } from './yaml.mjs'
+import { isGenerationModel } from './model-metadata.mjs'
 
 export function buildCpaConfig(config, channels, routes, runtimePaths) {
   const gateway = config.gateway
@@ -35,7 +36,7 @@ export function buildCpaConfig(config, channels, routes, runtimePaths) {
     '  disable-cloaking-model-list: true',
     'codex:',
     '  identity-confuse: false',
-    '  disable-codex-cloaking: true',
+    `  disable-codex-cloaking: ${yamlScalar(gateway.cpa.disableCodexCloaking ?? true)}`,
     '  optimize-multi-agent-v2: false',
     'routing:',
     '  strategy: fill-first',
@@ -64,7 +65,7 @@ export function buildCpaConfig(config, channels, routes, runtimePaths) {
 
 function protocolViews(channels, protocol) {
   return channels
-    .map(channel => ({ ...channel, models: channel.models.filter(model => model.protocol === protocol && model.status !== 'disabled') }))
+    .map(channel => ({ ...channel, models: channel.models.filter(model => model.protocol === protocol && model.status !== 'disabled' && isGenerationModel(model)) }))
     .filter(channel => channel.models.length > 0)
 }
 
@@ -100,16 +101,16 @@ function renderNativeKey(lines, config, channel, routes, { codex }) {
 
 function renderChannelModels(lines, channel, routes) {
   const modelEntries = []
-  for (const model of channel.models.filter(item => item.status !== 'disabled')) {
+  for (const model of channel.models.filter(item => item.status !== 'disabled' && isGenerationModel(item))) {
     for (const alias of model.aliases) modelEntries.push(renderModel(model, alias))
   }
   for (const route of routes.stableAliases.filter(item => item.channel === channel.id)) {
     const model = channel.models.find(item => item.upstream === route.model)
-    if (model && model.status !== 'disabled') modelEntries.push(renderModel(model, route.alias))
+    if (model && model.status !== 'disabled' && isGenerationModel(model)) modelEntries.push(renderModel(model, route.alias))
   }
   for (const route of routes.pinnedAliases.filter(item => item.channel === channel.id)) {
     const model = channel.models.find(item => item.upstream === route.model)
-    if (model && model.status !== 'disabled') modelEntries.push(renderModel(model, route.alias))
+    if (model && model.status !== 'disabled' && isGenerationModel(model)) modelEntries.push(renderModel(model, route.alias))
   }
   for (const entry of modelEntries) lines.push(...entry)
 }

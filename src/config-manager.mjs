@@ -4,6 +4,7 @@ import path from 'node:path'
 import { loadConfig } from './config.mjs'
 import { parseEnv, serializeEnv } from './env.mjs'
 import { fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from './model-sync.mjs'
+import { isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
 
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const MODEL_ID = /^[^\s/][^\r\n]{0,254}$/
@@ -30,19 +31,36 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
 
   return {
     status() {
-      const revision = currentRevision()
-      return { revision, restartRequired: revision !== initialRevision }
+      const pendingRevision = currentRevision()
+      return {
+        revision: pendingRevision,
+        loadedRevision: initialRevision,
+        pendingRevision,
+        restartRequired: pendingRevision !== initialRevision
+      }
     },
     routing() {
       const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+      const env = parseEnv(fs.readFileSync(envPath, 'utf8'))
       return {
         stableAliases: (routes.stableAliases ?? []).map(({ alias, channel, model }) => ({ alias, channel, model })),
         pinnedAliases: (routes.pinnedAliases ?? []).map(({ alias, channel, model, approvalRef }) => ({ alias, channel, model, approvalRef })),
-        models: (routes.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => ({
-          channel: channel.id,
-          model: model.upstream,
-          status: model.status ?? 'active'
-        })))
+        models: (routes.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => {
+          const kind = normalizeModelKind(model.kind, model.upstream)
+          const prefix = envPrefix(channel.id)
+          return {
+            channel: channel.id,
+            model: model.upstream,
+            protocol: model.protocol ?? env[`${prefix}_PROTOCOL`] ?? 'openai-compatible',
+            priority: model.priority ?? channel.priority ?? 0,
+            staged: channel.staged === true,
+            channelEnabled: channel.enabled !== false && !channel.staged,
+            status: model.status ?? 'active',
+            kind,
+            streaming: normalizeStreamingMode(model.streaming),
+            canaryEligible: model.canaryEligible ?? isGenerationModel({ kind })
+          }
+        }))
       }
     },
     discoverChannels() {
@@ -200,6 +218,9 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
         if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${channelId}`)
         const model = (channel.models ?? []).find(item => item.upstream === modelId)
         if (!model) throw new ConfigMutationError('model_not_found', 404, `Unknown model: ${channelId}/${modelId}`)
+        if (!isGenerationModel({ kind: normalizeModelKind(model.kind, model.upstream) })) {
+          throw new ConfigMutationError('model_not_generation', 409, 'Only generation models can receive a stable alias')
+        }
         if (model.status === 'disabled') throw new ConfigMutationError('model_disabled', 409, 'A disabled model cannot receive a stable alias')
         routes.stableAliases ??= []
         const current = routes.stableAliases.find(item => item.alias === alias)
@@ -257,7 +278,10 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
         const { routes, summaries } = synchronizeRouteModels(current.routes, discoveries)
         const originalRoutes = fs.readFileSync(routesPath, 'utf8')
         const nextRoutes = JSON.stringify(routes, null, 2) + '\n'
-        if (nextRoutes === originalRoutes) return { changed: false, channels: summaries, revision: currentRevision(), restartRequired: false }
+        if (nextRoutes === originalRoutes) {
+          const revision = currentRevision()
+          return { changed: false, channels: summaries, revision, restartRequired: revision !== initialRevision }
+        }
         const revision = digest(fs.readFileSync(envPath, 'utf8'), nextRoutes)
         const backupDir = path.join(root, 'runtime', 'config-revisions', `${timestamp()}-${revision}`)
         fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 })

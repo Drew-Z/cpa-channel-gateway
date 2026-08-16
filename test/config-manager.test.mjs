@@ -10,6 +10,9 @@ test('channel mutations are private, revisioned, validated, and restart-required
   const root = fixtureRoot()
   const config = loadConfig(root)
   const manager = createPrivateConfigManager(config)
+  const loadedStatus = manager.status()
+  assert.equal(loadedStatus.loadedRevision, loadedStatus.pendingRevision)
+  assert.equal(loadedStatus.restartRequired, false)
   const created = manager.createChannel({
     id: 'backup',
     name: 'Backup Channel',
@@ -24,6 +27,7 @@ test('channel mutations are private, revisioned, validated, and restart-required
   assert.equal(JSON.stringify(created).includes('backup_secret_key'), false)
   assert.equal(JSON.stringify(created).includes('backup.example.test'), false)
   assert.equal(manager.status().restartRequired, true)
+  assert.notEqual(manager.status().loadedRevision, manager.status().pendingRevision)
   assert.equal(loadConfig(root).channels.some(channel => channel.id === 'backup' && !channel.enabled && channel.staged && channel.runtimeEnabled), true)
 
   assert.throws(
@@ -102,6 +106,9 @@ test('admin model synchronization is read-only upstream, revisioned, and marks d
   assert.equal(calls[0].url, 'https://sample.example.test/v1/models')
   assert.equal(calls[0].headers.Authorization, 'Bearer sample_secret_key_123456')
   assert.equal(loadConfig(root).channels[0].models.some(model => model.upstream === 'model-b'), true)
+  const unchanged = await manager.syncModels(['sample'])
+  assert.equal(unchanged.changed, false)
+  assert.equal(unchanged.restartRequired, true)
 })
 
 test('a newly created staged channel can be synchronized without enabling it', async () => {
