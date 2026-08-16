@@ -78,6 +78,30 @@ npm run check
 npm run status
 ```
 
+更新到包含部署验收脚本的版本后，优先执行一次默认只读验收：
+
+```bash
+npm run verify:deployment
+```
+
+该检查会验证 `/healthz`、runtime supervisor、持久化 control state 以及 loaded/pending
+revision；它不会输出管理密钥、gateway key、Cookie、CSRF token、请求体、响应正文或上游原始错误。
+只有明确指定精确模型时才会发送一次固定诗词任务：
+
+```bash
+DEPLOYMENT_CANARY_MODEL='channel/model' npm run verify:deployment
+```
+
+如需同时确认正式业务路径的流式和非流式语义，指定同一个精确模型：
+
+```bash
+DEPLOYMENT_BUSINESS_MODEL='channel/model' npm run verify:deployment
+```
+
+此命令只使用容器已有的 `GATEWAY_API_KEY`，输出状态、延迟、正文长度、content type 和响应字节数，
+不会打印密钥或正文。发现 pending revision 时默认只报告并退出；只有已经明确批准应用配置时，才设置
+`DEPLOYMENT_APPLY=1` 再执行一次。不要在翼龙控制台或工单中粘贴任何密钥。
+
 普通翼龙控制台通常连接的是正在运行的 Node 进程，并不是 shell；不要把上述命令直接发送给应用控制台。没有终端权限时，可以在自己的电脑上检查模型目录，这不会生成模型回答：
 
 ```bash
