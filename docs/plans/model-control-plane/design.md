@@ -219,7 +219,7 @@ MVP may return a short `503 reloading` window while internal children change. Ze
 - `CPA_MANAGEMENT_KEY` is used only to establish an admin session and is not stored in browser local storage.
 - The session cookie is HttpOnly, Secure, SameSite=Strict, short-lived, and revocable on process restart.
 - Mutations require CSRF protection and `Origin` validation.
-- API keys are accepted on create/replace, written server-side, and returned only as masked presence.
+- Channel API keys are accepted on create/replace, written server-side, and returned only as masked presence. The separate gateway client key is revealed only after an authenticated same-origin `POST` with CSRF protection; the response is `no-store`, and the UI automatically restores its mask.
 - Authenticated channel status may include the validated upstream Base URL for operator identification. Admin responses are `no-store`; public APIs and logs never expose the URL.
 - Errors are classified and redacted before persistence or display.
 - Cloudflare Access can be added in front of `/admin/*`; it is recommended but not required for the first single-user build.

@@ -44,6 +44,37 @@ test('passive authentication failure removes a channel from later selection', ()
   next.release()
 })
 
+test('restores validated health state and persists expired cooldown cleanup', () => {
+  let clock = 1_000
+  const changes = []
+  const scheduler = createModelScheduler(fixtureConfig(), {
+    now: () => clock,
+    initialState: {
+      channels: {
+        alpha: { health: 'cooling', cooldownUntil: 2_000, updatedAt: 900 },
+        beta: { health: 'auth-failed', updatedAt: 900 },
+        unknown: { health: 'healthy', updatedAt: 900 }
+      }
+    },
+    onStateChange: state => {
+      changes.push(state)
+      throw new Error('Persistence callbacks must not affect routing')
+    }
+  })
+  assert.throws(() => scheduler.reserve('shared-model'), error => error.code === 'no_eligible_candidates')
+
+  clock = 2_001
+  const selection = scheduler.reserve('shared-model')
+  assert.equal(selection.candidate.channelId, 'alpha')
+  selection.release()
+  assert.equal(changes.length, 1)
+  assert.equal(changes[0].channels.alpha, undefined)
+  assert.equal(changes[0].channels.beta.health, 'auth-failed')
+
+  assert.doesNotThrow(() => scheduler.recordTransportError({ candidate: { channelId: 'alpha' } }))
+  assert.equal(changes.length, 2)
+})
+
 test('staged channels are available only to manual exact-model tests', () => {
   const config = fixtureConfig()
   config.channels.push({ ...channel('staged', 200, [model('staged', 'new-model', 200)]), enabled: false, staged: true, runtimeEnabled: true })

@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 import vm from 'node:vm'
 import { createControlGateway } from '../src/control-gateway.mjs'
+import { createControlState } from '../src/control-state.mjs'
 
 test('native Responses forwarding preserves reviewed client headers and replaces secrets', async t => {
   let captured
@@ -285,6 +289,57 @@ test('models endpoint exposes logical, stable, and direct ids', async t => {
   assert.doesNotMatch(result.body, /upstream\.example\.test/)
 })
 
+test('restores persisted health and canary summaries into the admin status', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-control-restore-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const config = fixtureConfig(19001)
+  config.digest = 'fixture-release'
+  config.paths = { routesPath: path.join(root, 'config', 'routes.local.json') }
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const timestamp = Date.now()
+  const persisted = createControlState(config, { now: () => timestamp })
+  persisted.replaceSchedulerState({
+    channels: { free: { health: 'auth-failed', updatedAt: timestamp } }
+  })
+  persisted.rememberTest('free/shared-model', {
+    ok: false,
+    status: 'failed',
+    error: 'authentication_failed',
+    statusCode: 401,
+    protocol: 'responses',
+    transport: 'native-passthrough',
+    latencyMs: 12,
+    testedAt: new Date(timestamp).toISOString()
+  })
+
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({
+    port: address.port,
+    path: '/admin/api/session',
+    body: { key: config.managementKey }
+  })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const status = JSON.parse((await request({
+    port: address.port,
+    method: 'GET',
+    path: '/admin/api/status',
+    headers: { cookie }
+  })).body)
+
+  assert.equal(status.channels[0].health, 'auth-failed')
+  assert.equal(status.lastTests['free/shared-model'].error, 'authentication_failed')
+  assert.equal(status.controlState.storage, 'persistent')
+  const blocked = await request({
+    port: address.port,
+    path: '/v1/responses',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'shared-model', input: 'must not reach upstream' }
+  })
+  assert.equal(blocked.statusCode, 503)
+})
+
 test('admin session protects status and runs a redacted exact-model canary', async t => {
   let upstreamBody
   const upstream = http.createServer(async (request, response) => {
@@ -423,7 +478,11 @@ test('admin API updates model status and stable aliases through the private conf
   assert.equal(connectionData.baseUrl, `http://127.0.0.1:${address.port}/v1`)
   assert.equal(connectionData.apiKey, undefined)
   assert.match(connectionData.apiKeyMasked, /^fixt\*+3456$/)
-  const revealedConnection = await request({ port: address.port, method: 'GET', path: '/admin/api/connection?reveal=1', headers: { cookie } })
+  const ignoredReveal = await request({ port: address.port, method: 'GET', path: '/admin/api/connection?reveal=1', headers: { cookie } })
+  assert.equal(JSON.parse(ignoredReveal.body).apiKey, undefined)
+  const rejectedReveal = await request({ port: address.port, path: '/admin/api/connection/reveal', headers: { cookie }, body: {} })
+  assert.equal(rejectedReveal.statusCode, 403)
+  const revealedConnection = await request({ port: address.port, path: '/admin/api/connection/reveal', headers, body: {} })
   assert.equal(JSON.parse(revealedConnection.body).apiKey, GATEWAY_KEY)
   const models = await request({ port: address.port, method: 'GET', path: '/admin/api/models', headers: { cookie } })
   const modelGroups = JSON.parse(models.body).data

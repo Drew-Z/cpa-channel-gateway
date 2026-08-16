@@ -88,7 +88,7 @@ Turn the current single-tenant CPA + HAProxy deployment into a manageable model 
 - The WebUI is served under `/admin` on the existing public port; no extra allocation is required.
 - Public model APIs and admin APIs use separate credentials.
 - Admin login creates an HttpOnly, Secure, SameSite=Strict session; mutating requests require CSRF protection.
-- The management secret, gateway key, channel keys, and Cloudflare token are never returned by admin APIs or written to logs. A validated upstream Base URL may be returned only to an authenticated admin for channel identification; it is never returned by public APIs or written to logs.
+- The management secret, channel keys, and Cloudflare token are never returned by admin APIs or written to logs. The gateway key may be returned only by an explicit authenticated same-origin reveal action protected by CSRF, with `no-store` responses and automatic UI re-masking; it is never present in the initial HTML, public APIs, or logs. A validated upstream Base URL may be returned only to an authenticated admin for channel identification; it is never returned by public APIs or written to logs.
 - The UI must show the active reservation and elapsed time, last test, passive health, and current configuration revision.
 
 ### R7. Runtime Apply and Rollback
