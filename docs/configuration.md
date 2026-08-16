@@ -1,8 +1,35 @@
 # Configuration Reference
 
-## Channel environment
+## Structured providers
 
-每个 `routes.local.json` 渠道 ID 对应以下私有变量：
+新配置优先把渠道私有字段放在 `config/providers.local.json`；`channels.local.env` 最终只保留
+`GATEWAY_API_KEY`、`CPA_MANAGEMENT_KEY` 和 Cloudflare Tunnel 等进程级变量。providers 文件的
+最小结构为：
+
+```json
+{
+  "schemaVersion": 1,
+  "providers": [
+    {
+      "id": "sample",
+      "name": "Sample Channel",
+      "baseUrl": "https://example.invalid/v1",
+      "apiKey": "<private-api-key>",
+      "protocol": "responses",
+      "enabled": false,
+      "priority": 100
+    }
+  ]
+}
+```
+
+已有旧格式时，先在可信本地副本执行 `npm run migrate:providers -- --dry-run`，确认摘要后再执行
+`npm run migrate:providers -- --apply`。迁移不会调用上游；它会创建私有备份并验证迁移前后的规范化
+配置语义一致。`providers.local.json` 存在时，`channels.local.env` 不得再包含 `CHANNEL_*` 渠道字段。
+
+## Legacy channel environment
+
+以下格式仅用于迁移兼容。每个 `routes.local.json` 渠道 ID 对应以下私有变量：
 
 ```text
 CHANNEL_<ID>_NAME

@@ -17,7 +17,7 @@ const secretPatterns = [
   ['credentialed-url', /https?:\/\/[^\s/:]+:[^\s/@]+@[^\s/]+/]
 ]
 const assignmentPattern = /(?:^|[\r\n])\s*(?:[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)|["'](?:apiKey|token|secret|password)["'])\s*[:=]\s*["']?([^\s,"'#}]{8,})/gi
-const placeholderPattern = /replace|example|dummy|fixture|legacy-|(?:gateway|management|old|new|free\d*)-key$|test|process\.env|env\[|invalid|secret-(?:chat|responses|claude)|<[^>]+>/i
+const placeholderPattern = /replace|example|dummy|fixture|legacy-|(?:gateway|management|old|new|free\d*)-key$|test|process\.env|env\[|(?:values|provider|input)\.|invalid|secret-(?:chat|responses|claude)|<[^>]+>/i
 
 const trackedPaths = gitText(['ls-files', '-z']).split('\0').filter(Boolean)
 for (const trackedPath of trackedPaths) {
@@ -99,14 +99,30 @@ function inspectContent(scope, candidate, data) {
 
 function readLocalSecrets() {
   const envPath = path.join(root, 'config', 'channels.local.env')
-  if (!fs.existsSync(envPath)) return []
   const values = []
-  for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
-    const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line.trim())
-    if (!match || !/(?:API_KEY|BASE_URL|MANAGEMENT_KEY|TOKEN|SECRET|PASSWORD)$/.test(match[1])) continue
-    const value = match[2].trim().replace(/^(["'])(.*)\1$/, '$2')
-    if (value.length < 8 || placeholderPattern.test(value)) continue
-    values.push({ field: match[1], value })
+  if (fs.existsSync(envPath)) {
+    for (const line of fs.readFileSync(envPath, 'utf8').split(/\r?\n/)) {
+      const match = /^([A-Z][A-Z0-9_]*)=(.*)$/.exec(line.trim())
+      if (!match || !/(?:API_KEY|BASE_URL|MANAGEMENT_KEY|TOKEN|SECRET|PASSWORD)$/.test(match[1])) continue
+      let value = match[2].trim()
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1)
+      if (value.length < 8 || placeholderPattern.test(value)) continue
+      values.push({ field: match[1], value })
+    }
+  }
+  const providersPath = path.join(root, 'config', 'providers.local.json')
+  if (fs.existsSync(providersPath)) {
+    try {
+      const document = JSON.parse(fs.readFileSync(providersPath, 'utf8'))
+      for (const [index, provider] of (document.providers ?? []).entries()) {
+        for (const field of ['baseUrl', 'apiKey']) {
+          const value = typeof provider?.[field] === 'string' ? provider[field].trim() : ''
+          if (value.length >= 8 && !placeholderPattern.test(value)) values.push({ field: `providers[${index}].${field}`, value })
+        }
+      }
+    } catch {
+      // The normal public-content scan reports malformed tracked JSON separately.
+    }
   }
   return values
 }

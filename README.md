@@ -76,6 +76,15 @@ npm run merge:legacy -- /absolute/path/to/channels.local.env
 
 合并模式会保留现有网关密钥、管理密钥、Tunnel 配置、启用状态、模型路由和别名；新增渠道默认禁用，并在写入前备份到 `runtime/config-revisions/`。旧式 `chat/completion` 会归一化为 `openai-compatible`，误填到 Base URL 末尾的 `/chat/completions`、`/responses` 或 `/messages` 也会移除。初次导入发现已有私有配置时会拒绝覆盖；只有明确执行 `npm run replace:legacy -- <path>` 才会整体替换。所有模式都只在本地写入 Git 忽略文件，不会枚举模型或调用上游。
 
+旧版 `channels.local.env` 已包含渠道 URL、密钥和协议时，可显式迁移到结构化的 `providers.local.json`：
+
+```bash
+npm run migrate:providers -- --dry-run
+npm run migrate:providers -- --apply
+```
+
+迁移默认只做 dry-run；只有 `--apply` 才会写入。它会把 `channels.local.env` 中的渠道字段移出，保留网关、管理和 Tunnel 等进程级变量，并从 routes 中移除已迁移的渠道 `enabled/priority` 冗余字段。迁移前会创建私有备份，写入后会重新校验归一化配置语义；失败会恢复原文件。`providers.local.json` 与旧渠道 env 不能并存，避免两份私有配置静默覆盖。迁移结果只输出渠道 ID、数量和（apply 时的）备份路径等低敏摘要，不输出 URL、API key 或响应正文。
+
 ## 翼龙面板
 
 完整步骤见 [翼龙面板部署指南](docs/pterodactyl-deployment.md)。自有域名接入见 [Cloudflare Tunnel 部署](docs/cloudflare-tunnel.md)。公开仓库可直接通过 HTTPS 克隆，Git 用户名和 Access Token 均留空。私有渠道配置不通过 Git 分发，必须在安装后由操作者手工上传。

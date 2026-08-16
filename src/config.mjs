@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { readEnvFile } from './env.mjs'
 import { MODEL_KINDS, STREAMING_MODES, isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
+import { isChannelEnvKey } from './providers.mjs'
 
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const MODEL_NAME = /^[^\s/][^\r\n]{0,254}$/
@@ -12,9 +13,11 @@ export function loadConfig(root, { allowExamples = false, allowEmptyEnabledChann
   const gateway = readJson(path.join(root, 'config', 'gateway.json'))
   const routesPath = chooseLocal(root, 'routes.local.json', 'routes.example.json', allowExamples)
   const envPath = chooseLocal(root, 'channels.local.env', 'channels.example.env', allowExamples)
+  const providersPath = chooseOptionalLocal(root, 'providers.local.json')
   const routes = readJson(routesPath)
   const env = readEnvFile(envPath)
-  return validateAndNormalize({ gateway, routes, env, paths: { routesPath, envPath }, allowEmptyEnabledChannels })
+  const providers = providersPath ? readJson(providersPath) : null
+  return validateAndNormalize({ gateway, routes, env, providers, paths: { routesPath, envPath, providersPath }, allowEmptyEnabledChannels })
 }
 
 function chooseLocal(root, localName, exampleName, allowExamples) {
@@ -24,14 +27,22 @@ function chooseLocal(root, localName, exampleName, allowExamples) {
   throw new Error(`Missing private configuration: config/${localName}`)
 }
 
+function chooseOptionalLocal(root, localName) {
+  const localPath = path.join(root, 'config', localName)
+  return fs.existsSync(localPath) ? localPath : null
+}
+
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'))
 }
 
-function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledChannels }) {
+export function validateAndNormalize({ gateway, routes, env, providers = null, paths = {}, allowEmptyEnabledChannels = false }) {
   const errors = []
   if (gateway.schemaVersion !== 1) errors.push('gateway.json schemaVersion must be 1')
   if (routes.schemaVersion !== 1) errors.push('routes schemaVersion must be 1')
+  const providerMode = providers !== null
+  const providersById = providerMode ? normalizeProviders(providers, errors) : new Map()
+  if (providerMode && Object.keys(env).some(isChannelEnvKey)) errors.push('providers.local.json cannot coexist with CHANNEL_* entries in channels.local.env')
   const gatewayKey = requireSecret(env, 'GATEWAY_API_KEY', errors, 32)
   const managementKey = env.CPA_MANAGEMENT_KEY?.trim() ?? ''
   if (managementKey && managementKey.length < 32) errors.push('CPA_MANAGEMENT_KEY must contain at least 32 characters when admin access is enabled')
@@ -52,8 +63,10 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
     if (!CHANNEL_ID.test(id)) errors.push(`channels[${index}].id is invalid`)
     if (seenChannels.has(id)) errors.push(`Duplicate channel id: ${id}`)
     seenChannels.add(id)
+    const provider = providerMode ? providersById.get(id) : null
+    if (providerMode && !provider) errors.push(`channels[${index}] references unknown provider ${id}`)
     const envPrefix = `CHANNEL_${id.toUpperCase().replaceAll('-', '_')}`
-    const baseUrlText = env[`${envPrefix}_BASE_URL`]?.trim() ?? ''
+    const baseUrlText = providerMode ? String(provider?.baseUrl ?? '').trim() : env[`${envPrefix}_BASE_URL`]?.trim() ?? ''
     let upstream
     try {
       upstream = new URL(baseUrlText)
@@ -62,14 +75,18 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
     } catch {
       errors.push(`${envPrefix}_BASE_URL must be a clean http(s) URL`)
     }
-    const secret = requireSecret(env, `${envPrefix}_API_KEY`, errors, 8)
-    const protocol = (env[`${envPrefix}_PROTOCOL`] || 'openai-compatible').trim()
+    const secret = providerMode
+      ? requireProviderSecret(provider, id, errors, 8)
+      : requireSecret(env, `${envPrefix}_API_KEY`, errors, 8)
+    const protocol = String(providerMode ? provider?.protocol ?? '' : env[`${envPrefix}_PROTOCOL`] || 'openai-compatible').trim()
     if (!['openai-compatible', 'responses', 'claude'].includes(protocol)) errors.push(`${envPrefix}_PROTOCOL is not supported: ${protocol}`)
-    const enabledByEnv = parseBoolean(env[`${envPrefix}_ENABLED`] ?? 'true', `${envPrefix}_ENABLED`, errors)
+    const enabledByEnv = providerMode
+      ? Boolean(provider?.enabled)
+      : parseBoolean(env[`${envPrefix}_ENABLED`] ?? 'true', `${envPrefix}_ENABLED`, errors)
     const staged = routeChannel.staged ?? false
     if (typeof staged !== 'boolean') errors.push(`${id}.staged must be boolean`)
-    if (staged && routeChannel.enabled === true) errors.push(`${id} cannot be both enabled and staged`)
-    const channelPriority = optionalInteger(routeChannel.priority, `${id}.priority`, errors) ?? 0
+    if (!providerMode && staged && routeChannel.enabled === true) errors.push(`${id} cannot be both enabled and staged`)
+    const channelPriority = optionalInteger(providerMode ? provider?.priority : routeChannel.priority, `${id}.priority`, errors) ?? 0
     const models = []
     for (const [modelIndex, model] of (routeChannel.models ?? []).entries()) {
       const upstreamModel = String(model.upstream ?? '').trim()
@@ -104,11 +121,11 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
         status
       })
     }
-    const enabled = Boolean(routeChannel.enabled ?? true) && enabledByEnv && !staged
+    const enabled = (providerMode || Boolean(routeChannel.enabled ?? true)) && enabledByEnv && !staged
     if (enabled && models.length === 0 && !allowEmptyEnabledChannels) errors.push(`Enabled channel ${id} has no models`)
     const channel = {
       id,
-      name: env[`${envPrefix}_NAME`]?.trim() || id,
+      name: String(providerMode ? provider?.name ?? '' : env[`${envPrefix}_NAME`] ?? '').trim() || id,
       enabled,
       staged: Boolean(staged),
       runtimeEnabled: (enabled || Boolean(staged)),
@@ -151,6 +168,8 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
     routes,
     env,
     paths,
+    providerMode,
+    providers,
     gatewayKey,
     managementKey,
     channels,
@@ -164,6 +183,40 @@ function validateAndNormalize({ gateway, routes, env, paths, allowEmptyEnabledCh
       readyTimeoutMs: tunnelSettings.readyTimeoutSeconds * 1000
     }
   }
+}
+
+function normalizeProviders(document, errors) {
+  if (!document || typeof document !== 'object' || Array.isArray(document)) {
+    errors.push('providers.local.json must contain an object')
+    return new Map()
+  }
+  if (document.schemaVersion !== 1) errors.push('providers.local.json schemaVersion must be 1')
+  if (!Array.isArray(document.providers)) {
+    errors.push('providers.local.json providers must be an array')
+    return new Map()
+  }
+  const result = new Map()
+  for (const [index, providerValue] of document.providers.entries()) {
+    const provider = providerValue && typeof providerValue === 'object' && !Array.isArray(providerValue) ? providerValue : {}
+    const id = String(provider.id ?? '').trim().toLowerCase()
+    if (!CHANNEL_ID.test(id)) errors.push(`providers[${index}].id is invalid`)
+    if (result.has(id)) errors.push(`Duplicate provider id: ${id}`)
+    if (id) result.set(id, { ...provider, id })
+    if (typeof provider.name !== 'string' || !provider.name.trim() || provider.name.length > 80) errors.push(`providers[${index}].name is invalid`)
+    if (typeof provider.baseUrl !== 'string') errors.push(`providers[${index}].baseUrl must be a string`)
+    if (typeof provider.apiKey !== 'string') errors.push(`providers[${index}].apiKey must be a string`)
+    if (typeof provider.protocol !== 'string') errors.push(`providers[${index}].protocol must be a string`)
+    if (typeof provider.enabled !== 'boolean') errors.push(`providers[${index}].enabled must be boolean`)
+    if (provider.priority !== undefined && !Number.isSafeInteger(provider.priority)) errors.push(`providers[${index}].priority must be an integer`)
+  }
+  return result
+}
+
+function requireProviderSecret(provider, id, errors, minLength) {
+  const value = typeof provider?.apiKey === 'string' ? provider.apiKey.trim() : ''
+  if (!value || value.includes('replace-me') || value.includes('replace-with')) errors.push(`providers.${id}.apiKey is missing or still an example`)
+  else if (value.length < minLength) errors.push(`providers.${id}.apiKey must contain at least ${minLength} characters`)
+  return value
 }
 
 function requireSecret(env, key, errors, minLength) {

@@ -5,6 +5,7 @@ import { loadConfig } from './config.mjs'
 import { parseEnv, serializeEnv } from './env.mjs'
 import { fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from './model-sync.mjs'
 import { isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
+import { collectLegacyChannelEntries, providerEnvPrefix, stripLegacyChannelEnv } from './providers.mjs'
 
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const MODEL_ID = /^[^\s/][^\r\n]{0,254}$/
@@ -26,6 +27,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
   const routesPath = config.paths.routesPath
   const envPath = config.paths.envPath
   const root = path.dirname(path.dirname(routesPath))
+  const providersPath = config.paths.providersPath ?? path.join(path.dirname(routesPath), 'providers.local.json')
   let loadedRevision = currentRevision()
   let modelSyncActive = false
 
@@ -50,21 +52,19 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       }
     },
     routing() {
-      const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
-      const env = parseEnv(fs.readFileSync(envPath, 'utf8'))
+      const current = loadConfig(root, { allowEmptyEnabledChannels: true })
       return {
-        stableAliases: (routes.stableAliases ?? []).map(({ alias, channel, model }) => ({ alias, channel, model })),
-        pinnedAliases: (routes.pinnedAliases ?? []).map(({ alias, channel, model, approvalRef }) => ({ alias, channel, model, approvalRef })),
-        models: (routes.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => {
+        stableAliases: current.stableAliases.map(({ alias, channel, model }) => ({ alias, channel, model })),
+        pinnedAliases: current.pinnedAliases.map(({ alias, channel, model, approvalRef }) => ({ alias, channel, model, approvalRef })),
+        models: current.channels.flatMap(channel => (channel.models ?? []).map(model => {
           const kind = normalizeModelKind(model.kind, model.upstream)
-          const prefix = envPrefix(channel.id)
           return {
             channel: channel.id,
             model: model.upstream,
-            protocol: model.protocol ?? env[`${prefix}_PROTOCOL`] ?? 'openai-compatible',
+            protocol: model.protocol ?? channel.protocol ?? 'openai-compatible',
             priority: model.priority ?? channel.priority ?? 0,
             staged: channel.staged === true,
-            channelEnabled: channel.enabled !== false && !channel.staged,
+            channelEnabled: channel.enabled,
             status: model.status ?? 'active',
             kind,
             streaming: normalizeStreamingMode(model.streaming),
@@ -78,18 +78,22 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       const diskRoutes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
       const diskIds = new Set((diskRoutes.channels ?? []).map(channel => String(channel.id).toLowerCase()))
       const runtimeIds = new Set(config.channels.map(channel => channel.id))
-      const grouped = new Map()
-      for (const key of Object.keys(env)) {
-        const match = /^CHANNEL_([A-Z][A-Z0-9_]*)_(NAME|BASE_URL|API_KEY|PROTOCOL|ENABLED)$/.exec(key)
-        if (!match) continue
-        const id = match[1].toLowerCase().replaceAll('_', '-')
-        const entry = grouped.get(id) ?? { id, prefix: match[1], values: {} }
-        entry.values[match[2]] = env[key]?.trim() ?? ''
-        grouped.set(id, entry)
-      }
+      const providers = fs.existsSync(providersPath) ? JSON.parse(fs.readFileSync(providersPath, 'utf8')) : null
+      const grouped = providers
+        ? (providers.providers ?? []).map(provider => ({
+            id: String(provider.id).toLowerCase(),
+            values: {
+              NAME: provider.name,
+              BASE_URL: provider.baseUrl,
+              API_KEY: provider.apiKey,
+              PROTOCOL: provider.protocol,
+              ENABLED: String(provider.enabled)
+            }
+          }))
+        : collectLegacyChannelEntries(env)
       const unregistered = []
       const pendingRestart = []
-      for (const entry of grouped.values()) {
+      for (const entry of grouped) {
         const values = entry.values
         const missing = []
         if (!values.NAME) missing.push('NAME')
@@ -125,75 +129,101 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       }
     },
     createChannel(input) {
-      return mutate(({ routes, env }) => {
+      return mutate(({ routes, env, providers }) => {
         const id = normalizeChannelId(input.id)
         if ((routes.channels ?? []).some(channel => channel.id === id)) {
           throw new ConfigMutationError('channel_exists', 409, `Channel already exists: ${id}`)
         }
         const values = validateChannelInput(input, { requireApiKey: true })
-        const prefix = envPrefix(id)
-        env[`${prefix}_NAME`] = values.name
-        env[`${prefix}_BASE_URL`] = values.baseUrl
-        env[`${prefix}_API_KEY`] = values.apiKey
-        env[`${prefix}_PROTOCOL`] = values.protocol
-        env[`${prefix}_ENABLED`] = 'false'
+        if (providers) {
+          providers.providers ??= []
+          providers.providers.push({ id, name: values.name, baseUrl: values.baseUrl, apiKey: values.apiKey, protocol: values.protocol, enabled: false, priority: values.priority })
+        } else {
+          const prefix = providerEnvPrefix(id)
+          env[`${prefix}_NAME`] = values.name
+          env[`${prefix}_BASE_URL`] = values.baseUrl
+          env[`${prefix}_API_KEY`] = values.apiKey
+          env[`${prefix}_PROTOCOL`] = values.protocol
+          env[`${prefix}_ENABLED`] = 'false'
+        }
         routes.channels ??= []
-        routes.channels.push({ id, enabled: false, staged: true, priority: values.priority, models: [] })
+        routes.channels.push(providers ? { id, staged: true, models: [] } : { id, enabled: false, staged: true, priority: values.priority, models: [] })
         return { id, name: values.name, enabled: false, staged: true, protocol: values.protocol, priority: values.priority, modelCount: 0, hasApiKey: true }
       })
     },
     importChannel(idValue) {
-      return mutate(({ routes, env }) => {
+      return mutate(({ routes, env, providers }) => {
         const id = normalizeChannelId(idValue)
         if ((routes.channels ?? []).some(channel => channel.id === id)) {
           throw new ConfigMutationError('channel_exists', 409, `Channel already exists: ${id}`)
         }
-        const prefix = envPrefix(id)
+        const prefix = providerEnvPrefix(id)
+        const provider = providers?.providers?.find(item => String(item.id).toLowerCase() === id)
         const values = validateChannelInput({
-          name: env[`${prefix}_NAME`],
-          baseUrl: env[`${prefix}_BASE_URL`],
-          apiKey: env[`${prefix}_API_KEY`],
-          protocol: env[`${prefix}_PROTOCOL`] || 'openai-compatible',
-          priority: 0
+          name: providers ? provider?.name : env[`${prefix}_NAME`],
+          baseUrl: providers ? provider?.baseUrl : env[`${prefix}_BASE_URL`],
+          apiKey: providers ? provider?.apiKey : env[`${prefix}_API_KEY`],
+          protocol: providers ? provider?.protocol : env[`${prefix}_PROTOCOL`] || 'openai-compatible',
+          priority: providers ? provider?.priority ?? 0 : 0
         }, { requireApiKey: true })
-        env[`${prefix}_ENABLED`] = 'false'
+        if (providers) {
+          if (!provider) throw new ConfigMutationError('channel_not_found', 404, `Unknown provider: ${id}`)
+          provider.enabled = false
+        } else {
+          env[`${prefix}_ENABLED`] = 'false'
+        }
         routes.channels ??= []
-        routes.channels.push({ id, enabled: false, staged: true, priority: values.priority, models: [] })
+        routes.channels.push(providers ? { id, staged: true, models: [] } : { id, enabled: false, staged: true, priority: values.priority, models: [] })
         return { id, name: values.name, enabled: false, staged: true, protocol: values.protocol, priority: values.priority, modelCount: 0, hasApiKey: true }
       })
     },
     updateChannel(idValue, input) {
-      return mutate(({ routes, env }) => {
+      return mutate(({ routes, env, providers }) => {
         const id = normalizeChannelId(idValue)
         const channel = (routes.channels ?? []).find(item => item.id === id)
         if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${id}`)
-        const prefix = envPrefix(id)
+        const prefix = providerEnvPrefix(id)
+        const provider = providers?.providers?.find(item => String(item.id).toLowerCase() === id)
+        if (providers && !provider) throw new ConfigMutationError('channel_not_found', 404, `Unknown provider: ${id}`)
         const values = validateChannelInput(input, { partial: true, requireApiKey: false })
-        if (values.name !== undefined) env[`${prefix}_NAME`] = values.name
-        if (values.baseUrl !== undefined) env[`${prefix}_BASE_URL`] = values.baseUrl
-        if (values.apiKey !== undefined) env[`${prefix}_API_KEY`] = values.apiKey
-        if (values.protocol !== undefined) env[`${prefix}_PROTOCOL`] = values.protocol
+        if (values.name !== undefined) providers ? provider.name = values.name : env[`${prefix}_NAME`] = values.name
+        if (values.baseUrl !== undefined) providers ? provider.baseUrl = values.baseUrl : env[`${prefix}_BASE_URL`] = values.baseUrl
+        if (values.apiKey !== undefined) providers ? provider.apiKey = values.apiKey : env[`${prefix}_API_KEY`] = values.apiKey
+        if (values.protocol !== undefined) providers ? provider.protocol = values.protocol : env[`${prefix}_PROTOCOL`] = values.protocol
         if (values.enabled !== undefined) {
-          channel.enabled = values.enabled
-          env[`${prefix}_ENABLED`] = String(values.enabled)
+          if (providers) provider.enabled = values.enabled
+          else {
+            channel.enabled = values.enabled
+            env[`${prefix}_ENABLED`] = String(values.enabled)
+          }
         }
         if (values.staged !== undefined) {
           channel.staged = values.staged
           if (values.staged) {
-            channel.enabled = false
-            env[`${prefix}_ENABLED`] = 'false'
+            if (providers) provider.enabled = false
+            else {
+              channel.enabled = false
+              env[`${prefix}_ENABLED`] = 'false'
+            }
           }
         }
-        if (values.priority !== undefined) channel.priority = values.priority
+        if (values.priority !== undefined) {
+          if (providers) provider.priority = values.priority
+          else channel.priority = values.priority
+        }
+        if (providers) {
+          delete channel.enabled
+          delete channel.priority
+        }
         return {
           id,
-          name: env[`${prefix}_NAME`] || id,
-          enabled: Boolean(channel.enabled),
+          name: providers ? provider.name || id : env[`${prefix}_NAME`] || id,
+          enabled: providers ? Boolean(provider.enabled) : Boolean(channel.enabled),
           staged: Boolean(channel.staged),
-          protocol: env[`${prefix}_PROTOCOL`] || 'openai-compatible',
-          priority: channel.priority ?? 0,
+          protocol: providers ? provider.protocol || 'openai-compatible' : env[`${prefix}_PROTOCOL`] || 'openai-compatible',
+          priority: providers ? provider.priority ?? 0 : channel.priority ?? 0,
           modelCount: (channel.models ?? []).length,
-          hasApiKey: Boolean(env[`${prefix}_API_KEY`])
+          hasApiKey: Boolean(providers ? provider.apiKey : env[`${prefix}_API_KEY`])
         }
       })
     },
@@ -249,21 +279,23 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       })
     },
     deleteChannel(idValue) {
-      return mutate(({ routes, env }) => {
+      return mutate(({ routes, env, providers }) => {
         const id = normalizeChannelId(idValue)
         const index = (routes.channels ?? []).findIndex(item => item.id === id)
         if (index < 0) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${id}`)
         const channel = routes.channels[index]
-        const prefix = envPrefix(id)
-        const enabledByEnv = !/^(false|0)$/i.test(env[`${prefix}_ENABLED`] ?? 'true')
-        if ((channel.enabled !== false && enabledByEnv) || channel.staged === true) {
+        const prefix = providerEnvPrefix(id)
+        const provider = providers?.providers?.find(item => String(item.id).toLowerCase() === id)
+        const enabledBySource = providers ? provider?.enabled === true : !/^(false|0)$/i.test(env[`${prefix}_ENABLED`] ?? 'true')
+        if ((channel.enabled !== false && enabledBySource) || channel.staged === true) {
           throw new ConfigMutationError('channel_must_be_disabled', 409, 'Disable the channel before deleting it')
         }
         if ([...(routes.stableAliases ?? []), ...(routes.pinnedAliases ?? [])].some(route => route.channel === id)) {
           throw new ConfigMutationError('channel_has_aliases', 409, 'Move stable and pinned aliases before deleting the channel')
         }
         routes.channels.splice(index, 1)
-        for (const key of Object.keys(env)) if (key.startsWith(`${prefix}_`)) delete env[key]
+        if (providers) providers.providers = providers.providers.filter(item => String(item.id).toLowerCase() !== id)
+        else for (const key of Object.keys(env)) if (key.startsWith(`${prefix}_`)) delete env[key]
         return { id, deleted: true }
       })
     },
@@ -292,10 +324,12 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
           const revision = currentRevision()
           return { changed: false, channels: summaries, revision, restartRequired: revision !== loadedRevision }
         }
-        const revision = digest(fs.readFileSync(envPath, 'utf8'), nextRoutes)
+        const providerText = fs.existsSync(providersPath) ? fs.readFileSync(providersPath, 'utf8') : null
+        const revision = digest(fs.readFileSync(envPath, 'utf8'), nextRoutes, providerText)
         const backupDir = path.join(root, 'runtime', 'config-revisions', `${timestamp()}-${revision}`)
         fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 })
         fs.writeFileSync(path.join(backupDir, 'routes.local.json'), originalRoutes, { mode: 0o600 })
+        if (providerText !== null) fs.writeFileSync(path.join(backupDir, 'providers.local.json'), providerText, { mode: 0o600 })
         try {
           atomicWrite(routesPath, nextRoutes)
           loadConfig(root, { allowEmptyEnabledChannels: true })
@@ -320,23 +354,30 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
     if (modelSyncActive) throw new ConfigMutationError('model_sync_in_progress', 409, 'Configuration changes are paused while model synchronization is in progress')
     const originalEnv = fs.readFileSync(envPath, 'utf8')
     const originalRoutes = fs.readFileSync(routesPath, 'utf8')
+    const providerMode = fs.existsSync(providersPath)
+    const originalProviders = providerMode ? fs.readFileSync(providersPath, 'utf8') : null
     const env = parseEnv(originalEnv)
     const routes = JSON.parse(originalRoutes)
-    const result = change({ routes, env })
-    const nextEnv = serializeEnv(env)
+    const providers = providerMode ? JSON.parse(originalProviders) : null
+    const result = change({ routes, env, providers })
+    const nextEnv = serializeEnv(providerMode ? stripLegacyChannelEnv(env) : env)
     const nextRoutes = JSON.stringify(routes, null, 2) + '\n'
-    const revision = digest(nextEnv, nextRoutes)
+    const nextProviders = providerMode ? JSON.stringify(providers, null, 2) + '\n' : null
+    const revision = digest(nextEnv, nextRoutes, nextProviders)
     const backupDir = path.join(root, 'runtime', 'config-revisions', `${timestamp()}-${revision}`)
     fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 })
     fs.writeFileSync(path.join(backupDir, 'channels.local.env'), originalEnv, { mode: 0o600 })
     fs.writeFileSync(path.join(backupDir, 'routes.local.json'), originalRoutes, { mode: 0o600 })
+    if (originalProviders !== null) fs.writeFileSync(path.join(backupDir, 'providers.local.json'), originalProviders, { mode: 0o600 })
     try {
+      if (nextProviders !== null) atomicWrite(providersPath, nextProviders)
       atomicWrite(envPath, nextEnv)
       atomicWrite(routesPath, nextRoutes)
       loadConfig(root)
     } catch (error) {
       atomicWrite(envPath, originalEnv)
       atomicWrite(routesPath, originalRoutes)
+      if (originalProviders !== null) atomicWrite(providersPath, originalProviders)
       if (error instanceof ConfigMutationError) throw error
       throw new ConfigMutationError('configuration_validation_failed', 400, error instanceof Error ? error.message : 'Configuration validation failed')
     }
@@ -344,7 +385,8 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
   }
 
   function currentRevision() {
-    return digest(fs.readFileSync(envPath, 'utf8'), fs.readFileSync(routesPath, 'utf8'))
+    const providers = fs.existsSync(providersPath) ? fs.readFileSync(providersPath, 'utf8') : null
+    return digest(fs.readFileSync(envPath, 'utf8'), fs.readFileSync(routesPath, 'utf8'), providers)
   }
 }
 
@@ -410,12 +452,15 @@ function normalizeAlias(value) {
   return alias
 }
 
-function envPrefix(id) {
-  return `CHANNEL_${id.toUpperCase().replaceAll('-', '_')}`
-}
-
-function digest(envText, routesText) {
-  return crypto.createHash('sha256').update(envText).update('\0').update(routesText).digest('hex').slice(0, 16)
+function digest(envText, routesText, providersText = null) {
+  return crypto.createHash('sha256')
+    .update(envText)
+    .update('\0')
+    .update(routesText)
+    .update('\0')
+    .update(providersText ?? '')
+    .digest('hex')
+    .slice(0, 16)
 }
 
 function atomicWrite(filePath, content) {

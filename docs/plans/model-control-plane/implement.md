@@ -14,6 +14,11 @@ Router MVP is implemented in the working tree:
 
 Persistent health state and redacted canary summaries now live in the Git-ignored `runtime/control-state.json`; stale transient health and cooldown entries are discarded on restore, while release-scoped failures are retained only for the same configuration digest. Configuration writes and model synchronization now share a low-sensitivity FIFO control-job queue, and pending channel/model changes drain new reservations without interrupting existing leases. The production start script now owns an injectable CPA/HAProxy child supervisor with readiness checks, old-release restoration, and a CSRF-protected runtime apply entrypoint; deployment rehearsal and audit history remain in later phases below.
 
+Stage 1 的首个 schema slice 现已实现：`loadConfig` 同时兼容旧 `channels.local.env` 和结构化
+`providers.local.json`，`npm run migrate:providers -- --dry-run` 默认只读，只有显式 `--apply`
+才会迁移并创建私有备份；providers 模式下渠道 CRUD 不会把 API key 写回进程 env。revision manifest、
+脱敏 audit JSONL、diff API 和 rollback 仍待真实部署验收后继续接入。
+
 The first admin slice is now also implemented: same-port `/admin`, in-memory HttpOnly admin sessions, CSRF/origin checks for tests, logical-model candidate status, exact-candidate poetry canaries with redacted summaries, revisioned stable-alias moves, persistent model enable/disable controls, and the serialized runtime apply path. Logical grouping edits remain later-phase work.
 
 The authenticated connection helper exposes the current `/v1` Base URL and a masked gateway client key. Full gateway-key retrieval is a separate same-origin `POST` protected by the session CSRF token; it is never included in initial HTML and is automatically re-masked in the UI. Channel credentials remain write-only.

@@ -44,14 +44,20 @@ Missing private configuration: config/routes.local.json
 
 ## 4. 手工上传私有配置
 
-通过面板文件管理器或 SFTP，把你本地准备好的文件上传到以下绝对路径：
+通过面板文件管理器或 SFTP，把你本地准备好的私有配置上传到以下绝对路径：
 
 ```text
 /home/container/config/channels.local.env
 /home/container/config/routes.local.json
 ```
 
-只上传这两个私有配置，不要替换仓库中的 `config/gateway.json`。上传前确认文件名没有被浏览器或系统追加 `.txt`，并确认 `channels.local.env` 中的 `GATEWAY_API_KEY` 至少 32 个字符。使用 Cloudflare Tunnel 时，Token 也只写在这个本地 env 文件中；完整步骤见 [Cloudflare Tunnel 部署](cloudflare-tunnel.md)。
+如果已经完成 providers 迁移，再额外上传：
+
+```text
+/home/container/config/providers.local.json
+```
+
+只上传这两个（旧格式）或三个（providers 格式）私有配置，不要替换仓库中的 `config/gateway.json`。上传前确认文件名没有被浏览器或系统追加 `.txt`，并确认 `channels.local.env` 中的 `GATEWAY_API_KEY` 至少 32 个字符。使用 Cloudflare Tunnel 时，Token 也只写在这个本地 env 文件中；完整步骤见 [Cloudflare Tunnel 部署](cloudflare-tunnel.md)。
 
 这些文件已被 `config/*.local.*` 忽略，不会被 Git 更新跟踪。仍应只在可信设备和面板连接中传输，并避免在控制台、工单或截图中展示其内容。
 
