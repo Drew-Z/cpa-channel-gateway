@@ -86,7 +86,7 @@ async function start(rootDir) {
     apply: async () => {
       const next = generateRelease(rootDir)
       const previous = appliedGenerated
-      return runtimeChildren.replace(next, {
+      const result = await runtimeChildren.replace(next, {
         drain: async () => { controlGateway.scheduler.drainAll() },
         waitForIdle: () => controlGateway.scheduler.waitForIdle({ timeoutMs: next.gateway.queue.timeoutSeconds * 1000 }),
         resume: async () => { controlGateway.scheduler.resumeAll() },
@@ -102,6 +102,8 @@ async function start(rootDir) {
           appliedGenerated = previous
         }
       })
+      if (!result.changed) controlGateway.markConfigApplied()
+      return result
     }
   }
 

@@ -41,6 +41,23 @@ test('drains, replaces, commits and resumes in order', async () => {
   ])
 })
 
+test('reports an unchanged release without restarting children', async () => {
+  const events = []
+  const runtime = createRuntimeChildren(fixtureOptions({ events }))
+  await runtime.start(generated('release-a'))
+  events.length = 0
+  let commits = 0
+
+  const result = await runtime.replace(generated('release-a'), {
+    commit: async () => { commits += 1 }
+  })
+
+  assert.equal(result.changed, false)
+  assert.equal(runtime.status().active.digest, 'release-a')
+  assert.equal(commits, 0)
+  assert.deepEqual(events, [])
+})
+
 test('restores the previous release when the new child fails readiness', async () => {
   const events = []
   let startCount = 0
