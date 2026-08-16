@@ -37,8 +37,9 @@ export function activateRelease(root, generated) {
   const previous = fs.existsSync(activePath) ? JSON.parse(fs.readFileSync(activePath, 'utf8')) : null
   if (previous?.active === generated.digest) return previous
   const payload = { version: 1, active: generated.digest, releaseDir: generated.releaseDir, previous: previous?.active ?? null, activatedAt: new Date().toISOString() }
-  fs.writeFileSync(`${activePath}.tmp`, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
-  fs.renameSync(`${activePath}.tmp`, activePath)
+  const temporaryPath = path.join(path.dirname(activePath), `${path.basename(activePath)}.tmp`)
+  fs.writeFileSync(temporaryPath, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
+  fs.renameSync(temporaryPath, activePath)
   return payload
 }
 
@@ -50,7 +51,8 @@ export function rollbackRelease(root) {
   const releaseDir = path.join(root, 'runtime', 'releases', active.previous)
   if (!fs.existsSync(releaseDir)) throw new Error(`Previous release missing: ${active.previous}`)
   const payload = { ...active, active: active.previous, releaseDir, previous: null, rolledBackAt: new Date().toISOString() }
-  fs.writeFileSync(`${activePath}.tmp`, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
-  fs.renameSync(`${activePath}.tmp`, activePath)
+  const temporaryPath = path.join(path.dirname(activePath), `${path.basename(activePath)}.tmp`)
+  fs.writeFileSync(temporaryPath, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
+  fs.renameSync(temporaryPath, activePath)
   return payload
 }

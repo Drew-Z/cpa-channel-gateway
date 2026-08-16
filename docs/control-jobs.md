@@ -16,7 +16,8 @@ HTTP 状态，不保存异常正文、URL、API key 或上游响应。
 抑制该模型候选，同一渠道的其他模型仍可使用。重新启用或恢复模型会解除当前进程的
 临时抑制。
 
-排空标记是内存状态，不写入 `runtime/control-state.json`。容器重启会从新的已加载
-release 重新建立候选；因此配置写入后仍必须重启，才能让 CPA/HAProxy 子进程加载新
-路由。当前队列和排空片不执行子进程热替换，真正的 apply/rollback 仍需经过内部进程
-排空、readiness 检查和旧 release 恢复流程。
+排空标记是内存状态，不写入 `runtime/control-state.json`。正式启动脚本提供
+`POST /admin/api/runtime/apply`：它会生成并校验新 release，排空在途请求，停止旧的
+CPA/HAProxy 子进程，等待新进程 readiness，然后切换父 Node 路由和 active release。
+任何启动或切换失败都会重启旧 release，并恢复旧的父路由。没有运行时监督器的测试/只读
+进程仍会报告 apply 不可用，此时按传统流程重启容器。

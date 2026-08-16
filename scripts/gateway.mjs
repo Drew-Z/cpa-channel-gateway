@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url'
 import { generateRelease, activateRelease, rollbackRelease } from '../src/generate.mjs'
 import { loadConfig } from '../src/config.mjs'
 import { createControlGateway } from '../src/control-gateway.mjs'
-import { childOutcome, terminateChildren, waitForHttpOk, waitForPort } from '../src/supervisor.mjs'
+import { createRuntimeChildren } from '../src/runtime-children.mjs'
+import { childOutcome, terminateChildren, waitForHttpOk } from '../src/supervisor.mjs'
 
 const root = path.resolve(process.env.GATEWAY_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url))))
 const command = process.argv[2] || 'status'
@@ -63,6 +64,9 @@ async function start(rootDir) {
   const children = []
   const outcomes = []
   let controlGateway = null
+  let appliedGenerated = generated
+  let resolveRuntimeFailure
+  const runtimeFailure = new Promise(resolve => { resolveRuntimeFailure = resolve })
   const abortController = new AbortController()
   let resolveSignal
   const signalOutcome = new Promise(resolve => { resolveSignal = resolve })
@@ -71,34 +75,46 @@ async function start(rootDir) {
   process.once('SIGINT', onSigint)
   process.once('SIGTERM', onSigterm)
 
+  const runtimeChildren = createRuntimeChildren({
+    cpaPath,
+    haproxyPath,
+    readyTimeoutMs: 15_000,
+    onFailure: error => resolveRuntimeFailure({ type: 'error', label: 'Internal runtime', error })
+  })
+  const runtimeManager = {
+    status: () => ({ ...runtimeChildren.status(), available: true }),
+    apply: async () => {
+      const next = generateRelease(rootDir)
+      const previous = appliedGenerated
+      return runtimeChildren.replace(next, {
+        drain: async () => { controlGateway.scheduler.drainAll() },
+        waitForIdle: () => controlGateway.scheduler.waitForIdle({ timeoutMs: next.gateway.queue.timeoutSeconds * 1000 }),
+        resume: async () => { controlGateway.scheduler.resumeAll() },
+        commit: async release => {
+          controlGateway.reloadConfig(release, { markApplied: false })
+          activateRelease(rootDir, release)
+          controlGateway.markConfigApplied()
+          appliedGenerated = release
+        },
+        rollback: async () => {
+          controlGateway.reloadConfig(previous, { markApplied: false })
+          activateRelease(rootDir, previous)
+          appliedGenerated = previous
+        }
+      })
+    }
+  }
+
   try {
-    const haproxy = spawn(haproxyPath, ['-f', path.join(generated.releaseDir, 'haproxy', 'haproxy.cfg'), '-db'], { stdio: 'inherit', env: process.env })
-    children.push(haproxy)
-    outcomes.push(childOutcome(haproxy, 'HAProxy'))
-    const haproxyReady = Promise.all(generated.channels
-      .filter(item => item.runtimeEnabled ?? item.enabled)
-      .map(item => waitForPort(generated.gateway.internal.host, item.listener, 15_000, { signal: abortController.signal })))
-      .then(() => null)
-    const early = await Promise.race([haproxyReady, ...outcomes, signalOutcome])
-    if (early?.type === 'signal') return
-    if (early) throw childFailure(early)
-
     const publicPort = Number(process.env[generated.gateway.public.portEnv] || process.env.SERVER_PORT || process.env.PORT || generated.gateway.public.defaultPort)
-    const cpaPort = generated.gateway.internal.cpaPort
-    const cpaArgs = ['-config', path.join(generated.releaseDir, 'cpa', 'config.yaml')]
-    if (generated.gateway.cpa.localModelCatalog) cpaArgs.push('-local-model')
-    const cpa = spawn(cpaPath, cpaArgs, {
-      stdio: 'inherit',
-      env: { ...process.env, SERVER_PORT: String(cpaPort) }
-    })
-    children.push(cpa)
-    outcomes.push(childOutcome(cpa, 'CPA'))
-    const cpaReady = waitForPort(generated.gateway.internal.host, cpaPort, 15_000, { signal: abortController.signal }).then(() => null)
-    const startup = await Promise.race([cpaReady, ...outcomes, signalOutcome])
-    if (startup?.type === 'signal') return
-    if (startup) throw childFailure(startup)
+    try {
+      await runtimeChildren.start(generated, { signal: abortController.signal })
+    } catch (error) {
+      if (abortController.signal.aborted) return
+      throw error
+    }
 
-    controlGateway = createControlGateway(generated)
+    controlGateway = createControlGateway(generated, { runtimeManager })
     await controlGateway.listen({ host: generated.gateway.public.host, port: publicPort })
 
     if (generated.cloudflareTunnel.enabled) {
@@ -123,20 +139,21 @@ async function start(rootDir) {
         tunnel.readyTimeoutMs,
         { signal: abortController.signal }
       ).then(() => null)
-      const tunnelStartup = await Promise.race([tunnelReady, ...outcomes, signalOutcome])
+      const tunnelStartup = await Promise.race([tunnelReady, ...outcomes, runtimeFailure, signalOutcome])
       if (tunnelStartup?.type === 'signal') return
       if (tunnelStartup) throw childFailure(tunnelStartup)
     }
 
     console.log(JSON.stringify({ ready: true, port: publicPort, release: generated.digest, cloudflareTunnel: generated.cloudflareTunnel.enabled }))
 
-    const outcome = await Promise.race([...outcomes, signalOutcome])
+    const outcome = await Promise.race([...outcomes, runtimeFailure, signalOutcome])
     if (outcome.type !== 'signal') throw childFailure(outcome)
   } finally {
     abortController.abort()
     process.removeListener('SIGINT', onSigint)
     process.removeListener('SIGTERM', onSigterm)
     await controlGateway?.close().catch(() => {})
+    await runtimeChildren.stop().catch(() => {})
     await terminateChildren(children)
   }
 }

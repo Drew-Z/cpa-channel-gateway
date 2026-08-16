@@ -26,7 +26,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
   const routesPath = config.paths.routesPath
   const envPath = config.paths.envPath
   const root = path.dirname(path.dirname(routesPath))
-  const initialRevision = currentRevision()
+  let loadedRevision = currentRevision()
   let modelSyncActive = false
 
   return {
@@ -34,10 +34,14 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       const pendingRevision = currentRevision()
       return {
         revision: pendingRevision,
-        loadedRevision: initialRevision,
+        loadedRevision,
         pendingRevision,
-        restartRequired: pendingRevision !== initialRevision
+        restartRequired: pendingRevision !== loadedRevision
       }
+    },
+    markApplied() {
+      loadedRevision = currentRevision()
+      return this.status()
     },
     routing() {
       const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
@@ -280,7 +284,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
         const nextRoutes = JSON.stringify(routes, null, 2) + '\n'
         if (nextRoutes === originalRoutes) {
           const revision = currentRevision()
-          return { changed: false, channels: summaries, revision, restartRequired: revision !== initialRevision }
+          return { changed: false, channels: summaries, revision, restartRequired: revision !== loadedRevision }
         }
         const revision = digest(fs.readFileSync(envPath, 'utf8'), nextRoutes)
         const backupDir = path.join(root, 'runtime', 'config-revisions', `${timestamp()}-${revision}`)
@@ -298,7 +302,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
           channels: summaries,
           backup: path.relative(root, path.join(backupDir, 'routes.local.json')).replaceAll('\\', '/'),
           revision,
-          restartRequired: revision !== initialRevision
+          restartRequired: revision !== loadedRevision
         }
       } finally {
         modelSyncActive = false
@@ -330,7 +334,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       if (error instanceof ConfigMutationError) throw error
       throw new ConfigMutationError('configuration_validation_failed', 400, error instanceof Error ? error.message : 'Configuration validation failed')
     }
-    return { ...result, revision, restartRequired: revision !== initialRevision }
+    return { ...result, revision, restartRequired: revision !== loadedRevision }
   }
 
   function currentRevision() {

@@ -107,6 +107,28 @@ test('suppresses a pending model disable while keeping other models on the chann
   assert.equal(scheduler.isCandidateSuppressed('alpha', 'shared-model'), false)
 })
 
+test('reloads the catalog only when no request lease is active', () => {
+  const scheduler = createModelScheduler(fixtureConfig())
+  const active = scheduler.reserve('shared-model')
+  assert.throws(
+    () => scheduler.reload(fixtureConfig()),
+    error => error instanceof GatewayRoutingError && error.code === 'runtime_busy'
+  )
+  active.release()
+
+  const next = fixtureConfig()
+  next.channels[0].models[0].upstream = 'new-model'
+  next.channels[0].models[0].aliases = ['alpha/new-model']
+  next.stableAliases = [{ alias: 'coding-main', channel: 'alpha', model: 'new-model' }]
+  scheduler.reload(next)
+  const publicIds = scheduler.catalog.listPublicModels().map(item => item.id)
+  assert.ok(publicIds.includes('new-model'))
+  assert.ok(!publicIds.includes('alpha/shared-model'))
+  const selection = scheduler.reserve('new-model')
+  assert.equal(selection.candidate.upstreamModel, 'new-model')
+  selection.release()
+})
+
 test('staged channels are available only to manual exact-model tests', () => {
   const config = fixtureConfig()
   config.channels.push({ ...channel('staged', 200, [model('staged', 'new-model', 200)]), enabled: false, staged: true, runtimeEnabled: true })

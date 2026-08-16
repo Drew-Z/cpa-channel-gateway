@@ -15,12 +15,12 @@ export function createControlState(config, {
   now = () => Date.now(),
   healthStaleMs = DEFAULT_HEALTH_STALE_MS
 } = {}) {
-  const configRevision = typeof config.digest === 'string' ? config.digest : null
-  const validChannels = new Set(config.channels?.map(channel => channel.id) ?? [])
-  const validCandidates = new Set((config.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => (
+  let configRevision = typeof config.digest === 'string' ? config.digest : null
+  let validChannels = new Set(config.channels?.map(channel => channel.id) ?? [])
+  let validCandidates = new Set((config.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => (
     `${channel.id}\0${model.upstream}\0${model.protocol ?? channel.protocol}`
   ))))
-  const validModels = new Set((config.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => `${channel.id}/${model.upstream}`)))
+  let validModels = new Set((config.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => `${channel.id}/${model.upstream}`)))
   let writable = Boolean(filePath)
   let state = emptyState(configRevision, now())
 
@@ -28,6 +28,53 @@ export function createControlState(config, {
 
   return {
     schedulerState() {
+      return cloneSchedulerState(state)
+    },
+    snapshot() {
+      return {
+        configRevision,
+        schedulerState: cloneSchedulerState(state),
+        lastTests: structuredClone(state.lastTests)
+      }
+    },
+    reconfigure(nextConfig) {
+      const nextRevision = typeof nextConfig?.digest === 'string' ? nextConfig.digest : null
+      const sameRelease = nextRevision === configRevision
+      configRevision = nextRevision
+      validChannels = new Set(nextConfig?.channels?.map(channel => channel.id) ?? [])
+      validCandidates = new Set((nextConfig?.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => (
+        `${channel.id}\0${model.upstream}\0${model.protocol ?? channel.protocol}`
+      ))))
+      validModels = new Set((nextConfig?.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => `${channel.id}/${model.upstream}`)))
+      const timestamp = now()
+      state = {
+        v: VERSION,
+        configRevision,
+        updatedAt: new Date(timestamp).toISOString(),
+        channels: sameRelease ? normalizeChannels(state.channels, { now: timestamp, healthStaleMs, validChannels }) : {},
+        candidates: sameRelease ? normalizeCandidates(state.candidates, validCandidates) : {},
+        lastTests: normalizeLastTests(state.lastTests, validModels)
+      }
+      persist()
+      return cloneSchedulerState(state)
+    },
+    restore(nextConfig, snapshot = {}) {
+      configRevision = typeof nextConfig?.digest === 'string' ? nextConfig.digest : null
+      validChannels = new Set(nextConfig?.channels?.map(channel => channel.id) ?? [])
+      validCandidates = new Set((nextConfig?.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => (
+        `${channel.id}\0${model.upstream}\0${model.protocol ?? channel.protocol}`
+      ))))
+      validModels = new Set((nextConfig?.channels ?? []).flatMap(channel => (channel.models ?? []).map(model => `${channel.id}/${model.upstream}`)))
+      const timestamp = now()
+      state = {
+        v: VERSION,
+        configRevision,
+        updatedAt: new Date(timestamp).toISOString(),
+        channels: normalizeChannels(snapshot.schedulerState?.channels, { now: timestamp, healthStaleMs, validChannels }),
+        candidates: normalizeCandidates(snapshot.schedulerState?.candidates, validCandidates),
+        lastTests: normalizeLastTests(snapshot.lastTests, validModels)
+      }
+      persist()
       return cloneSchedulerState(state)
     },
     lastTests() {

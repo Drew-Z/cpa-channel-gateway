@@ -106,6 +106,43 @@ test('rejects invalid summaries and falls back to memory for corrupt or unwritab
   assert.equal(unwritable.schedulerState().channels.alpha.health, 'healthy')
 })
 
+test('reconfigures the state store across a release change without carrying old blockers', t => {
+  const root = temporaryRoot(t)
+  const filePath = path.join(root, 'runtime', 'control-state.json')
+  const config = fixtureConfig(root)
+  const state = createControlState(config, { filePath, now: () => 1_000 })
+  state.replaceSchedulerState({ channels: { alpha: { health: 'auth-failed', updatedAt: 1_000 } } })
+  state.rememberTest('alpha/shared-model', successfulTest(1_000))
+
+  const next = fixtureConfig(root)
+  next.digest = 'release-b'
+  next.channels[0].models[0].upstream = 'new-model'
+  next.channels[0].models[0].protocol = 'responses'
+  const schedulerState = state.reconfigure(next)
+  assert.deepEqual(schedulerState, { channels: {}, candidates: {} })
+  assert.deepEqual(state.lastTests(), {})
+  assert.equal(state.status().configRevision, 'release-b')
+})
+
+test('restores a prior release state snapshot after a failed runtime reload', t => {
+  const root = temporaryRoot(t)
+  const filePath = path.join(root, 'runtime', 'control-state.json')
+  const config = fixtureConfig(root)
+  const state = createControlState(config, { filePath, now: () => 1_000 })
+  state.replaceSchedulerState({ channels: { alpha: { health: 'auth-failed', updatedAt: 1_000 } } })
+  state.rememberTest('alpha/shared-model', successfulTest(1_000))
+  const snapshot = state.snapshot()
+
+  const next = fixtureConfig(root)
+  next.digest = 'release-b'
+  state.reconfigure(next)
+  state.restore(config, snapshot)
+
+  assert.equal(state.status().configRevision, 'release-a')
+  assert.equal(state.schedulerState().channels.alpha.health, 'auth-failed')
+  assert.equal(state.lastTests()['alpha/shared-model'].status, 'success')
+})
+
 function fixtureConfig(root, channelIds = ['alpha']) {
   return {
     digest: 'release-a',

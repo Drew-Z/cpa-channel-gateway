@@ -317,6 +317,132 @@ test('channel updates enter drain mode before the pending restart', async t => {
   assert.equal(status.controlJobs.recent.at(-1).status, 'completed')
 })
 
+test('reloadConfig switches public routing to the new validated catalog', async t => {
+  const config = fixtureConfig(19001)
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const next = fixtureConfig(19001)
+  next.channels[0].models[0].upstream = 'new-model'
+  next.channels[0].models[0].aliases = ['free/new-model']
+  next.stableAliases = [{ alias: 'coding-main', channel: 'free', model: 'new-model' }]
+
+  const switched = gateway.reloadConfig(next)
+  assert.equal(switched.configRevision, null)
+  const models = await request({ port: address.port, path: '/v1/models', method: 'GET', headers: { authorization: `Bearer ${GATEWAY_KEY}` } })
+  const ids = JSON.parse(models.body).data.map(item => item.id)
+  assert.ok(ids.includes('new-model'))
+  assert.ok(!ids.includes('shared-model'))
+  assert.equal(gateway.scheduler.catalog.resolve('shared-model'), null)
+})
+
+test('reloadConfig restores the previous catalog and revision when validation fails', async t => {
+  const config = fixtureConfig(19001)
+  config.digest = 'release-a'
+  const controlState = createControlState(config)
+  const gateway = createControlGateway(config, { controlState })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const invalid = { ...config, digest: 'release-b', channels: null }
+  assert.throws(() => gateway.reloadConfig(invalid))
+  assert.ok(gateway.scheduler.catalog.resolve('shared-model'))
+  assert.equal(controlState.status().configRevision, 'release-a')
+})
+
+test('reloadConfig updates the adapted CPA target and request limit', async t => {
+  const responses = []
+  const cpaOne = http.createServer((request, response) => {
+    request.resume()
+    responses.push('one')
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"output_text":"one"}')
+  })
+  const cpaTwo = http.createServer((request, response) => {
+    request.resume()
+    responses.push('two')
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"output_text":"two"}')
+  })
+  const firstAddress = await listen(cpaOne)
+  const secondAddress = await listen(cpaTwo)
+  t.after(() => close(cpaOne))
+  t.after(() => close(cpaTwo))
+
+  const config = fixtureConfig(19001)
+  config.channels[0].protocol = 'openai-compatible'
+  config.channels[0].models[0].protocol = 'openai-compatible'
+  config.gateway.internal.cpaPort = firstAddress.port
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const first = await request({ port: address.port, path: '/v1/responses', headers: { authorization: `Bearer ${GATEWAY_KEY}` }, body: { model: 'shared-model', input: 'first' } })
+  assert.equal(first.statusCode, 200)
+  assert.deepEqual(responses, ['one'])
+
+  gateway.reloadConfig({
+    ...config,
+    gateway: { ...config.gateway, internal: { ...config.gateway.internal, cpaPort: secondAddress.port } }
+  })
+  const second = await request({ port: address.port, path: '/v1/responses', headers: { authorization: `Bearer ${GATEWAY_KEY}` }, body: { model: 'shared-model', input: 'second' } })
+  assert.equal(second.statusCode, 200)
+  assert.deepEqual(responses, ['one', 'two'])
+
+  gateway.reloadConfig({
+    ...config,
+    gateway: { ...config.gateway, internal: { ...config.gateway.internal, cpaPort: secondAddress.port }, control: { ...config.gateway.control, maxRequestBytes: 64 } }
+  })
+  const oversized = await request({ port: address.port, path: '/v1/responses', headers: { authorization: `Bearer ${GATEWAY_KEY}` }, body: { model: 'shared-model', input: 'x'.repeat(200) } })
+  assert.equal(oversized.statusCode, 413)
+})
+
+test('reloadConfig can defer the loaded revision until active release commit', () => {
+  const config = fixtureConfig(19001)
+  config.digest = 'release-a'
+  let loadedRevision = 'release-a'
+  let marks = 0
+  const configManager = {
+    status: () => ({ revision: 'release-b', loadedRevision, restartRequired: loadedRevision !== 'release-b' }),
+    markApplied: () => { marks += 1; loadedRevision = 'release-b' }
+  }
+  const gateway = createControlGateway(config, { configManager })
+  const next = { ...config, digest: 'release-b' }
+
+  gateway.reloadConfig(next, { markApplied: false })
+  assert.equal(marks, 0)
+  assert.equal(configManager.status().restartRequired, true)
+  gateway.markConfigApplied()
+  assert.equal(marks, 1)
+  assert.equal(configManager.status().restartRequired, false)
+})
+
+test('runtime apply is a CSRF-protected serialized admin operation', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  let applies = 0
+  const runtimeManager = {
+    status: () => ({ active: { digest: 'release-a', childCount: 2 }, transitioning: false, available: true }),
+    apply: async () => ({ changed: ++applies > 0, release: 'release-b' })
+  }
+  const gateway = createControlGateway(config, { runtimeManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+  const missingCsrf = await request({ port: address.port, path: '/admin/api/runtime/apply', headers: { cookie }, body: {} })
+  assert.equal(missingCsrf.statusCode, 403)
+  const applied = await request({ port: address.port, path: '/admin/api/runtime/apply', headers, body: {} })
+  assert.equal(applied.statusCode, 200)
+  assert.equal(JSON.parse(applied.body).release, 'release-b')
+  assert.equal(applies, 1)
+  const status = JSON.parse((await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })).body)
+  assert.equal(status.runtime.active.digest, 'release-a')
+  assert.equal(status.controlJobs.recent.at(-1).type, 'runtime-apply')
+})
+
 test('restores persisted health and canary summaries into the admin status', async t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-control-restore-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -599,6 +725,8 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.body, /mode:'same-origin'/)
   assert.match(first.body, /headers\['x-csrf-token'\]=csrf/)
   assert.match(first.body, /客户端连接/)
+  assert.match(first.body, /id="applyButton"/)
+  assert.match(first.body, /\/admin\/api\/runtime\/apply/)
   assert.match(first.body, /复制 Base URL/)
   assert.match(first.body, /复制 API key/)
   assert.doesNotMatch(first.body, new RegExp(GATEWAY_KEY))

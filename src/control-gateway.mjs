@@ -33,10 +33,9 @@ export function createControlGateway(config, {
     onStateChange: state => controlState.replaceSchedulerState(state)
   }),
   usageMonitor = createUsageMonitor(config),
-  configManager = createPrivateConfigManager(config)
+  configManager = createPrivateConfigManager(config),
+  runtimeManager = null
 } = {}) {
-  const maxRequestBytes = config.gateway.control.maxRequestBytes
-  const cpaPort = config.gateway.internal.cpaPort
   const sessions = new Map()
   const loginFailures = new Map()
   const controlJobs = createControlJobQueue()
@@ -83,7 +82,7 @@ export function createControlGateway(config, {
       return
     }
 
-    const body = await readJsonBody(request, maxRequestBytes)
+    const body = await readJsonBody(request, requestBodyLimit())
     const requestedModel = typeof body.model === 'string' ? body.model.trim() : ''
     if (!requestedModel) throw publicError('invalid_request', 400, 'Request body must include a model')
     let selection
@@ -169,7 +168,7 @@ export function createControlGateway(config, {
     if (url.pathname === '/admin/api/models' && request.method === 'PATCH') {
       requireAdminMutation(request, session)
       requireConfigManager()
-      const body = await readJsonBody(request, maxRequestBytes)
+      const body = await readJsonBody(request, requestBodyLimit())
       const result = await controlJobs.run('model-update', () => {
         const updated = configManager.updateModelStatus(body.channel, body.model, body.status)
         if (updated.status === 'disabled') scheduler.suppressCandidate?.(body.channel, body.model)
@@ -182,7 +181,7 @@ export function createControlGateway(config, {
     if (url.pathname === '/admin/api/stable-aliases' && request.method === 'PUT') {
       requireAdminMutation(request, session)
       requireConfigManager()
-      const body = await readJsonBody(request, maxRequestBytes)
+      const body = await readJsonBody(request, requestBodyLimit())
       sendJson(response, 202, await controlJobs.run('alias-update', () => configManager.setStableAlias(body.alias, body.channel, body.model)))
       return
     }
@@ -194,10 +193,20 @@ export function createControlGateway(config, {
       sendJson(response, 200, configManager?.status() ?? { revision: null, restartRequired: false, writable: false })
       return
     }
+    if (url.pathname === '/admin/api/runtime' && request.method === 'GET') {
+      sendJson(response, 200, runtimeManager?.status?.() ?? { active: null, transitioning: false, available: false })
+      return
+    }
+    if (url.pathname === '/admin/api/runtime/apply' && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      if (!runtimeManager?.apply) throw publicError('runtime_apply_unavailable', 409, 'Runtime apply is not available in this process')
+      sendJson(response, 200, await controlJobs.run('runtime-apply', () => runtimeManager.apply()))
+      return
+    }
     if (url.pathname === '/admin/api/model-sync' && request.method === 'POST') {
       requireAdminMutation(request, session)
       requireConfigManager()
-      const body = await readJsonBody(request, maxRequestBytes)
+      const body = await readJsonBody(request, requestBodyLimit())
       const requestedIds = Array.isArray(body.channels)
         ? body.channels
         : Array.isArray(body.channelIds)
@@ -209,7 +218,7 @@ export function createControlGateway(config, {
     if (url.pathname === '/admin/api/channels' && request.method === 'POST') {
       requireAdminMutation(request, session)
       requireConfigManager()
-      const body = await readJsonBody(request, maxRequestBytes)
+      const body = await readJsonBody(request, requestBodyLimit())
       const result = await controlJobs.run('channel-create', async () => {
         const created = configManager.createChannel(body)
         const sync = body.sync === true ? await configManager.syncModels([created.id]) : null
@@ -221,7 +230,7 @@ export function createControlGateway(config, {
     if (url.pathname === '/admin/api/channels/import' && request.method === 'POST') {
       requireAdminMutation(request, session)
       requireConfigManager()
-      const body = await readJsonBody(request, maxRequestBytes)
+      const body = await readJsonBody(request, requestBodyLimit())
       const result = await controlJobs.run('channel-import', async () => {
         const imported = configManager.importChannel(body.id)
         const sync = body.sync === true ? await configManager.syncModels([imported.id]) : null
@@ -234,7 +243,7 @@ export function createControlGateway(config, {
     if (channelRoute && request.method === 'PATCH') {
       requireAdminMutation(request, session)
       requireConfigManager()
-      const body = await readJsonBody(request, maxRequestBytes)
+      const body = await readJsonBody(request, requestBodyLimit())
       const result = await controlJobs.run('channel-update', () => {
         const updated = configManager.updateChannel(channelRoute[1], body)
         if (updated.staged || updated.enabled === false) scheduler.drainChannel?.(channelRoute[1])
@@ -258,7 +267,7 @@ export function createControlGateway(config, {
     }
     if (url.pathname === '/admin/api/tests' && request.method === 'POST') {
       requireAdminMutation(request, session)
-      const body = await readJsonBody(request, maxRequestBytes)
+      const body = await readJsonBody(request, requestBodyLimit())
       sendJson(response, 200, await runAdminTest(body))
       return
     }
@@ -270,7 +279,7 @@ export function createControlGateway(config, {
       sendJson(response, 404, { error: { code: 'admin_disabled', message: 'Admin access is disabled' } })
       return
     }
-    const body = await readJsonBody(request, maxRequestBytes)
+    const body = await readJsonBody(request, requestBodyLimit())
     const now = Date.now()
     pruneSessions(now)
     pruneLoginFailures(now)
@@ -405,7 +414,7 @@ export function createControlGateway(config, {
         }
       : {
           host: config.gateway.internal.host,
-          port: cpaPort,
+          port: internalCpaPort(),
           path: `${url.pathname}${url.search}`,
           authorization: `Bearer ${config.gatewayKey}`
         }
@@ -421,7 +430,7 @@ export function createControlGateway(config, {
         let size = 0
         upstreamResponse.on('data', chunk => {
           size += chunk.length
-          if (size > maxRequestBytes) {
+          if (size > requestBodyLimit()) {
             upstreamResponse.destroy(new Error('Canary response is too large'))
             return
           }
@@ -457,6 +466,7 @@ export function createControlGateway(config, {
       pinnedAliases: routing.pinnedAliases,
       reservations: snapshot.reservations,
       controlJobs: controlJobs.status(),
+      runtime: runtimeManager?.status?.() ?? { active: null, transitioning: false, available: false },
       draining: snapshot.draining ?? [],
       suppressedCandidates: snapshot.suppressedCandidates ?? [],
       lastTests: Object.fromEntries(lastTests),
@@ -483,6 +493,52 @@ export function createControlGateway(config, {
       apiKeyMasked: maskSecret(config.gatewayKey),
       ...(reveal ? { apiKey: config.gatewayKey } : {})
     }
+  }
+
+  function reloadConfig(nextConfig, { markApplied = true } = {}) {
+    if (!nextConfig || typeof nextConfig !== 'object') throw new TypeError('A runtime configuration is required')
+    if (scheduler.reservations.snapshot().length) throw publicError('runtime_busy', 409, 'Cannot reload configuration while requests are active')
+    const previousConfig = { ...config }
+    const previousState = controlState.snapshot?.() ?? {
+      schedulerState: controlState.schedulerState(),
+      lastTests: controlState.lastTests()
+    }
+    try {
+      const nextState = controlState.reconfigure(nextConfig)
+      scheduler.reload(nextConfig, { initialState: nextState })
+      Object.assign(config, nextConfig)
+      lastTests.clear()
+      for (const [modelId, result] of Object.entries(controlState.lastTests())) lastTests.set(modelId, result)
+      if (markApplied) configManager?.markApplied?.()
+      return { configRevision: nextConfig.digest ?? null, controlState: controlState.status() }
+    } catch (error) {
+      Object.assign(config, previousConfig)
+      try {
+        const restoredState = controlState.restore
+          ? controlState.restore(previousConfig, previousState)
+          : previousState.schedulerState
+        scheduler.reload(previousConfig, { initialState: restoredState })
+        lastTests.clear()
+        for (const [modelId, result] of Object.entries(controlState.lastTests())) lastTests.set(modelId, result)
+      } catch (restoreError) {
+        const failure = publicError('runtime_reload_failed', 503, 'Runtime configuration reload failed and could not be restored')
+        failure.cause = restoreError
+        throw failure
+      }
+      throw error
+    }
+  }
+
+  function requestBodyLimit() {
+    return config.gateway.control.maxRequestBytes
+  }
+
+  function internalCpaPort() {
+    return config.gateway.internal.cpaPort
+  }
+
+  function markConfigApplied() {
+    return configManager?.markApplied?.() ?? null
   }
 
   function rememberTest(modelId, result) {
@@ -568,7 +624,7 @@ export function createControlGateway(config, {
           }
         : {
             host: config.gateway.internal.host,
-            port: cpaPort,
+            port: internalCpaPort(),
             path: `${url.pathname}${url.search}`,
             authorization: `Bearer ${config.gatewayKey}`
           }
@@ -638,6 +694,9 @@ export function createControlGateway(config, {
     scheduler,
     usageMonitor,
     controlJobs,
+    runtimeManager,
+    reloadConfig,
+    markConfigApplied,
     listen({ host = config.gateway.public.host, port } = {}) {
       const listenPort = port ?? Number(process.env[config.gateway.public.portEnv] || process.env.SERVER_PORT || process.env.PORT || config.gateway.public.defaultPort)
       return new Promise((resolve, reject) => {
@@ -855,13 +914,13 @@ function adminHtml(nonce) {
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA Channel Gateway</title>
 <style nonce="${nonce}">*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#f5f7fb;color:#152033;margin:0}main{max-width:1100px;margin:2rem auto;padding:0 1rem}section{background:#fff;border:1px solid #dce3ef;border-radius:8px;padding:1rem;margin:1rem 0;box-shadow:0 2px 10px #1520330d}h1{font-size:1.35rem}h2{font-size:1.05rem;margin:1.25rem 0 .7rem}h3{font-size:.95rem;margin:1rem 0 .5rem}button{border:0;border-radius:8px;padding:.6rem .9rem;background:#2458d6;color:#fff;cursor:pointer}button.secondary{background:#526078}button:disabled{opacity:.6;cursor:wait}input,select{padding:.6rem;border:1px solid #b8c3d5;border-radius:8px;width:100%;min-width:0;background:#fff;color:inherit}.toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:.65rem;align-items:end}.toolbar label{display:grid;gap:.25rem;font-size:.8rem;color:#637089}.toolbar button{width:100%}.connection-grid{display:grid;gap:.65rem}.connection-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:.5rem;align-items:end}.connection-row label{display:grid;gap:.25rem;font-size:.8rem;color:#637089}.connection-row button{white-space:nowrap}.connection-hint{margin:.35rem 0 0}.connection-models{display:flex;flex-wrap:wrap;gap:.5rem}.connection-models code{background:#eef2f8;border-radius:6px;padding:.3rem .5rem}#channels,#models,#usage{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e8edf4;padding:.55rem;font-size:.9rem;white-space:nowrap}.muted{color:#637089}.error{color:#b42318}.ok{color:#067647}.busy{color:#b54708}@media(max-width:700px){.connection-row{grid-template-columns:1fr}.connection-row button{width:100%}}</style></head>
 <body><main><h1>CPA Channel Gateway 管理台</h1><section id="login"><p class="muted">管理密钥只用于建立内存会话，重启后自动失效。</p><input id="key" type="password" autocomplete="current-password" placeholder="CPA_MANAGEMENT_KEY"><button id="loginButton">登录</button><p id="loginError" class="error"></p></section>
-<section id="app" hidden><p><button id="refreshButton">刷新状态</button> <button id="logoutButton" class="secondary">退出</button> <span id="summary" class="muted"></span></p><h2>客户端连接</h2><div id="connection"></div><div id="channels"></div><h2>渠道发现</h2><p class="muted">自动比较私有 env 与当前 routes。已登记但尚未重启的渠道会单独提示；API key 只用于导入，不会显示。</p><div id="discovery"></div><h2>最近 24 小时</h2><p class="muted">仅统计真实业务请求；管理台模型测活不计入。成功率按成功请求数除以全部请求数计算。</p><div id="usage"></div><h2>模型目录同步</h2><div class="toolbar"><label>渠道（留空同步生产渠道）<select id="syncChannelIds" autocomplete="off"><option value="">全部生产渠道</option></select></label><button id="syncButton" type="button">只读同步 /models</button></div><p id="syncResult" class="muted"></p><h2>新增渠道</h2><form id="addChannelForm" class="toolbar"><label>渠道 ID<input id="channelId" required pattern="[a-z][a-z0-9-]{0,31}" maxlength="32" autocomplete="off"></label><label>名称<input id="channelName" required maxlength="80"></label><label>Base URL<input id="channelUrl" required type="url" autocomplete="url"></label><label>API key<input id="channelKey" required type="password" minlength="8" autocomplete="new-password"></label><label>协议<select id="channelProtocol"><option value="responses">responses</option><option value="openai-compatible">openai-compatible</option><option value="claude">claude</option></select></label><label>优先级<input id="channelPriority" required type="number" step="1" value="0"></label><button id="addChannelButton" type="submit">新增待测试渠道</button><button id="addAndSyncButton" class="secondary" type="button">新增并同步模型</button></form><p id="channelResult"></p><h2>模型测活与路由</h2><div class="toolbar"><label>精确模型 ID<select id="model" autocomplete="off"><option value="">请选择要测试的精确模型</option></select></label><button id="testButton" type="button">测试模型</button><button id="setMainButton" type="button">设为 coding-main</button><button id="setBackupButton" class="secondary" type="button">设为 coding-backup</button><button id="toggleModelButton" class="secondary" type="button">禁用模型</button></div><p id="testHint" class="muted">模型目录会在刷新状态时自动填充。</p><p id="testResult"></p><div id="routing"></div><h2>模型目录</h2><div id="models"></div></section></main>
+<section id="app" hidden><p><button id="refreshButton">刷新状态</button> <button id="applyButton" class="secondary" type="button" hidden>应用待重启配置</button> <button id="logoutButton" class="secondary">退出</button> <span id="summary" class="muted"></span></p><h2>客户端连接</h2><div id="connection"></div><div id="channels"></div><h2>渠道发现</h2><p class="muted">自动比较私有 env 与当前 routes。已登记但尚未重启的渠道会单独提示；API key 只用于导入，不会显示。</p><div id="discovery"></div><h2>最近 24 小时</h2><p class="muted">仅统计真实业务请求；管理台模型测活不计入。成功率按成功请求数除以全部请求数计算。</p><div id="usage"></div><h2>模型目录同步</h2><div class="toolbar"><label>渠道（留空同步生产渠道）<select id="syncChannelIds" autocomplete="off"><option value="">全部生产渠道</option></select></label><button id="syncButton" type="button">只读同步 /models</button></div><p id="syncResult" class="muted"></p><h2>新增渠道</h2><form id="addChannelForm" class="toolbar"><label>渠道 ID<input id="channelId" required pattern="[a-z][a-z0-9-]{0,31}" maxlength="32" autocomplete="off"></label><label>名称<input id="channelName" required maxlength="80"></label><label>Base URL<input id="channelUrl" required type="url" autocomplete="url"></label><label>API key<input id="channelKey" required type="password" minlength="8" autocomplete="new-password"></label><label>协议<select id="channelProtocol"><option value="responses">responses</option><option value="openai-compatible">openai-compatible</option><option value="claude">claude</option></select></label><label>优先级<input id="channelPriority" required type="number" step="1" value="0"></label><button id="addChannelButton" type="submit">新增待测试渠道</button><button id="addAndSyncButton" class="secondary" type="button">新增并同步模型</button></form><p id="channelResult"></p><h2>模型测活与路由</h2><div class="toolbar"><label>精确模型 ID<select id="model" autocomplete="off"><option value="">请选择要测试的精确模型</option></select></label><button id="testButton" type="button">测试模型</button><button id="setMainButton" type="button">设为 coding-main</button><button id="setBackupButton" class="secondary" type="button">设为 coding-backup</button><button id="toggleModelButton" class="secondary" type="button">禁用模型</button></div><p id="testHint" class="muted">模型目录会在刷新状态时自动填充。</p><p id="testResult"></p><div id="routing"></div><h2>模型目录</h2><div id="models"></div></section></main>
 <script nonce="${nonce}">
 let csrf='';let restartRequired=false;let modelCandidates=new Map();let gatewayKeyHideTimer=null;
 const $=id=>document.getElementById(id);
 async function call(path, options={}){const method=(options.method||'GET').toUpperCase();const headers={'content-type':'application/json',...(options.headers||{})};if(!['GET','HEAD','OPTIONS'].includes(method)&&csrf)headers['x-csrf-token']=csrf;const r=await fetch(path,{...options,mode:'same-origin',credentials:'same-origin',headers});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error?.message||'请求失败');return data}
 async function login(){try{const data=await call('/admin/api/session',{method:'POST',body:JSON.stringify({key:$('key').value})});csrf=data.csrfToken;$('login').hidden=true;$('app').hidden=false;await refresh()}catch(e){$('loginError').textContent=e.message}}
-async function refresh(){try{const [status,models,usage,discovery,connection]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage'),call('/admin/api/channel-discovery'),call('/admin/api/connection')]);restartRequired=status.restartRequired===true;const revisionText=restartRequired?'；待重启 '+(status.pendingRevision||status.configRevision||'-')+'，运行中 '+(status.loadedRevision||'未知'):'；运行配置 '+(status.loadedRevision||status.configRevision||'未知');const storageText=status.controlState?.storage==='memory-fallback'?'；健康状态持久化已退化为内存':'';const jobText=status.controlJobs?.active?'；配置任务 '+status.controlJobs.active.type+(status.controlJobs.queued?'，等待 '+status.controlJobs.queued:''):status.controlJobs?.queued?'；等待配置任务 '+status.controlJobs.queued:'';$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次'+revisionText+storageText+jobText;$('summary').className=status.controlState?.storage==='memory-fallback'?'busy':'muted';renderConnection(connection);$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>Base URL</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td class="'+(c.busy||c.draining?'busy':'')+'">'+channelState(c)+(c.busy?' / 当前忙碌':'')+'</td><td>'+c.modelCount+'</td><td>'+esc(healthLabel(c.health))+'</td><td>'+channelActions(c)+'</td></tr>').join('')+'</table>';$('discovery').innerHTML=discoveryHtml(discovery);$('usage').innerHTML=usageHtml(usage);$('routing').innerHTML=routingHtml(status.stableAliases||[]);$('models').innerHTML=modelsHtml(models.data);populateSyncChannelSelect(status.channels);populateModelSelect(models.data)}catch(e){$('summary').textContent=e.message}}
+async function refresh(){try{const [status,models,usage,discovery,connection]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage'),call('/admin/api/channel-discovery'),call('/admin/api/connection')]);restartRequired=status.restartRequired===true;const revisionText=restartRequired?'；待重启 '+(status.pendingRevision||status.configRevision||'-')+'，运行中 '+(status.loadedRevision||'未知'):'；运行配置 '+(status.loadedRevision||status.configRevision||'未知');const storageText=status.controlState?.storage==='memory-fallback'?'；健康状态持久化已退化为内存':'';const jobText=status.controlJobs?.active?'；配置任务 '+status.controlJobs.active.type+(status.controlJobs.queued?'，等待 '+status.controlJobs.queued:''):status.controlJobs?.queued?'；等待配置任务 '+status.controlJobs.queued:'';$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次'+revisionText+storageText+jobText;$('summary').className=status.controlState?.storage==='memory-fallback'?'busy':'muted';const applyButton=$('applyButton');applyButton.hidden=status.runtime?.available!==true;applyButton.disabled=!status.restartRequired||Boolean(status.runtime?.transitioning)||Boolean(status.controlJobs?.active);renderConnection(connection);$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>Base URL</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td class="'+(c.busy||c.draining?'busy':'')+'">'+channelState(c)+(c.busy?' / 当前忙碌':'')+'</td><td>'+c.modelCount+'</td><td>'+esc(healthLabel(c.health))+'</td><td>'+channelActions(c)+'</td></tr>').join('')+'</table>';$('discovery').innerHTML=discoveryHtml(discovery);$('usage').innerHTML=usageHtml(usage);$('routing').innerHTML=routingHtml(status.stableAliases||[]);$('models').innerHTML=modelsHtml(models.data);populateSyncChannelSelect(status.channels);populateModelSelect(models.data)}catch(e){$('summary').textContent=e.message}}
 function populateSyncChannelSelect(channels){const select=$('syncChannelIds');const previous=select.value;select.replaceChildren(new Option('全部生产渠道',''));for(const channel of channels.slice().sort((left,right)=>left.id.localeCompare(right.id))){const state=channel.staged?'待测试':channel.enabled?'生产启用':'已停用';select.add(new Option(channel.id+' ['+state+']',channel.id))}if(channels.some(channel=>channel.id===previous))select.value=previous}
 function healthLabel(value){return ({healthy:'健康',unknown:'未测试',degraded:'降级',cooling:'冷却中','auth-failed':'认证失败','payment-blocked':'支付受限'}[value]||value||'未测试')}
 function populateModelSelect(groups){const select=$('model');const previous=select.value;select.replaceChildren(new Option('请选择要测试或管理的精确模型',''));const candidates=groups.flatMap(group=>group.candidates||[]).filter((candidate,index,list)=>list.findIndex(item=>item.directId===candidate.directId)===index).sort((left,right)=>left.channel.localeCompare(right.channel)||left.upstreamModel.localeCompare(right.upstreamModel));modelCandidates=new Map();const byChannel=new Map();for(const candidate of candidates){const optionGroup=byChannel.get(candidate.channel)||(()=>{const created=document.createElement('optgroup');created.label=candidate.channel;select.append(created);byChannel.set(candidate.channel,created);return created})();const states=[modelKindLabel(candidate.kind),streamingLabel(candidate.streaming)];if(candidate.staged)states.push('待测试');if(candidate.channelEnabled===false&&!candidate.staged)states.push('已停用');if(candidate.status==='stale')states.push('stale');if(candidate.status==='disabled')states.push('已禁用');if(candidate.busy)states.push('当前忙碌');if(candidate.draining)states.push('排空中');if(candidate.suppressed)states.push('配置待应用');const directId=candidate.directId||candidate.channel+'/'+candidate.upstreamModel;modelCandidates.set(directId,candidate);const option=new Option(directId+' ['+states.join('，')+']',directId);option.title=directId;optionGroup.append(option)}if(modelCandidates.has(previous))select.value=previous;updateModelButtons();$('testHint').textContent=restartRequired?'配置已更新；仍可继续调整路由，重启后再执行模型测活':candidates.length?'请选择一个精确模型；忙碌或已禁用模型不能测活；仅生成型且具备测活资格的模型可执行固定任务':'暂无模型，请先同步模型目录'}
@@ -893,9 +952,10 @@ async function deleteChannel(id){if(!confirm('确认删除 '+id+'？'))return;tr
 async function setStableAlias(alias){const candidate=selectedModel();if(!candidate)return;try{const data=await call('/admin/api/stable-aliases',{method:'PUT',body:JSON.stringify({alias,channel:candidate.channel,model:candidate.upstreamModel})});$('testResult').className='ok';$('testResult').textContent='已将 '+alias+' 指向 '+candidate.directId+'，revision '+data.revision+'；请重启应用后生效';await refresh()}catch(e){$('testResult').className='error';$('testResult').textContent=e.message}}
 async function toggleModelStatus(){const candidate=selectedModel();if(!candidate)return;const status=candidate.status==='disabled'?'active':'disabled';try{const data=await call('/admin/api/models',{method:'PATCH',body:JSON.stringify({channel:candidate.channel,model:candidate.upstreamModel,status})});$('testResult').className='ok';$('testResult').textContent=(status==='disabled'?'已禁用 ':'已恢复 ')+candidate.directId+'，revision '+data.revision+'；请重启应用后生效';await refresh()}catch(e){$('testResult').className='error';$('testResult').textContent=e.message}}
 async function testModel(){if(restartRequired){$('testResult').className='error';$('testResult').textContent='配置已更新，请先重启应用后再测试模型';return}const model=$('model').value;if(!model){$('testResult').className='error';$('testResult').textContent='请先从下拉框选择一个精确模型';return}const button=$('testButton');button.disabled=true;try{const data=await call('/admin/api/tests',{method:'POST',body:JSON.stringify({model})});$('testResult').className=data.ok?'ok':'error';$('testResult').textContent=data.ok?'测试成功：'+model+'，延迟 '+formatLatency(data.latencyMs)+(data.latencyMs>=10000?'（较慢）':''):'测试失败：'+model+'，原因 '+data.error}catch(e){$('testResult').className='error';$('testResult').textContent=e.message}finally{await refresh()}}
+async function applyRuntime(){const button=$('applyButton');button.disabled=true;$('testResult').className='muted';$('testResult').textContent='正在排空请求并应用配置…';try{const data=await call('/admin/api/runtime/apply',{method:'POST',body:'{}'});$('testResult').className='ok';$('testResult').textContent=data.changed?'配置已应用，运行 release '+data.active?.digest:'当前配置已经是运行版本'}catch(e){$('testResult').className='error';$('testResult').textContent=e.message}finally{await refresh()}}
 async function logout(){try{await call('/admin/api/session',{method:'DELETE'})}finally{hideGatewayKey();$('connection').replaceChildren();csrf='';$('app').hidden=true;$('login').hidden=false}}
 function esc(v){return String(v).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
- $('loginButton').onclick=login;$('refreshButton').onclick=refresh;$('logoutButton').onclick=logout;$('syncButton').onclick=syncModels;$('model').onchange=updateModelButtons;$('addChannelForm').onsubmit=e=>{e.preventDefault();addChannel()};$('addAndSyncButton').onclick=()=>addChannel(true);$('testButton').onclick=testModel;$('setMainButton').onclick=()=>setStableAlias('coding-main');$('setBackupButton').onclick=()=>setStableAlias('coding-backup');$('toggleModelButton').onclick=toggleModelStatus;$('channels').onclick=e=>{const action=e.target.closest('.channelAction');const remove=e.target.closest('.deleteChannel');if(action)setChannelMode(action.dataset.id,action.dataset.mode);if(remove)deleteChannel(remove.dataset.id)};$('discovery').onclick=e=>{const importButton=e.target.closest('.importChannel');if(importButton)importChannel(importButton.dataset.id,importButton.dataset.sync==='true')};
+ $('loginButton').onclick=login;$('refreshButton').onclick=refresh;$('applyButton').onclick=applyRuntime;$('logoutButton').onclick=logout;$('syncButton').onclick=syncModels;$('model').onchange=updateModelButtons;$('addChannelForm').onsubmit=e=>{e.preventDefault();addChannel()};$('addAndSyncButton').onclick=()=>addChannel(true);$('testButton').onclick=testModel;$('setMainButton').onclick=()=>setStableAlias('coding-main');$('setBackupButton').onclick=()=>setStableAlias('coding-backup');$('toggleModelButton').onclick=toggleModelStatus;$('channels').onclick=e=>{const action=e.target.closest('.channelAction');const remove=e.target.closest('.deleteChannel');if(action)setChannelMode(action.dataset.id,action.dataset.mode);if(remove)deleteChannel(remove.dataset.id)};$('discovery').onclick=e=>{const importButton=e.target.closest('.importChannel');if(importButton)importChannel(importButton.dataset.id,importButton.dataset.sync==='true')};
 </script></body></html>`
 }
 

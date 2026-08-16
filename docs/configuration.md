@@ -45,7 +45,7 @@ CPA 的 Codex 兼容头由 `gateway.json` 中的 `cpa.disableCodexCloaking` 控�
 
 管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名请求体为 `{ "alias", "channel", "model" }`。禁用仍被 stable/pinned alias 引用的模型会返回 `409 model_has_aliases`。请求必须带会话 CSRF token 和同源 `Origin`；新增渠道的 API key 只写入服务器，不在变更响应中返回。成功响应为 `202`，包含脱敏的 `revision` 与 `restartRequired: true`；当前进程不会静默热切换，需按部署流程重启以应用新 revision。所有变更先备份到 `runtime/config-revisions/`，验证失败自动恢复。
 
-配置写入和模型同步使用单一 FIFO 控制作业队列，`GET /admin/api/status` 的 `controlJobs` 返回当前作业、等待数量和最近低敏结果；队列满时返回 `429 control_queue_full`。停用、待测试或删除当前渠道会先进入排空状态，停止新的生产预约并等待在途租约释放；禁用模型会临时抑制当前进程的该候选。排空不替代子进程 apply，配置仍需按部署流程重启。
+配置写入和模型同步使用单一 FIFO 控制作业队列，`GET /admin/api/status` 的 `controlJobs` 返回当前作业、等待数量和最近低敏结果；队列满时返回 `429 control_queue_full`。停用、待测试或删除当前渠道会先进入排空状态，停止新的生产预约并等待在途租约释放；禁用模型会临时抑制当前进程的该候选。正式启动脚本中的 `POST /admin/api/runtime/apply` 会在排空后替换内部 CPA/HAProxy，执行 readiness，并在失败时恢复旧 release；成功后父 Node 路由和 `loadedRevision` 一起更新。没有运行时监督器的进程仍需重启应用。
 
 `GET /admin/api/usage` 返回最近 24 小时真实业务请求的低敏聚合结果。统计口径如下：
 

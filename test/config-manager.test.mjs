@@ -47,6 +47,23 @@ test('channel mutations are private, revisioned, validated, and restart-required
   assert.equal(loadConfig(root).channels.some(channel => channel.id === 'backup'), false)
 })
 
+test('markApplied advances the loaded revision after an external runtime apply', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  manager.createChannel({
+    id: 'applied',
+    name: 'Applied Channel',
+    baseUrl: 'https://applied.example.test/v1',
+    apiKey: 'applied_secret_key_123456',
+    protocol: 'responses',
+    priority: 1
+  })
+  assert.equal(manager.status().restartRequired, true)
+  const applied = manager.markApplied()
+  assert.equal(applied.restartRequired, false)
+  assert.equal(applied.loadedRevision, applied.pendingRevision)
+})
+
 test('stable aliases may temporarily point to a disabled channel', () => {
   const root = fixtureRoot()
   const routesPath = path.join(root, 'config', 'routes.local.json')

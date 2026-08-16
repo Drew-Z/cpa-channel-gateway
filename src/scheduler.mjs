@@ -59,9 +59,9 @@ export function createModelScheduler(config, {
   initialState = {},
   onStateChange = null
 } = {}) {
-  const catalog = buildModelCatalog(config)
-  const validChannelIds = new Set(config.channels.map(channel => channel.id))
-  const validCandidateKeys = new Set([...catalog.allModels.values()].flat().map(candidate => candidate.key))
+  let catalog = buildModelCatalog(config)
+  let validChannelIds = new Set(config.channels.map(channel => channel.id))
+  let validCandidateKeys = new Set([...catalog.allModels.values()].flat().map(candidate => candidate.key))
   const channelState = restoreChannelState(initialState.channels, validChannelIds)
   const candidateState = restoreCandidateState(initialState.candidates, validCandidateKeys)
   const drainingChannels = new Set()
@@ -136,6 +136,23 @@ export function createModelScheduler(config, {
     notifyStateChange()
   }
 
+  function reload(nextConfig, { initialState = {} } = {}) {
+    if (reservations.snapshot().length) {
+      throw new GatewayRoutingError('runtime_busy', 409, 'Cannot reload routing while requests are active')
+    }
+    catalog = buildModelCatalog(nextConfig)
+    validChannelIds = new Set(nextConfig.channels.map(channel => channel.id))
+    validCandidateKeys = new Set([...catalog.allModels.values()].flat().map(candidate => candidate.key))
+    channelState.clear()
+    candidateState.clear()
+    for (const [channelId, value] of restoreChannelState(initialState.channels, validChannelIds)) channelState.set(channelId, value)
+    for (const [candidateKey, value] of restoreCandidateState(initialState.candidates, validCandidateKeys)) candidateState.set(candidateKey, value)
+    drainingChannels.clear()
+    suppressedCandidates.clear()
+    notifyStateChange()
+    return true
+  }
+
   function drainChannel(channelId) {
     const id = String(channelId ?? '').trim()
     if (!validChannelIds.has(id) || drainingChannels.has(id)) return false
@@ -145,6 +162,25 @@ export function createModelScheduler(config, {
 
   function resumeChannel(channelId) {
     return drainingChannels.delete(String(channelId ?? '').trim())
+  }
+
+  function drainAll() {
+    for (const channelId of validChannelIds) drainingChannels.add(channelId)
+    return [...drainingChannels].sort()
+  }
+
+  function resumeAll() {
+    drainingChannels.clear()
+    return true
+  }
+
+  async function waitForIdle({ timeoutMs = 30_000, pollMs = 25 } = {}) {
+    const deadline = Date.now() + timeoutMs
+    while (reservations.snapshot().length) {
+      if (Date.now() >= deadline) throw new GatewayRoutingError('drain_timeout', 409, 'Active requests did not finish before the runtime apply deadline')
+      await new Promise(resolve => setTimeout(resolve, pollMs))
+    }
+    return true
   }
 
   function suppressCandidate(channelId, upstreamModel) {
@@ -186,13 +222,19 @@ export function createModelScheduler(config, {
   }
 
   return {
-    catalog,
+    get catalog() {
+      return catalog
+    },
     reservations,
     reserve,
     recordOutcome,
     recordTransportError,
+    reload,
     drainChannel,
     resumeChannel,
+    drainAll,
+    resumeAll,
+    waitForIdle,
     suppressCandidate,
     resumeCandidate,
     isChannelDraining(channelId) {
