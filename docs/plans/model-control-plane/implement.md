@@ -135,8 +135,14 @@ readiness 失败均保留原运行配置；公开审计扫描证明历史、API 
 
 本地实现已完成 3A–3D：候选证据 reducer、v1 到 v2 状态迁移、保守熔断/half-open、
 流式完整生命周期终态记录、无重放集成覆盖，以及管理台低敏证据和排除原因码均已接入。
-当前本地门禁为 `npm test` 135/135、`npm run check` 和 `npm run audit:public` 通过；真实翼龙
-环境的重启、认证后低敏状态读取、一次精确诗词 canary，以及流式/非流式小任务仍待生产验收。
+本地门禁为 `npm test` 135/135、`npm run check` 和 `npm run audit:public` 通过。
+
+生产验收已于 2026-08-17 完成：`AUTO_UPDATE=1` 重启后 Console 为 Online，公开
+`/healthz` 返回 ready；认证管理台显示运行 revision 与持久化状态一致。精确候选
+`free5/DeepSeek-V4-Flash` 的固定诗词 canary 返回 200，transport 为 `adapted`、约 26.4 秒、
+正文长度 40；随后同一 `coding-main` 的非流式和流式小请求分别返回 200，约 2.7 秒和
+5.8 秒，流式响应确认为 `text/event-stream` 并完整结束。该请求对只增加 2 次成功、无失败
+或取消，结束后预约数恢复为 0；验收没有记录密钥、Cookie、请求正文或响应正文。
 
 ### Stage 4: WebUI MVP on Stable APIs
 
