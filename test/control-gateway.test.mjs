@@ -1126,6 +1126,42 @@ test('rate limits repeated failed admin logins', async t => {
   assert.ok(Number(limited.headers['retry-after']) > 0)
 })
 
+test('bounds active admin sessions and evicts the oldest login', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const gateway = createControlGateway(config, { adminSessionLimit: 2 })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const cookies = []
+  for (let index = 0; index < 3; index += 1) {
+    const login = await request({
+      port: address.port,
+      path: '/admin/api/session',
+      body: { key: config.managementKey }
+    })
+    assert.equal(login.statusCode, 200)
+    cookies.push(login.headers['set-cookie'][0].split(';', 1)[0])
+  }
+
+  const oldest = await request({
+    port: address.port,
+    method: 'GET',
+    path: '/admin/api/session',
+    headers: { cookie: cookies[0] }
+  })
+  const newest = await request({
+    port: address.port,
+    method: 'GET',
+    path: '/admin/api/session',
+    headers: { cookie: cookies[2] }
+  })
+
+  assert.equal(oldest.statusCode, 401)
+  assert.equal(JSON.parse(oldest.body).error.code, 'admin_unauthorized')
+  assert.equal(newest.statusCode, 200)
+})
+
 const GATEWAY_KEY = 'fixture_gateway_key_that_is_long_enough_123456'
 
 function fixtureConfig(listener) {

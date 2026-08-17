@@ -141,7 +141,7 @@ npm run canary
 
 保持 Auto Update 为 `1`。公开代码可由面板自动拉取，但私有配置不会从 Git 更新；更新前仍应备份两个或三个 `config/*.local.*` 文件，并在代码更新后重启容器使新进程加载。固定 CPA/HAProxy/cloudflared 版本改变时只重新安装对应运行时组件。
 
-只替换渠道或模型时，先在可信本地副本中执行 `npm run sync:models`，审核并重新上传 `config/routes.local.json`。不要在自动启动流程中周期性同步模型目录。如果面板提供容器终端，再执行：
+只替换渠道或模型时，优先在管理台完成渠道发现、模型同步、测活和路由调整；这些操作会保存私有 revision，并保持待测试渠道与生产调度隔离。不要在自动启动流程中周期性同步模型目录。管理台不可用时，才在可信本地副本中执行 `npm run sync:models`，审核并重新上传 `config/routes.local.json`。如果面板提供容器终端，再执行：
 
 ```bash
 npm run check

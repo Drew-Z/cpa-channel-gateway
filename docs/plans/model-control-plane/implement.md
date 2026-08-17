@@ -35,25 +35,22 @@ The private configuration slice now supports atomic, revisioned channel create/u
 不提前开始依赖它的下一阶段。现有单公网端口、单渠道互斥、无自动重放、无周期探测、
 固定诗词测活和私密字段不落 Git/日志的约束保持不变。
 
-### Stage 0: Production Rehearsal Gate (partially complete)
+### Stage 0: Production Rehearsal Gate (closed by later acceptance)
 
-目标是证明当前 `b7634e6` 基线在真实翼龙容器中成立，而不是把公开健康检查等同于完整验收。
+目标是证明早期 `b7634e6` 基线在真实翼龙容器中成立，而不是把公开健康检查等同于完整验收。
+后续 Stage 3、Stage 4 和 Stage 5 的生产验收已经覆盖并取代这项早期门槛。
 
 本地可丢弃夹具已经直接覆盖正常切换、同 digest revision 提交、active pointer 提交失败
 恢复旧 release，以及排空超时不触碰当前运行时；真实翼龙环境的下列验证仍是部署门槛。
 
 - 已通过 `AUTO_UPDATE=1` 重启容器；Console 显示 Online，公开 `/healthz` 返回 200，且部署的
-  `/admin` 已包含 Changes、revision、audit 和 rollback 控件。控制台为 canvas，未从 DOM
-  提取提交号；新版页面标记用于证明代码已加载。
-- 在管理台确认 `runtime.available=true`、`controlState.storage=persistent`、运行 revision
-  与磁盘 revision 一致；该项需要操作者手工建立管理会话后继续，只读取低敏状态。
-- 选择一个已启用的精确渠道模型执行固定诗词 canary；只核对状态、transport、延迟和
-  正文长度，不查看或保存正文。
-- 对同一可用模型各执行一个流式和非流式真实小任务，确认流式生命周期持有租约、
-  非流式不会被强制改成流式。
-- 验证同 digest apply 不重启内部进程但会提交 loaded revision；再验证一次正常的有变更
-  apply。生产环境的故障注入或私有配置改动必须单独取得批准；失败回滚先在可丢弃夹具中
-  演练。
+  `/admin` 已加载当前构建产物。
+- 管理台已确认 `runtime.available=true`、`controlState.storage=persistent`、运行 revision
+  与磁盘 revision 一致。
+- 固定诗词 canary 以及同一生产别名的流式和非流式真实小任务均已完成低敏验收；详细证据
+  记录在 Stage 3 的生产验收段落。
+- 同 digest、正常 apply 和失败恢复由可丢弃 fixture 覆盖。生产环境不执行故障注入；任何
+  私有配置变更或故障注入仍必须单独取得批准。
 
 验收证据：Console 的低敏 ready/apply 结果、管理台状态、一次精确 canary 摘要、流式和
 非流式请求结果。任何 Cookie、密钥、请求正文、响应正文和上游原始错误都不进入记录。
@@ -191,7 +188,9 @@ no-replay contract. Usage events have a configurable default 4 MiB hard byte cap
 compaction. Release activation prunes only unprotected content-addressed directories while
 preserving active, previous, and a bounded recent tail. Runtime status exposes only bounded
 apply counts, outcomes, durations, drain wait, classified error codes, and unexpected child
-exit counts; the admin Overview renders the short runtime summary.
+exit counts; the admin Overview renders the short runtime summary. Post-closeout hardening also
+bounds in-memory admin sessions and evicts the oldest session when the single-tenant limit is
+reached.
 
 最终门槛：`npm test`、`npm run check`、`npm run audit:public`、语法检查、桌面/移动截图、
 一次真实精确 canary、流式与非流式请求、正常 apply 和可证明的失败回滚全部通过。

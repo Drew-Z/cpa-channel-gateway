@@ -24,6 +24,7 @@ const HOP_BY_HOP = new Set([
   'upgrade'
 ])
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000
+const ADMIN_SESSION_LIMIT = 64
 const ADMIN_TEST_COOLDOWN_MS = 5_000
 const ADMIN_LOGIN_WINDOW_MS = 5 * 60 * 1000
 const ADMIN_LOGIN_MAX_FAILURES = 5
@@ -39,9 +40,13 @@ export function createControlGateway(config, {
   configManager = createPrivateConfigManager(config),
   runtimeManager = null,
   auditStore: auditStoreOption = null,
-  monotonicNow = () => performance.now()
+  monotonicNow = () => performance.now(),
+  adminSessionLimit = ADMIN_SESSION_LIMIT
 } = {}) {
   const sessions = new Map()
+  const sessionLimit = Number.isSafeInteger(adminSessionLimit) && adminSessionLimit > 0
+    ? adminSessionLimit
+    : ADMIN_SESSION_LIMIT
   const loginFailures = new Map()
   const auditStore = auditStoreOption ?? createAuditEventStore(config)
   const controlJobs = createControlJobQueue({
@@ -406,9 +411,10 @@ export function createControlGateway(config, {
       return
     }
     loginFailures.delete(clientKey)
+    evictOldestSessions(sessionLimit - 1)
     const token = crypto.randomBytes(32).toString('base64url')
     const csrfToken = crypto.randomBytes(24).toString('base64url')
-    sessions.set(token, { token, csrfToken, expiresAt: Date.now() + ADMIN_SESSION_TTL_MS })
+    sessions.set(token, { token, csrfToken, expiresAt: now + ADMIN_SESSION_TTL_MS })
     sendJson(response, 200, { ok: true, csrfToken }, {
       'set-cookie': `cpa_admin=${token}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=${ADMIN_SESSION_TTL_MS / 1000}`
     })
@@ -870,6 +876,14 @@ export function createControlGateway(config, {
   function pruneSessions(now = Date.now()) {
     for (const [token, session] of sessions) {
       if (session.expiresAt <= now) sessions.delete(token)
+    }
+  }
+
+  function evictOldestSessions(retainCount) {
+    while (sessions.size > retainCount) {
+      const oldestToken = sessions.keys().next().value
+      if (oldestToken === undefined) return
+      sessions.delete(oldestToken)
     }
   }
 
