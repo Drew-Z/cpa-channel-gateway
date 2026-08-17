@@ -22,7 +22,6 @@ const VIEWS: Array<{ id: View; label: string; icon: typeof Activity }> = [
 function App() {
   const [csrf, setCsrf] = useState('')
   const [loggedIn, setLoggedIn] = useState(false)
-  const [loginKey, setLoginKey] = useState('')
   const [loginError, setLoginError] = useState('')
   const [view, setView] = useState<View>('overview')
   const [busy, setBusy] = useState(false)
@@ -66,13 +65,13 @@ function App() {
 
   useEffect(() => { if (loggedIn) void refresh() }, [loggedIn, csrf])
 
-  const login = async (event: FormEvent) => {
+  const login = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setLoginError('')
+    const key = String(new FormData(event.currentTarget).get('password') ?? '')
     try {
-      const data = await api('/admin/api/session', { method: 'POST', body: JSON.stringify({ key: loginKey }) })
+      const data = await api('/admin/api/session', { method: 'POST', body: JSON.stringify({ key }) })
       setCsrf(data.csrfToken ?? '')
-      setLoginKey('')
       setLoggedIn(true)
     } catch (error) {
       setLoginError(errorMessage(error))
@@ -86,7 +85,7 @@ function App() {
     setConnection(null)
   }
 
-  if (!loggedIn) return <LoginPage value={loginKey} error={loginError} onChange={setLoginKey} onSubmit={login} />
+  if (!loggedIn) return <LoginPage error={loginError} onSubmit={login} />
 
   const activeLabel = VIEWS.find(item => item.id === view)?.label ?? '概览'
   return (
@@ -116,8 +115,8 @@ function App() {
   )
 }
 
-function LoginPage({ value, error, onChange, onSubmit }: { value: string; error: string; onChange: (value: string) => void; onSubmit: (event: FormEvent) => void }) {
-  return <main className="login-shell"><form className="login-panel" onSubmit={onSubmit}><div className="brand centered"><div className="brand-mark"><KeyRound size={19} /></div><div><strong>CPA Channel Gateway</strong><span>管理台登录</span></div></div><label>管理密钥<input autoFocus autoComplete="current-password" type="password" value={value} onChange={event => onChange(event.target.value)} /></label><button className="button primary full" type="submit"><LogIn size={17} />登录</button>{error && <p className="form-error" role="alert">{error}</p>}<p className="muted login-note">会话仅保存在网关内存中，重启后需要重新登录。</p></form></main>
+function LoginPage({ error, onSubmit }: { error: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
+  return <main className="login-shell"><form className="login-panel" onSubmit={onSubmit}><div className="brand centered"><div className="brand-mark"><KeyRound size={19} /></div><div><strong>CPA Channel Gateway</strong><span>管理台登录</span></div></div><label>管理密钥<input autoFocus autoComplete="current-password" name="password" required type="password" /></label><button className="button primary full" type="submit"><LogIn size={17} />登录</button>{error && <p className="form-error" role="alert">{error}</p>}<p className="muted login-note">会话仅保存在网关内存中，重启后需要重新登录。</p></form></main>
 }
 
 function Overview({ state, usage, connection, csrf, setNotice, onApply }: { state: Json | null; usage: Json | null; connection: Json | null; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onApply: () => void }) {

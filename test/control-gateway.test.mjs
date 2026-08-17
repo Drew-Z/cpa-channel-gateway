@@ -1093,6 +1093,8 @@ test('admin page serves the built app with strict static CSP and immutable asset
   assert.match(asset.headers['cache-control'], /immutable/)
   assert.match(asset.headers['content-security-policy'], /default-src 'none'/)
   assert.match(asset.body, /客户端连接/)
+  assert.match(asset.body, /current-password/)
+  assert.match(asset.body, /FormData/)
   assert.match(asset.body, /\/admin\/api\/stable-aliases/)
   assert.match(asset.body, /\/admin\/api\/runtime\/apply/)
   assert.match(asset.body, /\/admin\/api\/revisions/)
