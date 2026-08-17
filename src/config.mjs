@@ -337,6 +337,7 @@ function validateGateway(gateway, errors) {
   const q = gateway.queue ?? {}
   const tunnel = gateway.cloudflareTunnel ?? {}
   const cpa = gateway.cpa ?? {}
+  const usage = gateway.usage ?? {}
   if (typeof gateway.cpa?.localModelCatalog !== 'boolean') errors.push('cpa.localModelCatalog must be boolean')
   if (cpa.disableCodexCloaking !== undefined && typeof cpa.disableCodexCloaking !== 'boolean') errors.push('cpa.disableCodexCloaking must be boolean')
   if (!ENV_NAME.test(tunnel.enabledEnv ?? '')) errors.push('cloudflareTunnel.enabledEnv must be an environment variable name')
@@ -354,5 +355,8 @@ function validateGateway(gateway, errors) {
     'cloudflareTunnel.readyTimeoutSeconds': tunnel.readyTimeoutSeconds
   })) {
     if (!Number.isSafeInteger(value) || value <= 0) errors.push(`${name} must be a positive integer`)
+  }
+  if (usage.maxBytes !== undefined && (!Number.isSafeInteger(usage.maxBytes) || usage.maxBytes <= 0)) {
+    errors.push('usage.maxBytes must be a positive integer')
   }
 }

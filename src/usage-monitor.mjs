@@ -5,10 +5,16 @@ const DEFAULT_WINDOW_HOURS = 24
 const RETENTION_MS = 26 * 60 * 60 * 1000
 const COMPACTION_INTERVAL_MS = 60 * 60 * 1000
 const MAX_EVENTS = 50_000
+const DEFAULT_MAX_BYTES = 4 * 1024 * 1024
 const OUTCOMES = new Set(['success', 'failure', 'cancelled'])
 const TRANSPORTS = new Set(['native-passthrough', 'adapted', 'unassigned'])
 
-export function createUsageMonitor(config, { filePath = defaultFilePath(config), now = () => Date.now() } = {}) {
+export function createUsageMonitor(config, {
+  filePath = defaultFilePath(config),
+  now = () => Date.now(),
+  maxBytes = config?.gateway?.usage?.maxBytes ?? DEFAULT_MAX_BYTES
+} = {}) {
+  const byteLimit = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_MAX_BYTES
   let events = []
   let writable = Boolean(filePath)
   let lastCompactedAt = now()
@@ -24,7 +30,14 @@ export function createUsageMonitor(config, { filePath = defaultFilePath(config),
       if (filePath && writable) {
         try {
           fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
-          fs.appendFileSync(filePath, `${JSON.stringify(event)}\n`, { mode: 0o600 })
+          const line = `${JSON.stringify(event)}\n`
+          const currentBytes = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0
+          let compacted = false
+          if (currentBytes + Buffer.byteLength(line) > byteLimit) {
+            compact(event.at)
+            compacted = true
+          }
+          if (!compacted) fs.appendFileSync(filePath, line, { mode: 0o600 })
           if (event.at - lastCompactedAt >= COMPACTION_INTERVAL_MS) compact(event.at)
         } catch {
           writable = false
@@ -68,7 +81,7 @@ export function createUsageMonitor(config, { filePath = defaultFilePath(config),
           return []
         }
       }).slice(-MAX_EVENTS)
-      if (events.length === MAX_EVENTS) needsCompaction = true
+      if (events.length === MAX_EVENTS || fs.statSync(filePath).size > byteLimit) needsCompaction = true
       if (needsCompaction) compact(now())
     } catch {
       events = []
@@ -81,10 +94,21 @@ export function createUsageMonitor(config, { filePath = defaultFilePath(config),
     events = events.filter(event => event.at >= cutoff).slice(-MAX_EVENTS)
     const temporary = `${filePath}.tmp-${process.pid}`
     fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
-    fs.writeFileSync(temporary, events.map(event => JSON.stringify(event)).join('\n') + (events.length ? '\n' : ''), { mode: 0o600 })
+    let serialized = serializeEvents(events)
+    while (serialized.bytes > byteLimit && events.length) {
+      events = events.slice(1)
+      serialized = serializeEvents(events)
+    }
+    if (serialized.bytes > byteLimit) serialized = { text: '', bytes: 0 }
+    fs.writeFileSync(temporary, serialized.text, { mode: 0o600 })
     fs.renameSync(temporary, filePath)
     lastCompactedAt = timestamp
   }
+}
+
+function serializeEvents(events) {
+  const text = events.map(event => JSON.stringify(event)).join('\n') + (events.length ? '\n' : '')
+  return { text, bytes: Buffer.byteLength(text) }
 }
 
 function defaultFilePath(config) {

@@ -145,3 +145,24 @@ test('usage monitor falls back to memory when its private event file is not writ
   assert.equal(monitor.snapshot().storage, 'memory-fallback')
   assert.equal(monitor.snapshot().summary.total, 1)
 })
+
+test('usage monitor enforces a byte budget with atomic compaction', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-usage-budget-'))
+  const filePath = path.join(root, 'runtime', 'usage-events.jsonl')
+  let clock = 1_000
+  const monitor = createUsageMonitor({}, { filePath, maxBytes: 420, now: () => clock })
+  for (let index = 0; index < 20; index += 1) {
+    monitor.record({
+      requestedModel: `model-${index}`,
+      channelId: 'free',
+      upstreamModel: 'shared-model',
+      outcome: 'success',
+      transport: 'adapted'
+    })
+    clock += 1
+  }
+  assert.ok(fs.statSync(filePath).size <= 420)
+  const restored = createUsageMonitor({}, { filePath, maxBytes: 420, now: () => clock }).snapshot()
+  assert.ok(restored.summary.total < 20)
+  assert.ok(restored.summary.total > 0)
+})
