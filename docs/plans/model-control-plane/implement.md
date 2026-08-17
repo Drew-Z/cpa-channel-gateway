@@ -119,6 +119,9 @@ readiness 失败均保留原运行配置；公开审计扫描证明历史、API 
 
 目标是补齐设计稿中的同优先级决胜项和故障状态机，但不引入自动重放或额外探测流量。
 
+详细状态、排序、持久化、half-open 和验收契约见
+[Stage 3 Evidence Scheduling and Circuit Breaker Plan](stage3-evidence-scheduling.md)。
+
 - 在 `runtime/control-state.json` 中持久化有界、脱敏的候选结果统计：成功/失败计数、
   连续瞬态失败数和 EWMA 延迟；不保存 request ID、正文或 Header。
 - 候选排序固定为：健康状态、operator priority、最小样本门槛后的成功率、EWMA 延迟、
