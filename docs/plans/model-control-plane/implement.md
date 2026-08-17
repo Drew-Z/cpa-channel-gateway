@@ -195,6 +195,8 @@ reached. The Changes view now exposes a low-sensitivity revision inventory and 2
 plans without snapshot contents or filesystem paths. Revision pruning is explicit only: it requires
 matching `keep` and `confirmKeep`, runs through the FIFO and audit path, always protects loaded and
 pending revisions, and is never triggered by startup, background work, or deployment verification.
+Long-lived manual-canary cooldown entries are also filtered against the active catalog on runtime
+reload, so removed model IDs cannot accumulate in memory or retain stale cooldowns when reintroduced.
 
 最终门槛：`npm test`、`npm run check`、`npm run audit:public`、语法检查、桌面/移动截图、
 一次真实精确 canary、流式与非流式请求、正常 apply 和可证明的失败回滚全部通过。

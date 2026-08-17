@@ -527,6 +527,47 @@ test('reloadConfig restores the previous catalog and revision when validation fa
   assert.equal(controlState.status().configRevision, 'release-a')
 })
 
+test('reloadConfig retains canary cooldowns only for models still in the catalog', async t => {
+  let canaryCount = 0
+  const upstream = http.createServer((request, response) => {
+    request.resume()
+    canaryCount += 1
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"output_text":"秋夜读书灯映寒窗"}')
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+  const config = fixtureConfig(upstreamAddress.port)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+  const testModel = model => request({ port: address.port, path: '/admin/api/tests', headers, body: { model } })
+
+  assert.equal((await testModel('free/shared-model')).statusCode, 200)
+  gateway.reloadConfig({ ...config, digest: 'same-model-release' })
+  assert.equal((await testModel('free/shared-model')).statusCode, 429)
+
+  const replacement = fixtureConfig(upstreamAddress.port)
+  replacement.managementKey = config.managementKey
+  replacement.digest = 'replacement-release'
+  replacement.channels[0].models[0].upstream = 'replacement-model'
+  replacement.channels[0].models[0].aliases = ['free/replacement-model']
+  replacement.stableAliases = [{ alias: 'coding-main', channel: 'free', model: 'replacement-model' }]
+  gateway.reloadConfig(replacement)
+  assert.equal((await testModel('free/replacement-model')).statusCode, 200)
+  const restored = fixtureConfig(upstreamAddress.port)
+  restored.managementKey = config.managementKey
+  restored.digest = 'restored-release'
+  gateway.reloadConfig(restored)
+  assert.equal((await testModel('free/shared-model')).statusCode, 200)
+  assert.equal(canaryCount, 3)
+})
+
 test('reloadConfig updates the adapted CPA target and request limit', async t => {
   const responses = []
   const cpaOne = http.createServer((request, response) => {

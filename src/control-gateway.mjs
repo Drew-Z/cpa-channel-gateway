@@ -663,6 +663,7 @@ export function createControlGateway(config, {
       const nextState = controlState.reconfigure(nextConfig)
       scheduler.reload(nextConfig, { initialState: nextState })
       Object.assign(config, nextConfig)
+      pruneTestCooldowns()
       lastTests.clear()
       for (const [modelId, result] of Object.entries(controlState.lastTests())) lastTests.set(modelId, result)
       if (markApplied) configManager?.markApplied?.(nextConfig.digest)
@@ -674,6 +675,7 @@ export function createControlGateway(config, {
           ? controlState.restore(previousConfig, previousState)
           : previousState.schedulerState
         scheduler.reload(previousConfig, { initialState: restoredState })
+        pruneTestCooldowns()
         lastTests.clear()
         for (const [modelId, result] of Object.entries(controlState.lastTests())) lastTests.set(modelId, result)
       } catch (restoreError) {
@@ -682,6 +684,15 @@ export function createControlGateway(config, {
         throw failure
       }
       throw error
+    }
+  }
+
+  function pruneTestCooldowns() {
+    const validModels = new Set(
+      [...scheduler.catalog.allModels.values()].flatMap(candidates => candidates.map(candidate => candidate.directAlias))
+    )
+    for (const modelId of lastTestStarted.keys()) {
+      if (!validModels.has(modelId)) lastTestStarted.delete(modelId)
     }
   }
 
