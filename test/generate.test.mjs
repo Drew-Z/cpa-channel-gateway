@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { createConfigRevisionStore } from '../src/config-revisions.mjs'
 import { activateRelease, pruneReleases, rollbackRelease } from '../src/generate.mjs'
 
 test('re-activating the current release preserves the real rollback target', () => {
@@ -19,7 +20,7 @@ test('re-activating the current release preserves the real rollback target', () 
   assert.equal(rollbackRelease(root).active, 'release-a')
 })
 
-test('release pruning protects active and previous releases and keeps a bounded tail', () => {
+test('release pruning protects active, previous, and revision-linked releases and keeps a bounded tail', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-release-prune-'))
   const runtime = path.join(root, 'runtime')
   const releases = path.join(runtime, 'releases')
@@ -30,9 +31,16 @@ test('release pruning protects active and previous releases and keeps a bounded 
     fs.writeFileSync(path.join(directory, 'manifest.json'), JSON.stringify({ generatedAt: new Date(1_000 + index).toISOString() }))
   }
   fs.writeFileSync(path.join(runtime, 'active.json'), JSON.stringify({ active: 'eeeeeeeeeeeeeeee', previous: 'dddddddddddddddd' }))
+  const revisionStore = createConfigRevisionStore({ root })
+  const revision = revisionStore.create({
+    operation: 'baseline',
+    snapshot: { envText: 'PRIVATE_VALUE=fixture\n', routesText: '{}\n', providersText: null }
+  })
+  revisionStore.linkRelease(revision.revision, 'bbbbbbbbbbbbbbbb')
   const result = pruneReleases(root, { keepExtra: 1 })
-  assert.deepEqual(result.retained.sort(), ['cccccccccccccccc', 'dddddddddddddddd', 'eeeeeeeeeeeeeeee'].sort())
-  assert.deepEqual(result.removed.sort(), ['aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb'].sort())
+  assert.deepEqual(result.retained.sort(), ['bbbbbbbbbbbbbbbb', 'cccccccccccccccc', 'dddddddddddddddd', 'eeeeeeeeeeeeeeee'].sort())
+  assert.deepEqual(result.removed, ['aaaaaaaaaaaaaaaa'])
   assert.equal(fs.existsSync(path.join(releases, 'dddddddddddddddd')), true)
+  assert.equal(fs.existsSync(path.join(releases, 'bbbbbbbbbbbbbbbb')), true)
   assert.equal(fs.existsSync(path.join(releases, 'aaaaaaaaaaaaaaaa')), false)
 })

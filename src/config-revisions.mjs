@@ -5,6 +5,7 @@ import { parseEnv } from './env.mjs'
 
 const VERSION = 1
 const REVISION_ID = /^\d{8}T\d{9}Z-[a-f0-9]{16}-[a-f0-9]{8}$/
+const RELEASE_DIGEST = /^[a-f0-9]{16}$/
 const OPERATION = /^[a-z][a-z0-9-]{0,63}$/
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 
@@ -29,7 +30,7 @@ export function createConfigRevisionStore({
     snapshotCurrent() {
       return readCurrentSnapshot(root)
     },
-    create({ parentRevision = null, operation, affected = {}, snapshot, validation = { ok: true } } = {}) {
+    create({ parentRevision = null, operation, affected = {}, snapshot, validation = { ok: true }, releaseDigest = null } = {}) {
       const normalizedSnapshot = normalizeSnapshot(snapshot)
       const contentDigest = digestSnapshot(normalizedSnapshot)
       const createdAt = new Date(now()).toISOString()
@@ -42,6 +43,7 @@ export function createConfigRevisionStore({
         operation,
         affected,
         contentDigest,
+        releaseDigest,
         validation,
         files: { providers: normalizedSnapshot.providersText !== null }
       })
@@ -59,6 +61,28 @@ export function createConfigRevisionStore({
         removeTemporaryDirectory(revisionRoot, temporaryDir)
         if (error instanceof ConfigRevisionError) throw error
         throw new ConfigRevisionError('revision_write_failed', 500, 'Configuration revision could not be written')
+      }
+      return structuredClone(manifest)
+    },
+    linkRelease(revisionValue, releaseDigestValue) {
+      const revision = normalizeRevisionId(revisionValue)
+      const releaseDigest = normalizeReleaseDigest(releaseDigestValue)
+      const releaseRoot = path.resolve(root, 'runtime', 'releases')
+      const releaseDirectory = path.resolve(releaseRoot, releaseDigest)
+      if (path.dirname(releaseDirectory) !== releaseRoot || !fs.existsSync(path.join(releaseDirectory, 'manifest.json'))) {
+        throw new ConfigRevisionError('release_not_found', 404, 'Runtime release was not found')
+      }
+      const current = readRevision(revisionRoot, revision)
+      if (current.manifest.releaseDigest === releaseDigest) return structuredClone(current.manifest)
+      const manifest = normalizeManifest({ ...current.manifest, releaseDigest })
+      const manifestPath = path.join(revisionPath(revisionRoot, revision), 'manifest.json')
+      const temporaryPath = `${manifestPath}.tmp-${process.pid}-${crypto.randomUUID()}`
+      try {
+        fs.writeFileSync(temporaryPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 })
+        fs.renameSync(temporaryPath, manifestPath)
+      } catch {
+        try { fs.rmSync(temporaryPath, { force: true }) } catch {}
+        throw new ConfigRevisionError('revision_link_failed', 500, 'Configuration revision could not be linked to the runtime release')
       }
       return structuredClone(manifest)
     },
@@ -95,6 +119,13 @@ export function createConfigRevisionStore({
     },
     root: revisionRoot
   }
+}
+
+export function revisionReleaseDigests(root) {
+  if (typeof root !== 'string' || !root) throw new TypeError('root is required')
+  const revisionRoot = path.resolve(root, 'runtime', 'config-revisions')
+  return [...new Set(validManifests(revisionRoot).map(manifest => manifest.releaseDigest).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right))
 }
 
 function validManifests(revisionRoot) {
@@ -359,6 +390,9 @@ function normalizeManifest(value) {
   }
   const contentDigest = String(value.contentDigest ?? '')
   if (!/^[a-f0-9]{64}$/.test(contentDigest)) throw new ConfigRevisionError('invalid_revision_manifest', 400, 'Revision content digest is invalid')
+  const releaseDigest = value.releaseDigest === null || value.releaseDigest === undefined
+    ? null
+    : normalizeReleaseDigest(value.releaseDigest)
   if (value.validation?.ok !== true) throw new ConfigRevisionError('invalid_revision_manifest', 400, 'Revision validation result is invalid')
   return {
     schemaVersion: VERSION,
@@ -368,6 +402,7 @@ function normalizeManifest(value) {
     operation,
     affected: normalizeAffected(value.affected),
     contentDigest,
+    releaseDigest,
     validation: { ok: true },
     files: {
       env: 'channels.local.env',
@@ -411,10 +446,17 @@ function publicManifest(manifest) {
     operation: manifest.operation,
     affected: structuredClone(manifest.affected),
     contentDigest: manifest.contentDigest,
+    releaseDigest: manifest.releaseDigest,
     validation: { ok: true },
     files: { ...manifest.files },
     valid: true
   }
+}
+
+function normalizeReleaseDigest(value) {
+  const digest = String(value ?? '')
+  if (!RELEASE_DIGEST.test(digest)) throw new ConfigRevisionError('invalid_release_digest', 400, 'Runtime release digest is invalid')
+  return digest
 }
 
 function normalizeRevisionId(value) {

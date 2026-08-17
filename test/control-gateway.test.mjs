@@ -579,9 +579,10 @@ test('reloadConfig can defer the loaded revision until active release commit', (
   config.digest = 'release-a'
   let loadedRevision = 'release-a'
   let marks = 0
+  let markedRelease = null
   const configManager = {
     status: () => ({ revision: 'release-b', loadedRevision, restartRequired: loadedRevision !== 'release-b' }),
-    markApplied: () => { marks += 1; loadedRevision = 'release-b' }
+    markApplied: releaseDigest => { marks += 1; markedRelease = releaseDigest; loadedRevision = 'release-b' }
   }
   const gateway = createControlGateway(config, { configManager })
   const next = { ...config, digest: 'release-b' }
@@ -591,6 +592,7 @@ test('reloadConfig can defer the loaded revision until active release commit', (
   assert.equal(configManager.status().restartRequired, true)
   gateway.markConfigApplied()
   assert.equal(marks, 1)
+  assert.equal(markedRelease, 'release-b')
   assert.equal(configManager.status().restartRequired, false)
 })
 

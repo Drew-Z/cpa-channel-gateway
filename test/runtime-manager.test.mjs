@@ -32,7 +32,7 @@ test('commits a changed release only after drain and readiness replacement', asy
     'idle:7000',
     'reload:release-b:false',
     'activate:release-b',
-    'mark-applied',
+    'mark-applied:release-b',
     'resume'
   ])
 })
@@ -55,7 +55,7 @@ test('marks an unchanged generated revision without restarting the runtime', asy
   const result = await manager.apply()
 
   assert.equal(result.changed, false)
-  assert.deepEqual(events, ['generate', 'replace:release-a', 'mark-applied'])
+  assert.deepEqual(events, ['generate', 'replace:release-a', 'mark-applied:release-a'])
 })
 
 test('restores the previous config and active release when commit fails', async () => {
@@ -145,6 +145,6 @@ function fixtureGateway(events, { waitError = null } = {}) {
       resumeAll: () => events.push('resume')
     },
     reloadConfig: (release, options) => events.push(`reload:${release.digest}:${options.markApplied}`),
-    markConfigApplied: () => events.push('mark-applied')
+    markConfigApplied: releaseDigest => events.push(`mark-applied:${releaseDigest}`)
   }
 }

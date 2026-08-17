@@ -14,7 +14,7 @@ HAProxy listener 均绑定到容器回环地址。
 - Node 为每个物理渠道持有一个互斥租约。渠道繁忙时会从所有模型的新请求候选中临时隐藏；没有其他空闲候选时立即返回 `429 all_candidates_busy`，不向上游排队或重复调用。
 - HAProxy 仍以 `maxconn 1` 作为最终硬约束；CPA 和网关都不会自动重放已经发往上游的生成请求。
 - 私有渠道 URL、密钥、激活配置、日志和二进制不会进入 Git。
-- 私有配置按完整快照保存带 manifest 的 revision；运行时 release 按内容寻址，支持排空、readiness 验证和事务回滚。
+- 私有配置按完整快照保存带 manifest 的 revision；成功应用后 manifest 会关联对应的内容寻址 release，清理时保护 active、previous 和所有有效 revision 引用，支持排空、readiness 验证和事务回滚。
 - canary 使用真实小任务，不使用 `hi`、`你好` 等无意义提示词。
 - 流式与非流式请求按模型能力筛选候选；不支持时返回 `422 streaming_not_supported`，不会静默降级或重放请求。
 - 开启 `CPA_MANAGEMENT_KEY` 后，可在同一公网端口的 `/admin` 使用管理台查看渠道状态、逻辑模型候选和执行精确渠道模型测活。
@@ -216,7 +216,7 @@ npm run canary
 - Cloudflare Tunnel 默认关闭；Token 只存在于 `channels.local.env`，并通过子进程环境传递。cloudflared 固定版本、校验 SHA-256 且禁用自动更新。
 - CPA Management API 默认关闭；确需开启时仍只允许 localhost。
 - 不提交 `config/*.local.*`、`runtime/`、`auth/`、`logs/` 或 `bin/`。
-- `runtime/config-revisions/` 保存完整私有快照；`runtime/audit-events.jsonl` 只保存白名单低敏字段，两者都必须保持 Git 忽略。
+- `runtime/config-revisions/` 保存完整私有快照及其已应用 release digest；`runtime/audit-events.jsonl` 只保存白名单低敏字段，两者都必须保持 Git 忽略。
 - 公开或发布前运行 `npm run audit:public`；该检查会扫描当前跟踪文件、完整可达 Git 历史以及本地私密值是否意外进入仓库，但不会输出私密值。
 - CPA 当前启用 Codex 的标准兼容头（由 `cpa.disableCodexCloaking=false` 控制），用于适配通常只检查 `User-Agent`/`Originator` 的上游；这不是客户端真实性证明，也不会复制 Desktop 版本。身份混淆、Claude cloaking 和系统提示词替换仍保持关闭；Responses 同协议 native 路径继续保留真实客户端实际发送的低敏请求头。
 - 启动时使用 CPA 的 `-local-model`，模型目录来自已审核的本地 routes 配置，不依赖远程模型目录服务。

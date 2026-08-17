@@ -185,10 +185,11 @@ Stage 5 implementation status: complete. Fixture coverage now includes Responses
 adapted Chat Completions JSON/SSE, adapted Claude Messages, reviewed credential replacement,
 hop-by-hop and connection-token filtering, client cancellation, transport failure, and the
 no-replay contract. Usage events have a configurable default 4 MiB hard byte cap with atomic
-compaction. Release activation prunes only unprotected content-addressed directories while
-preserving active, previous, and a bounded recent tail. Runtime status exposes only bounded
-apply counts, outcomes, durations, drain wait, classified error codes, and unexpected child
-exit counts; the admin Overview renders the short runtime summary. Post-closeout hardening also
+compaction. Applied revision manifests atomically record their release digest; release activation
+prunes only unprotected content-addressed directories while preserving active, previous, every
+valid revision reference, and a bounded recent tail. Runtime status exposes only bounded apply
+counts, outcomes, durations, drain wait, classified error codes, and unexpected child exit counts;
+the admin Overview renders the short runtime summary. Post-closeout hardening also
 bounds in-memory admin sessions and evicts the oldest session when the single-tenant limit is
 reached.
 

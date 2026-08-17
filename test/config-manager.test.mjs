@@ -98,9 +98,32 @@ test('markApplied advances the loaded revision after an external runtime apply',
     priority: 1
   })
   assert.equal(manager.status().restartRequired, true)
-  const applied = manager.markApplied()
+  const releaseDigest = '0123456789abcdef'
+  const releaseDir = path.join(root, 'runtime', 'releases', releaseDigest)
+  fs.mkdirSync(releaseDir, { recursive: true })
+  fs.writeFileSync(path.join(releaseDir, 'manifest.json'), '{}\n')
+  const applied = manager.markApplied(releaseDigest)
   assert.equal(applied.restartRequired, false)
   assert.equal(applied.loadedRevision, applied.pendingRevision)
+  assert.equal(createConfigRevisionStore({ root }).read(applied.loadedRevision).manifest.releaseDigest, releaseDigest)
+})
+
+test('startup links the current revision to the already activated generated release', () => {
+  const root = fixtureRoot()
+  const releaseDigest = 'fedcba9876543210'
+  const releaseDir = path.join(root, 'runtime', 'releases', releaseDigest)
+  fs.mkdirSync(releaseDir, { recursive: true })
+  fs.writeFileSync(path.join(releaseDir, 'manifest.json'), '{}\n')
+  const config = { ...loadConfig(root), digest: releaseDigest }
+
+  const manager = createPrivateConfigManager(config)
+  const status = manager.status()
+  const linked = createConfigRevisionStore({ root }).read(status.loadedRevision)
+
+  assert.equal(status.loadedRevision, status.pendingRevision)
+  assert.equal(linked.manifest.releaseDigest, releaseDigest)
+  assert.equal(linked.snapshot.envText, fs.readFileSync(path.join(root, 'config', 'channels.local.env'), 'utf8'))
+  assert.equal(linked.snapshot.routesText, fs.readFileSync(path.join(root, 'config', 'routes.local.json'), 'utf8'))
 })
 
 test('stable aliases may temporarily point to a disabled channel', () => {

@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { buildCpaConfig } from './cpa.mjs'
 import { loadConfig } from './config.mjs'
+import { revisionReleaseDigests } from './config-revisions.mjs'
 import { assignListeners, buildHaproxyConfig } from './haproxy.mjs'
 
 const DEFAULT_EXTRA_RELEASES = 3
@@ -63,6 +64,7 @@ export function pruneReleases(root, { keepExtra = DEFAULT_EXTRA_RELEASES } = {})
       if (RELEASE_ID.test(String(active?.previous ?? ''))) protectedIds.add(active.previous)
     } catch {}
   }
+  for (const releaseDigest of revisionReleaseDigests(root)) protectedIds.add(releaseDigest)
   const releases = fs.readdirSync(releaseRoot, { withFileTypes: true })
     .filter(entry => entry.isDirectory() && RELEASE_ID.test(entry.name))
     .map(entry => {

@@ -31,7 +31,7 @@ export function createRuntimeManager({
         commit: async release => {
           controlGateway.reloadConfig(release, { markApplied: false })
           activateReleaseImpl(rootDir, release)
-          controlGateway.markConfigApplied()
+          controlGateway.markConfigApplied(release.digest)
           appliedGenerated = release
         },
         rollback: async () => {
@@ -40,7 +40,7 @@ export function createRuntimeManager({
           appliedGenerated = previous
         }
       })
-      if (!result.changed) controlGateway.markConfigApplied()
+      if (!result.changed) controlGateway.markConfigApplied(next.digest)
       return result
     }
   }

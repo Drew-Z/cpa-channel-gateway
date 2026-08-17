@@ -44,10 +44,13 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
         restartRequired: pendingRevision !== loadedRevision
       }
     },
-    markApplied() {
+    markApplied(releaseDigest = config.digest ?? null) {
       const previousRevision = loadedRevision
       loadedRevision = refreshCurrentRevision().revision
       try {
+        if (releaseDigest && revisionStore.linkRelease) {
+          pendingManifest = revisionStore.linkRelease(loadedRevision, releaseDigest)
+        }
         return this.status()
       } catch (error) {
         loadedRevision = previousRevision
@@ -585,8 +588,9 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
   function initialRevision() {
     const snapshot = revisionStore.snapshotCurrent()
     const existing = revisionStore.findByDigest(digestSnapshot(snapshot))
-    if (existing) return existing
-    return revisionStore.create({ operation: 'startup-baseline', snapshot })
+    const manifest = existing ?? revisionStore.create({ operation: 'startup-baseline', snapshot })
+    if (config.digest && revisionStore.linkRelease) return revisionStore.linkRelease(manifest.revision, config.digest)
+    return manifest
   }
 
   function refreshCurrentRevision() {

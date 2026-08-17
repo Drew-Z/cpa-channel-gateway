@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { ConfigRevisionError, createConfigRevisionStore, diffSnapshots, digestSnapshot } from '../src/config-revisions.mjs'
+import { ConfigRevisionError, createConfigRevisionStore, diffSnapshots, digestSnapshot, revisionReleaseDigests } from '../src/config-revisions.mjs'
 
 test('stores complete private snapshots with a validated low-sensitivity manifest', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-revision-store-'))
@@ -43,6 +43,28 @@ test('links revisions and rejects traversal or corrupted snapshot content', () =
   fs.appendFileSync(path.join(store.root, second.revision, 'routes.local.json'), 'tampered')
   assert.throws(() => store.read(second.revision), error => error instanceof ConfigRevisionError && error.code === 'revision_invalid')
   assert.equal(store.list().find(entry => entry.revision === second.revision).valid, false)
+})
+
+test('links a validated revision to an existing runtime release without exposing snapshot data', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-revision-release-'))
+  const releaseDigest = '0123456789abcdef'
+  const releaseDir = path.join(root, 'runtime', 'releases', releaseDigest)
+  fs.mkdirSync(releaseDir, { recursive: true })
+  fs.writeFileSync(path.join(releaseDir, 'manifest.json'), '{}\n')
+  const store = createConfigRevisionStore({ root })
+  const revision = store.create({
+    operation: 'baseline',
+    snapshot: { envText: 'PRIVATE_VALUE=fixture-secret\n', routesText: '{}\n', providersText: null }
+  })
+
+  const linked = store.linkRelease(revision.revision, releaseDigest)
+
+  assert.equal(linked.releaseDigest, releaseDigest)
+  assert.equal(store.read(revision.revision).manifest.releaseDigest, releaseDigest)
+  assert.deepEqual(revisionReleaseDigests(root), [releaseDigest])
+  assert.equal(JSON.stringify(store.list()).includes('fixture-secret'), false)
+  assert.throws(() => store.linkRelease(revision.revision, 'not-a-release'), error => error instanceof ConfigRevisionError && error.code === 'invalid_release_digest')
+  assert.throws(() => store.linkRelease(revision.revision, 'fedcba9876543210'), error => error instanceof ConfigRevisionError && error.code === 'release_not_found')
 })
 
 test('produces structured diffs without returning provider URLs or keys', () => {

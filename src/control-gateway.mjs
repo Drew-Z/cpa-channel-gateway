@@ -640,7 +640,7 @@ export function createControlGateway(config, {
       Object.assign(config, nextConfig)
       lastTests.clear()
       for (const [modelId, result] of Object.entries(controlState.lastTests())) lastTests.set(modelId, result)
-      if (markApplied) configManager?.markApplied?.()
+      if (markApplied) configManager?.markApplied?.(nextConfig.digest)
       return { configRevision: nextConfig.digest ?? null, controlState: controlState.status() }
     } catch (error) {
       Object.assign(config, previousConfig)
@@ -668,8 +668,8 @@ export function createControlGateway(config, {
     return config.gateway.internal.cpaPort
   }
 
-  function markConfigApplied() {
-    return configManager?.markApplied?.() ?? null
+  function markConfigApplied(releaseDigest = config.digest) {
+    return configManager?.markApplied?.(releaseDigest) ?? null
   }
 
   function rememberTest(modelId, result) {
