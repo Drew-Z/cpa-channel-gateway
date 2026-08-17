@@ -105,8 +105,8 @@ function App() {
           {notice && <div className={`notice ${notice.kind}`} role="status"><span>{notice.kind === 'ok' ? <CheckCircle2 size={17} /> : notice.kind === 'error' ? <XCircle size={17} /> : <AlertTriangle size={17} />}</span><span>{notice.text}</span><button className="icon-button" title="关闭" onClick={() => setNotice(null)}><X size={16} /></button></div>}
           {view === 'overview' && <Overview state={state} usage={usage} connection={connection} csrf={csrf} setNotice={setNotice} onApply={() => openDialog(setDialog, '应用待重启配置', '应用会先排空在途请求，再替换内部运行时。', async () => { const result = await api('/admin/api/runtime/apply', { method: 'POST', csrf }); setNotice({ kind: 'ok', text: result.changed ? '配置已应用，内部运行时已就绪。' : '当前运行时已经是最新配置。' }); await refresh() })} />}
           {view === 'channels' && <Channels state={state} discovery={discovery} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
-          {view === 'models' && <Models models={models} state={state} csrf={csrf} setNotice={setNotice} onRefresh={refresh} />}
-          {view === 'routing' && <Routing state={state} models={models} csrf={csrf} setNotice={setNotice} onRefresh={refresh} />}
+          {view === 'models' && <Models models={models} state={state} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
+          {view === 'routing' && <Routing state={state} models={models} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
           {view === 'changes' && <Changes state={state} revisions={revisions} audits={audits} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
         </main>
       </div>
@@ -198,9 +198,114 @@ function Channels({ state, discovery, csrf, setNotice, onRefresh, openDialog }: 
 
 function Discovery({ discovery, csrf, setNotice, onRefresh }: { discovery: Json | null; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void> }) { const importChannel = async (id: string, sync: boolean) => { try { await api('/admin/api/channels/import', { method: 'POST', csrf, body: JSON.stringify({ id, sync }) }); setNotice({ kind: 'ok', text: `已导入 ${id} 为待测试渠道` }); await onRefresh() } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } }; if (!discovery) return <p className="muted">暂无发现结果。</p>; return <div className="discovery-list">{discovery.pendingRestart?.map((item: Json) => <div className="discovery-row" key={item.id}><div><strong>{item.name}</strong><small>{item.id} · {item.protocol}</small></div><span className="state-tag warning">等待重启</span></div>)}{discovery.unregistered?.map((item: Json) => <div className="discovery-row" key={item.id}><div><strong>{item.name}</strong><small>{item.id} · {item.baseUrl}</small></div>{item.ready ? <div className="inline-actions"><button className="button tiny" onClick={() => void importChannel(item.id, false)}>导入</button><button className="button tiny subtle" onClick={() => void importChannel(item.id, true)}>导入并同步</button></div> : <span className="state-tag danger">缺少 {item.missing?.join(', ')}</span>}</div>)}{!discovery.pendingRestart?.length && !discovery.unregistered?.length && <p className="muted">没有新的 env 渠道。</p>}</div> }
 
-function Models({ models, state, csrf, setNotice, onRefresh }: { models: Json[]; state: Json | null; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void> }) { const candidates = useMemo(() => models.flatMap(group => group.candidates ?? []), [models]); const [selected, setSelected] = useState(''); const candidate = candidates.find(item => item.directId === selected); const restart = state?.restartRequired === true; const run = async (path: string, method: string, body: Json, message: string) => { try { const result = await api(path, { method, csrf, body: JSON.stringify(body) }); setNotice({ kind: 'ok', text: `${message}${result.revision ? ` · ${result.revision}` : ''}` }); await onRefresh() } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } }; const test = () => { if (selected) void run('/admin/api/tests', 'POST', { model: selected }, '固定诗词测活完成') }; const alias = (name: string) => candidate && void run('/admin/api/stable-aliases', 'PUT', { alias: name, channel: candidate.channel, model: candidate.upstreamModel }, `${name} 已固定到 ${candidate.directId}`); const toggle = () => candidate && void api('/admin/api/models', { method: 'PATCH', csrf, body: JSON.stringify({ channel: candidate.channel, model: candidate.upstreamModel, status: candidate.status === 'disabled' ? 'active' : 'disabled' }) }).then(() => { setNotice({ kind: 'ok', text: candidate.status === 'disabled' ? '模型已恢复' : '模型已禁用' }); return onRefresh() }).catch(error => setNotice({ kind: 'error', text: errorMessage(error) })); const blocked = !candidate || restart || candidate.status === 'disabled' || candidate.busy || candidate.draining || candidate.suppressed || candidate.scheduling?.reasonCodes?.some((code: string) => ['channel-busy', 'channel-draining', 'channel-cooling', 'circuit-open', 'half-open-busy', 'configuration-pending-restart'].includes(code)); return <div className="view-stack"><section className="band"><div className="section-heading"><div><div className="eyebrow">MODEL CONTROL</div><h2>精确模型测活与路由</h2></div><span className="muted">固定诗词任务 · 不计入业务统计</span></div><div className="model-toolbar"><select value={selected} onChange={event => setSelected(event.target.value)}><option value="">请选择精确模型</option>{candidates.map(item => <option key={item.directId} value={item.directId}>{item.directId} · {item.kind === 'generation' ? '生成' : item.kind}</option>)}</select><button className="button primary" disabled={Boolean(blocked) || candidate?.canaryEligible === false} onClick={test}><Play size={16} />测活</button><button className="button" disabled={!candidate || candidate.status === 'disabled'} onClick={() => alias('coding-main')}><ArrowUp size={16} />coding-main</button><button className="button subtle" disabled={!candidate || candidate.status === 'disabled'} onClick={() => alias('coding-backup')}><ArrowDown size={16} />coding-backup</button><button className="button subtle" disabled={!candidate} onClick={toggle}>{candidate?.status === 'disabled' ? <><Check size={16} />恢复</> : <><X size={16} />禁用</>}</button></div>{restart && <p className="inline-warning"><AlertTriangle size={16} />配置待应用，测活暂时禁用。</p>}{candidate && <div className="candidate-inspector"><StateTag channel={candidate} /><HealthTag value={candidate.health} /><span>模式：{streamingLabel(candidate.streaming)}</span><span>调度：{reasonText(candidate.scheduling?.reasonCodes)}</span><span>证据：{evidenceText(candidate.scheduling?.evidence)}</span></div>}</section><section className="band"><div className="section-heading"><div><div className="eyebrow">CATALOG</div><h2>模型目录</h2></div><span className="muted">{candidates.length} 个精确候选</span></div><div className="table-scroll"><table><thead><tr><th>精确模型</th><th>类型</th><th>请求模式</th><th>生命周期</th><th>证据</th><th>调度原因</th><th>测活</th></tr></thead><tbody>{candidates.map(item => <tr key={item.directId}><td><strong>{item.directId}</strong><small>{item.channel} / {item.upstreamModel}</small></td><td>{kindLabel(item.kind)}</td><td>{streamingLabel(item.streaming)}</td><td><StateTag channel={item} /></td><td>{evidenceText(item.scheduling?.evidence)}</td><td>{reasonText(item.scheduling?.reasonCodes)}</td><td>{item.canaryEligible && item.kind === 'generation' ? <span className="state-tag success">可测活</span> : <span className="state-tag neutral">不适用</span>}</td></tr>)}</tbody></table></div></section></div> }
+function Models({ models, state, csrf, setNotice, onRefresh, openDialog }: { models: Json[]; state: Json | null; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void>; openDialog: (value: { title: string; body: string; action: () => Promise<void> } | null) => void }) {
+  const candidates = useMemo(() => models.flatMap(group => group.candidates ?? []), [models])
+  const [selected, setSelected] = useState('')
+  const candidate = candidates.find(item => item.directId === selected)
+  const restart = state?.restartRequired === true
+  const run = async (path: string, method: string, body: Json, message: string) => {
+    try {
+      const result = await api(path, { method, csrf, body: JSON.stringify(body) })
+      setNotice({ kind: 'ok', text: `${message}${result.revision ? ` · ${result.revision}` : ''}` })
+      await onRefresh()
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorMessage(error) })
+    }
+  }
+  const test = () => { if (selected) void run('/admin/api/tests', 'POST', { model: selected }, '固定诗词测活完成') }
+  const confirmAlias = (name: string) => {
+    if (!candidate) return
+    openDialog({
+      title: `移动 ${name}`,
+      body: `将固定别名指向 ${candidate.directId}。修改会创建待应用 revision。`,
+      action: () => run('/admin/api/stable-aliases', 'PUT', { alias: name, channel: candidate.channel, model: candidate.upstreamModel }, `${name} 已固定到 ${candidate.directId}`)
+    })
+  }
+  const setStatus = async (status: 'active' | 'disabled') => {
+    if (!candidate) return
+    await run('/admin/api/models', 'PATCH', { channel: candidate.channel, model: candidate.upstreamModel, status }, status === 'active' ? '模型已恢复' : '模型已禁用')
+  }
+  const toggle = () => {
+    if (!candidate) return
+    if (candidate.status === 'disabled') {
+      void setStatus('active')
+      return
+    }
+    openDialog({
+      title: `禁用 ${candidate.directId}`,
+      body: '禁用后该模型会从公开目录和生产调度移除；仍有别名或逻辑候选引用时服务器会拒绝修改。',
+      action: () => setStatus('disabled')
+    })
+  }
+  const blocked = !candidate || restart || candidate.status === 'disabled' || candidate.busy || candidate.draining || candidate.suppressed || candidate.scheduling?.reasonCodes?.some((code: string) => ['channel-busy', 'channel-draining', 'channel-cooling', 'circuit-open', 'half-open-busy', 'configuration-pending-restart'].includes(code))
+  return <div className="view-stack"><section className="band"><div className="section-heading"><div><div className="eyebrow">MODEL CONTROL</div><h2>精确模型测活与路由</h2></div><span className="muted">固定诗词任务 · 不计入业务统计</span></div><div className="model-toolbar"><select value={selected} onChange={event => setSelected(event.target.value)}><option value="">请选择精确模型</option>{candidates.map(item => <option key={item.directId} value={item.directId}>{item.directId} · {item.kind === 'generation' ? '生成' : item.kind}</option>)}</select><button className="button primary" disabled={Boolean(blocked) || candidate?.canaryEligible === false} onClick={test}><Play size={16} />测活</button><button className="button" disabled={!candidate || candidate.status === 'disabled'} onClick={() => confirmAlias('coding-main')}><ArrowUp size={16} />coding-main</button><button className="button subtle" disabled={!candidate || candidate.status === 'disabled'} onClick={() => confirmAlias('coding-backup')}><ArrowDown size={16} />coding-backup</button><button className="button subtle" disabled={!candidate} onClick={toggle}>{candidate?.status === 'disabled' ? <><Check size={16} />恢复</> : <><X size={16} />禁用</>}</button></div>{restart && <p className="inline-warning"><AlertTriangle size={16} />配置待应用，测活暂时禁用。</p>}{candidate && <div className="candidate-inspector"><StateTag channel={candidate} /><HealthTag value={candidate.health} /><span>模式：{streamingLabel(candidate.streaming)}</span><span>调度：{reasonText(candidate.scheduling?.reasonCodes)}</span><span>证据：{evidenceText(candidate.scheduling?.evidence)}</span></div>}</section><section className="band"><div className="section-heading"><div><div className="eyebrow">CATALOG</div><h2>模型目录</h2></div><span className="muted">{candidates.length} 个精确候选</span></div><div className="table-scroll"><table><thead><tr><th>精确模型</th><th>类型</th><th>请求模式</th><th>生命周期</th><th>证据</th><th>调度原因</th><th>测活</th></tr></thead><tbody>{candidates.map(item => <tr key={item.directId}><td><strong>{item.directId}</strong><small>{item.channel} / {item.upstreamModel}</small></td><td>{kindLabel(item.kind)}</td><td>{streamingLabel(item.streaming)}</td><td><StateTag channel={item} /></td><td>{evidenceText(item.scheduling?.evidence)}</td><td>{reasonText(item.scheduling?.reasonCodes)}</td><td>{item.canaryEligible && item.kind === 'generation' ? <span className="state-tag success">可测活</span> : <span className="state-tag neutral">不适用</span>}</td></tr>)}</tbody></table></div></section></div>
+}
 
-function Routing({ state, models, csrf, setNotice, onRefresh }: { state: Json | null; models: Json[]; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void> }) { const groups = state?.logicalModels ?? []; const [selected, setSelected] = useState(''); const group = groups.find((item: Json) => item.id === selected); const [id, setId] = useState(''); const [enabled, setEnabled] = useState(true); const [candidates, setCandidates] = useState<Json[]>([]); const exact = useMemo(() => models.flatMap(item => item.candidates ?? []), [models]); useEffect(() => { if (group) { setId(group.id); setEnabled(group.enabled); setCandidates(group.candidates ?? []) } else { setId(''); setEnabled(true); setCandidates([]) } }, [group]); const save = async () => { if (!id.trim()) return; const body = { enabled, candidates: candidates.map(item => ({ channel: item.channel, model: item.upstreamModel ?? item.model, enabled: item.enabled !== false, priority: Number(item.priority ?? 0) })) }; try { await api(selected ? `/admin/api/logical-models/${encodeURIComponent(selected)}` : '/admin/api/logical-models', { method: selected ? 'PATCH' : 'POST', csrf, body: JSON.stringify(selected ? body : { id, ...body }) }); setNotice({ kind: 'ok', text: `逻辑模型 ${id} 已保存` }); await onRefresh() } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } }; const add = (event: ChangeEvent<HTMLSelectElement>) => { const item = exact.find(candidate => candidate.directId === event.target.value); if (item && !candidates.some(candidate => candidate.channel === item.channel && candidate.model === item.upstreamModel)) setCandidates([...candidates, { channel: item.channel, model: item.upstreamModel, upstreamModel: item.upstreamModel, enabled: true, priority: 0 }]); event.target.value = '' }; const remove = (index: number) => setCandidates(candidates.filter((_, current) => current !== index)); return <div className="view-stack"><section className="band"><div className="section-heading"><div><div className="eyebrow">FIXED ROUTING</div><h2>稳定别名</h2></div><span className="muted">别名是固定指针，不自动漂移</span></div><div className="alias-grid">{(state?.stableAliases ?? []).map((item: Json) => <div key={item.alias} className="alias-row"><code>{item.alias}</code><ChevronRight size={15} /><code>{item.logicalModel ? `logical:${item.logicalModel}` : `${item.channel}/${item.model}`}</code></div>)}</div></section><section className="band"><div className="section-heading"><div><div className="eyebrow">LOGICAL MODEL</div><h2>逻辑模型与候选</h2></div><span className="muted">不同 upstream ID 仅在显式加入后聚合</span></div><div className="form-grid routing-form"><label>逻辑模型<select value={selected} onChange={event => setSelected(event.target.value)}><option value="">新建逻辑模型</option>{groups.map((item: Json) => <option key={item.id} value={item.id}>{item.id}</option>)}</select></label><label>逻辑模型 ID<input value={id} onChange={event => setId(event.target.value)} pattern="[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}" /></label><label className="checkbox"><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} />启用</label><label>添加精确候选<select value="" onChange={add}><option value="">选择模型</option>{exact.map(item => <option key={item.directId} value={item.directId}>{item.directId}</option>)}</select></label></div><div className="candidate-list">{candidates.map((item, index) => <div className="candidate-row" key={`${item.channel}/${item.model}`}><code>{item.channel}/{item.model}</code><label>优先级<input type="number" value={item.priority ?? 0} onChange={event => setCandidates(candidates.map((candidate, current) => current === index ? { ...candidate, priority: Number(event.target.value) } : candidate))} /></label><label className="checkbox"><input type="checkbox" checked={item.enabled !== false} onChange={event => setCandidates(candidates.map((candidate, current) => current === index ? { ...candidate, enabled: event.target.checked } : candidate))} />启用</label><button className="icon-button danger" title="移除候选" onClick={() => remove(index)}><Trash2 size={15} /></button></div>)}{!candidates.length && <p className="muted">尚未添加候选。</p>}</div><div className="form-actions"><button className="button primary" onClick={() => void save}><Save size={16} />保存逻辑模型</button>{selected && <button className="button subtle" onClick={() => void (async () => { try { await api(`/admin/api/logical-models/${encodeURIComponent(selected)}`, { method: 'DELETE', csrf }); setNotice({ kind: 'ok', text: '逻辑模型已删除' }); setSelected(''); await onRefresh() } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } })()}><Trash2 size={16} />删除</button>}<button className="button" disabled={!selected} onClick={() => void setAlias('coding-main', selected, csrf, setNotice, onRefresh)}><ArrowUp size={16} />设为 coding-main</button><button className="button subtle" disabled={!selected} onClick={() => void setAlias('coding-backup', selected, csrf, setNotice, onRefresh)}><ArrowDown size={16} />设为 coding-backup</button></div></section></div> }
+function Routing({ state, models, csrf, setNotice, onRefresh, openDialog }: { state: Json | null; models: Json[]; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void>; openDialog: (value: { title: string; body: string; action: () => Promise<void> } | null) => void }) {
+  const groups = state?.logicalModels ?? []
+  const [selected, setSelected] = useState('')
+  const group = groups.find((item: Json) => item.id === selected)
+  const [id, setId] = useState('')
+  const [enabled, setEnabled] = useState(true)
+  const [candidates, setCandidates] = useState<Json[]>([])
+  const exact = useMemo(() => models.flatMap(item => item.candidates ?? []), [models])
+  useEffect(() => {
+    if (group) {
+      setId(group.id)
+      setEnabled(group.enabled)
+      setCandidates(group.candidates ?? [])
+    } else {
+      setId('')
+      setEnabled(true)
+      setCandidates([])
+    }
+  }, [group])
+  const save = async () => {
+    if (!id.trim()) return
+    const body = { enabled, candidates: candidates.map(item => ({ channel: item.channel, model: item.upstreamModel ?? item.model, enabled: item.enabled !== false, priority: Number(item.priority ?? 0) })) }
+    try {
+      await api(selected ? `/admin/api/logical-models/${encodeURIComponent(selected)}` : '/admin/api/logical-models', { method: selected ? 'PATCH' : 'POST', csrf, body: JSON.stringify(selected ? body : { id, ...body }) })
+      setNotice({ kind: 'ok', text: `逻辑模型 ${selected || id} 已保存` })
+      await onRefresh()
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorMessage(error) })
+    }
+  }
+  const add = (event: ChangeEvent<HTMLSelectElement>) => {
+    const item = exact.find(candidate => candidate.directId === event.target.value)
+    if (item && !candidates.some(candidate => candidate.channel === item.channel && candidate.model === item.upstreamModel)) {
+      setCandidates([...candidates, { channel: item.channel, model: item.upstreamModel, upstreamModel: item.upstreamModel, enabled: true, priority: 0 }])
+    }
+    event.target.value = ''
+  }
+  const remove = (index: number) => setCandidates(candidates.filter((_, current) => current !== index))
+  const confirmDelete = () => {
+    if (!selected) return
+    openDialog({
+      title: `删除逻辑模型 ${selected}`,
+      body: '删除前必须先移走稳定别名引用。确认后会创建待应用 revision。',
+      action: async () => {
+        try {
+          await api(`/admin/api/logical-models/${encodeURIComponent(selected)}`, { method: 'DELETE', csrf })
+          setNotice({ kind: 'ok', text: '逻辑模型已删除' })
+          setSelected('')
+          await onRefresh()
+        } catch (error) {
+          setNotice({ kind: 'error', text: errorMessage(error) })
+        }
+      }
+    })
+  }
+  const confirmAlias = (alias: string) => {
+    if (!selected) return
+    openDialog({
+      title: `移动 ${alias}`,
+      body: `将固定别名指向逻辑模型 ${selected}。修改会创建待应用 revision。`,
+      action: () => setAlias(alias, selected, csrf, setNotice, onRefresh)
+    })
+  }
+  return <div className="view-stack"><section className="band"><div className="section-heading"><div><div className="eyebrow">FIXED ROUTING</div><h2>稳定别名</h2></div><span className="muted">别名是固定指针，不自动漂移</span></div><div className="alias-grid">{(state?.stableAliases ?? []).map((item: Json) => <div key={item.alias} className="alias-row"><code>{item.alias}</code><ChevronRight size={15} /><code>{item.logicalModel ? `logical:${item.logicalModel}` : `${item.channel}/${item.model}`}</code></div>)}</div></section><section className="band"><div className="section-heading"><div><div className="eyebrow">LOGICAL MODEL</div><h2>逻辑模型与候选</h2></div><span className="muted">不同 upstream ID 仅在显式加入后聚合</span></div><div className="form-grid routing-form"><label>逻辑模型<select value={selected} onChange={event => setSelected(event.target.value)}><option value="">新建逻辑模型</option>{groups.map((item: Json) => <option key={item.id} value={item.id}>{item.id}</option>)}</select></label><label>逻辑模型 ID<input readOnly={Boolean(selected)} title={selected ? '现有逻辑模型 ID 不可修改' : undefined} value={id} onChange={event => setId(event.target.value)} pattern="[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}" /></label><label className="checkbox"><input type="checkbox" checked={enabled} onChange={event => setEnabled(event.target.checked)} />启用</label><label>添加精确候选<select value="" onChange={add}><option value="">选择模型</option>{exact.map(item => <option key={item.directId} value={item.directId}>{item.directId}</option>)}</select></label></div><div className="candidate-list">{candidates.map((item, index) => <div className="candidate-row" key={`${item.channel}/${item.model}`}><code>{item.channel}/{item.model}</code><label>优先级<input type="number" value={item.priority ?? 0} onChange={event => setCandidates(candidates.map((candidate, current) => current === index ? { ...candidate, priority: Number(event.target.value) } : candidate))} /></label><label className="checkbox"><input type="checkbox" checked={item.enabled !== false} onChange={event => setCandidates(candidates.map((candidate, current) => current === index ? { ...candidate, enabled: event.target.checked } : candidate))} />启用</label><button className="icon-button danger" title="移除候选" onClick={() => remove(index)}><Trash2 size={15} /></button></div>)}{!candidates.length && <p className="muted">尚未添加候选。</p>}</div><div className="form-actions"><button className="button primary" onClick={() => void save}><Save size={16} />保存逻辑模型</button>{selected && <button className="button subtle" onClick={confirmDelete}><Trash2 size={16} />删除</button>}<button className="button" disabled={!selected} onClick={() => confirmAlias('coding-main')}><ArrowUp size={16} />设为 coding-main</button><button className="button subtle" disabled={!selected} onClick={() => confirmAlias('coding-backup')}><ArrowDown size={16} />设为 coding-backup</button></div></section></div>
+}
 
 async function setAlias(alias: string, logicalModel: string, csrf: string, setNotice: (value: { kind: 'ok' | 'error' | 'info' } & { text: string }) => void, onRefresh: () => Promise<void>) { try { await api('/admin/api/stable-aliases', { method: 'PUT', csrf, body: JSON.stringify({ alias, logicalModel }) }); setNotice({ kind: 'ok', text: `${alias} 已固定到 ${logicalModel}` }); await onRefresh() } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } }
 
