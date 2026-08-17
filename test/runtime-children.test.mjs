@@ -91,6 +91,31 @@ test('reports unexpected child exit without exposing process details', async () 
   assert.equal(failure.statusCode, 503)
 })
 
+test('exposes bounded runtime apply metrics without child details', async () => {
+  let tick = 0
+  const events = []
+  const runtime = createRuntimeChildren({
+    ...fixtureOptions({ events }),
+    monotonicNow: () => ++tick
+  })
+  await runtime.start(generated('release-a'))
+  await runtime.replace(generated('release-b'), {
+    drain: async () => {},
+    waitForIdle: async () => {}
+  })
+  const status = runtime.status()
+  assert.equal(status.metrics.applyCount, 1)
+  assert.equal(status.metrics.successCount, 1)
+  assert.equal(status.metrics.failureCount, 0)
+  assert.equal(status.metrics.lastResult, 'success')
+  assert.equal(typeof status.metrics.lastDurationMs, 'number')
+  assert.equal(status.metrics.lastErrorCode, null)
+  assert.deepEqual(Object.keys(status.metrics).sort(), [
+    'applyCount', 'failureCount', 'lastDrainWaitMs', 'lastDurationMs',
+    'lastErrorCode', 'lastResult', 'successCount', 'unexpectedExitCount'
+  ])
+})
+
 function generated(digest) {
   return {
     digest,

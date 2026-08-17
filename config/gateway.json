@@ -58,5 +58,8 @@
     "loggingToFile": false,
     "logsMaxTotalSizeMb": 64,
     "localModelCatalog": true
+  },
+  "usage": {
+    "maxBytes": 4194304
   }
 }

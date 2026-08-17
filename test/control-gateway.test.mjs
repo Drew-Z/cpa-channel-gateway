@@ -205,6 +205,65 @@ test('adapted traffic targets the exact CPA alias instead of another channel can
   assert.equal(captured.headers['user-agent'], 'real-client/1.0')
 })
 
+test('adapted Chat Completions preserves non-stream and stream request semantics', async t => {
+  const captures = []
+  const cpa = http.createServer(async (request, response) => {
+    captures.push({ path: request.url, headers: request.headers, body: await jsonBody(request) })
+    response.writeHead(200, { 'content-type': captures.length === 1 ? 'application/json' : 'text/event-stream', connection: 'close' })
+    if (captures.length === 1) response.end('{"choices":[{"message":{"content":"ok"}}]}')
+    else response.end('data: {"choices":[{"delta":{"content":"ok"}}]}\\n\\ndata: [DONE]\\n\\n')
+  })
+  const cpaAddress = await listen(cpa)
+  t.after(() => close(cpa))
+  const config = fixtureConfig(19001)
+  config.gateway.internal.cpaPort = cpaAddress.port
+  config.channels[0].protocol = 'openai-compatible'
+  config.channels[0].models[0].protocol = 'openai-compatible'
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const nonStream = await request({ port: address.port, path: '/v1/chat/completions', headers: { authorization: `Bearer ${GATEWAY_KEY}` }, body: { model: 'shared-model', messages: [{ role: 'user', content: 'task' }], stream: false } })
+  const stream = await request({ port: address.port, path: '/v1/chat/completions', headers: { authorization: `Bearer ${GATEWAY_KEY}` }, body: { model: 'shared-model', messages: [{ role: 'user', content: 'task' }], stream: true } })
+  assert.equal(nonStream.statusCode, 200)
+  assert.equal(stream.statusCode, 200)
+  assert.equal(captures[0].path, '/v1/chat/completions')
+  assert.equal(captures[0].body.stream, false)
+  assert.equal(captures[1].body.stream, true)
+  assert.equal(captures[0].body.model, 'free/shared-model')
+})
+
+test('adapted Claude Messages replaces credentials and preserves response headers', async t => {
+  let captured
+  const cpa = http.createServer(async (request, response) => {
+    captured = { path: request.url, headers: request.headers, body: await jsonBody(request) }
+    response.writeHead(200, { 'content-type': 'application/json', connection: 'close', 'x-upstream-trace': 'safe' })
+    response.end('{"content":[{"type":"text","text":"ok"}]}')
+  })
+  const cpaAddress = await listen(cpa)
+  t.after(() => close(cpa))
+  const config = fixtureConfig(19001)
+  config.gateway.internal.cpaPort = cpaAddress.port
+  config.channels[0].protocol = 'claude'
+  config.channels[0].models[0].protocol = 'claude'
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const result = await request({
+    port: address.port,
+    path: '/v1/messages',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}`, 'x-api-key': 'client-secret', connection: 'x-remove-me', 'x-remove-me': 'private' },
+    body: { model: 'shared-model', messages: [{ role: 'user', content: 'task' }], stream: false }
+  })
+  assert.equal(result.statusCode, 200)
+  assert.equal(result.headers['x-upstream-trace'], 'safe')
+  assert.equal(captured.path, '/v1/messages')
+  assert.equal(captured.body.model, 'free/shared-model')
+  assert.equal(captured.headers.authorization, `Bearer ${GATEWAY_KEY}`)
+  assert.equal(captured.headers['x-api-key'], undefined)
+  assert.equal(captured.headers['x-remove-me'], undefined)
+})
+
 test('busy channels return 429 without creating another upstream request', async t => {
   let upstreamCalls = 0
   let releaseFirst

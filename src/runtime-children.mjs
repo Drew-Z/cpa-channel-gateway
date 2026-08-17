@@ -19,11 +19,22 @@ export function createRuntimeChildren({
   waitForPortImpl = waitForPort,
   terminateChildrenImpl = terminateChildren,
   readyTimeoutMs = 15_000,
+  monotonicNow = () => Date.now(),
   onFailure = () => {}
 } = {}) {
   if (!cpaPath || !haproxyPath) throw new TypeError('CPA and HAProxy paths are required')
   let active = null
   let transitioning = false
+  const metrics = {
+    applyCount: 0,
+    successCount: 0,
+    failureCount: 0,
+    lastResult: null,
+    lastDurationMs: null,
+    lastDrainWaitMs: null,
+    lastErrorCode: null,
+    unexpectedExitCount: 0
+  }
 
   async function start(generated, { signal } = {}) {
     if (active) throw new RuntimeApplyError('runtime_already_started', 409, 'The internal runtime is already started')
@@ -42,14 +53,28 @@ export function createRuntimeChildren({
   } = {}) {
     if (transitioning) throw new RuntimeApplyError('runtime_apply_in_progress', 409, 'A runtime apply is already in progress')
     if (!active) throw new RuntimeApplyError('runtime_not_started', 503, 'The internal runtime is not started')
-    if (active.generated.digest === generated.digest) return { changed: false, ...publicStatus() }
+    metrics.applyCount += 1
+    const startedAt = monotonicNow()
+    if (active.generated.digest === generated.digest) {
+      metrics.successCount += 1
+      metrics.lastResult = 'unchanged'
+      metrics.lastDurationMs = elapsed(startedAt)
+      metrics.lastDrainWaitMs = 0
+      metrics.lastErrorCode = null
+      return { changed: false, ...publicStatus() }
+    }
 
     transitioning = true
     const previous = active
     let next = null
     try {
-      await drain()
-      await waitForIdle()
+      const drainStartedAt = monotonicNow()
+      try {
+        await drain()
+        await waitForIdle()
+      } finally {
+        metrics.lastDrainWaitMs = elapsed(drainStartedAt)
+      }
       await stopRelease(previous)
       active = null
       try {
@@ -71,7 +96,17 @@ export function createRuntimeChildren({
         }
         throw new RuntimeApplyError('runtime_apply_failed', 503, 'The new internal runtime failed readiness and was rolled back', error)
       }
+      metrics.successCount += 1
+      metrics.lastResult = 'success'
+      metrics.lastDurationMs = elapsed(startedAt)
+      metrics.lastErrorCode = null
       return { changed: true, ...publicStatus() }
+    } catch (error) {
+      metrics.failureCount += 1
+      metrics.lastResult = 'failure'
+      metrics.lastDurationMs = elapsed(startedAt)
+      metrics.lastErrorCode = publicErrorCode(error)
+      throw error
     } finally {
       transitioning = false
       await resume()
@@ -91,8 +126,14 @@ export function createRuntimeChildren({
       active: active
         ? { digest: active.generated.digest, childCount: active.children.length }
         : null,
-      transitioning
+      transitioning,
+      metrics: { ...metrics }
     }
+  }
+
+  function elapsed(startedAt) {
+    const duration = monotonicNow() - startedAt
+    return Number.isFinite(duration) ? Math.max(0, Math.round(duration)) : 0
   }
 
   async function spawnRelease(generated, signal) {
@@ -153,6 +194,8 @@ export function createRuntimeChildren({
       const outcome = childOutcome(child, index === 0 ? 'HAProxy' : 'CPA')
       outcome.then(result => {
         if (release.stopping) return
+        metrics.unexpectedExitCount += 1
+        metrics.lastErrorCode = 'runtime_child_exited'
         try {
           onFailure(new RuntimeApplyError('runtime_child_exited', 503, `${result.label} exited unexpectedly`))
         } catch {}
@@ -167,6 +210,11 @@ export function createRuntimeChildren({
   }
 
   return { start, replace, stop, status: publicStatus }
+}
+
+function publicErrorCode(error) {
+  const code = String(error?.code ?? '')
+  return /^[a-z][a-z0-9_-]{0,63}$/.test(code) ? code : 'runtime_apply_failed'
 }
 
 function defaultRunCheck(command, args, label, accepted = new Set([0])) {

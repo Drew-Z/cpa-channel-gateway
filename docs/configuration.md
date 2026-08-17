@@ -83,6 +83,7 @@ Changes 相关 API 为 `GET /admin/api/revisions`、`GET /admin/api/revisions/<r
 - 同时按逻辑模型、客户端请求入口、实际 `<channel>/<upstream-model>` 和渠道聚合；管理台任务型测活不计入。
 - 原始低敏事件保存在 `runtime/usage-events.jsonl` 并定期压缩，只保留计算滚动窗口所需的短期记录。文件不包含提示词、响应正文、HTTP 请求头、密钥、用户标识、请求 ID 或错误正文。
 - 私有配置路径不可用时使用进程内统计；磁盘写入失败时管理 API 报告 `storage: memory-fallback`，但统计故障不会改变业务请求结果。
+- `gateway.json` 的 `usage.maxBytes` 控制事件文件硬上限，默认 4 MiB；超限只淘汰最旧事件，不影响请求处理。
 
 完整字段、边界和测试契约见 [24 小时模型使用监控](usage-monitoring.md)。
 

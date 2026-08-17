@@ -184,6 +184,15 @@ apply 均复用既有 API。桌面/移动布局使用紧凑表格和可访问确
 - 增加 apply 耗时、排空超时、队列深度和子进程异常退出等低敏运维指标，并更新部署、
   迁移、恢复和故障处理文档。
 
+Stage 5 implementation status: complete. Fixture coverage now includes Responses JSON/SSE,
+adapted Chat Completions JSON/SSE, adapted Claude Messages, reviewed credential replacement,
+hop-by-hop and connection-token filtering, client cancellation, transport failure, and the
+no-replay contract. Usage events have a configurable default 4 MiB hard byte cap with atomic
+compaction. Release activation prunes only unprotected content-addressed directories while
+preserving active, previous, and a bounded recent tail. Runtime status exposes only bounded
+apply counts, outcomes, durations, drain wait, classified error codes, and unexpected child
+exit counts; the admin Overview renders the short runtime summary.
+
 最终门槛：`npm test`、`npm run check`、`npm run audit:public`、语法检查、桌面/移动截图、
 一次真实精确 canary、流式与非流式请求、正常 apply 和可证明的失败回滚全部通过。
 

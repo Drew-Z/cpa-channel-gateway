@@ -102,6 +102,9 @@ npm run verify:deployment
 
 该检查会验证 `/healthz`、runtime supervisor、持久化 control state 以及 loaded/pending
 revision；它不会输出管理密钥、gateway key、Cookie、CSRF token、请求体、响应正文或上游原始错误。
+管理台 Overview 的 runtime 区域还会显示有界的 apply 次数、最近结果、耗时、排空等待和
+异常子进程退出计数；这些指标不包含 URL、命令行、请求内容或错误正文。release 清理只
+删除未被 active/previous 指针保护且超出保留尾部的目录。
 只有明确指定精确模型时才会发送一次固定诗词任务：
 
 ```bash
