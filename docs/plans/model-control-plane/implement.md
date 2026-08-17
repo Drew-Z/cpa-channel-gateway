@@ -14,11 +14,12 @@ Router MVP is implemented in the working tree:
 
 Persistent health state and redacted canary summaries now live in the Git-ignored `runtime/control-state.json`; stale transient health and cooldown entries are discarded on restore, while release-scoped failures are retained only for the same configuration digest. Configuration writes and model synchronization now share a low-sensitivity FIFO control-job queue, and pending channel/model changes drain new reservations without interrupting existing leases. The production start script now owns an injectable CPA/HAProxy child supervisor with readiness checks, old-release restoration, and a CSRF-protected runtime apply entrypoint; deployment rehearsal and audit history remain in later phases below.
 
-Stage 1 已在工作树完成：`loadConfig` 同时兼容旧 `channels.local.env` 和结构化
-`providers.local.json`；每次配置变更保存带父链和内容 digest 的完整私有 revision；有界 audit
-JSONL、已认证的 revision list/diff/rollback API 与 Changes 管理界面均已接入。rollback 与 apply
-共用 FIFO，并在运行时失败时恢复原私有快照。真实翼龙容器的重启、日志和页面验收仍是本阶段
-进入下一阶段前的部署门槛。
+Stage 1 已在 `b7634e6` 完成并部署：`loadConfig` 同时兼容旧
+`channels.local.env` 和结构化 `providers.local.json`；每次配置变更保存带父链和内容 digest
+的完整私有 revision；有界 audit JSONL、已认证的 revision list/diff/rollback API 与 Changes
+管理界面均已接入。rollback 与 apply 共用 FIFO，并在运行时失败时恢复原私有快照。公开
+`/healthz` 和新版 `/admin` 标记已通过；认证后的持久化状态、revision 一致性、精确 canary
+以及流式/非流式请求仍是进入 Stage 2 部署前的生产验收门槛。
 
 The first admin slice is now also implemented: same-port `/admin`, in-memory HttpOnly admin sessions, CSRF/origin checks for tests, logical-model candidate status, exact-candidate poetry canaries with redacted summaries, revisioned stable-alias moves, persistent model enable/disable controls, and the serialized runtime apply path. Logical grouping edits remain later-phase work.
 
@@ -34,16 +35,18 @@ The private configuration slice now supports atomic, revisioned channel create/u
 不提前开始依赖它的下一阶段。现有单公网端口、单渠道互斥、无自动重放、无周期探测、
 固定诗词测活和私密字段不落 Git/日志的约束保持不变。
 
-### Stage 0: Production Rehearsal Gate
+### Stage 0: Production Rehearsal Gate (partially complete)
 
-目标是先证明当前 `8bd9633` 基线在真实翼龙容器中成立，而不是继续叠加未部署代码。
+目标是证明当前 `b7634e6` 基线在真实翼龙容器中成立，而不是把公开健康检查等同于完整验收。
 
 本地可丢弃夹具已经直接覆盖正常切换、同 digest revision 提交、active pointer 提交失败
 恢复旧 release，以及排空超时不触碰当前运行时；真实翼龙环境的下列验证仍是部署门槛。
 
-- 通过 `AUTO_UPDATE=1` 重启容器，确认启动日志加载目标提交并输出 ready release。
+- 已通过 `AUTO_UPDATE=1` 重启容器；Console 显示 Online，公开 `/healthz` 返回 200，且部署的
+  `/admin` 已包含 Changes、revision、audit 和 rollback 控件。控制台为 canvas，未从 DOM
+  提取提交号；新版页面标记用于证明代码已加载。
 - 在管理台确认 `runtime.available=true`、`controlState.storage=persistent`、运行 revision
-  与磁盘 revision 一致。
+  与磁盘 revision 一致；该项需要操作者手工建立管理会话后继续，只读取低敏状态。
 - 选择一个已启用的精确渠道模型执行固定诗词 canary；只核对状态、transport、延迟和
   正文长度，不查看或保存正文。
 - 对同一可用模型各执行一个流式和非流式真实小任务，确认流式生命周期持有租约、
@@ -55,7 +58,7 @@ The private configuration slice now supports atomic, revisioned channel create/u
 验收证据：Console 的低敏 ready/apply 结果、管理台状态、一次精确 canary 摘要、流式和
 非流式请求结果。任何 Cookie、密钥、请求正文、响应正文和上游原始错误都不进入记录。
 
-### Stage 1: Structured Private Revisions, Audit, and Rollback
+### Stage 1: Structured Private Revisions, Audit, and Rollback (complete)
 
 目标是让变更历史真正可检查、可解释、可恢复，而不是只有备份目录。
 
@@ -75,7 +78,7 @@ The private configuration slice now supports atomic, revisioned channel create/u
 验收条件：迁移前后生成配置语义一致；损坏 revision、并发 apply/rollback、排空超时和
 readiness 失败均保留原运行配置；公开审计扫描证明历史、API 和 UI 中没有私密值。
 
-### Stage 2: Explicit Logical Models and Candidate Priority
+### Stage 2: Explicit Logical Models and Candidate Priority (local complete; production acceptance pending)
 
 目标是完成 PRD 中“不同上游 ID 由操作者显式合并”的能力，同时保留现有精确路由。
 
@@ -90,6 +93,27 @@ readiness 失败均保留原运行配置；公开审计扫描证明历史、API 
 
 验收条件：两个不同 ID 的候选可组成一个逻辑模型；直接 ID、固定 alias 和 pinned alias
 兼容；禁用/忙碌候选不会绕过渠道互斥；无效或循环引用不会写入私有配置。
+
+本地实现已完成 2A–2D 的代码与 fixture 验收：schema v1 保持兼容，v2 支持显式逻辑组、
+候选开关/优先级、stable logical target、原子 CRUD、revision diff、同步引用保留和管理台
+编辑器；真实 usage 事件按解析后的逻辑组 ID 聚合，不同 upstream ID 不再被拆开。桌面与
+390px 移动视口通过 Edge CDP 检查，无横向溢出、控件重叠或脚本异常。当前私有 routes
+仍保持 schema v1，`migrate:routes` 只执行过 dry-run；部署重启、认证后状态核对和真实小任务
+验收仍待完成，未经操作者批准不执行 `--apply`、不创建生产逻辑组、不移动生产 alias。
+
+执行切片：
+
+1. **2A 配置契约与纯路由**：新增向后兼容的版本化 `logicalModels` 结构、确定性 v1 读取/
+   v2 写入规则、显式候选优先级与 stable logical target；先覆盖 config、catalog、scheduler
+   和 revision diff，不提供自动迁移或改写现有私有 routes。
+2. **2B 原子变更与 API**：增加逻辑组 create/update/delete、候选启用/排序和 stable alias
+   目标 API；全部经过现有 revision store 与 FIFO，model sync、model disable 和 channel delete
+   必须检查逻辑组引用。
+3. **2C 管理台工作流**：在当前内联管理台先提供可用的逻辑组编辑、候选排序和冲突提示；
+   React/Vite 迁移仍留在 Stage 4，避免同时改变 API 与前端框架。
+4. **2D 验收与部署**：fixture 覆盖不同 upstream ID 合组、busy alternate、streaming 筛选、
+   直接 ID 兼容、非法引用和 revision rollback；本地全套门槛通过后再重启翼龙并执行一次
+   低敏真实验收。
 
 ### Stage 3: Evidence-Based Scheduling and Conservative Circuit Breaking
 

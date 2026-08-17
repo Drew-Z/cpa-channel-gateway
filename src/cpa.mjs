@@ -104,7 +104,9 @@ function renderChannelModels(lines, channel, routes) {
   for (const model of channel.models.filter(item => item.status !== 'disabled' && isGenerationModel(item))) {
     for (const alias of model.aliases) modelEntries.push(renderModel(model, alias))
   }
-  for (const route of routes.stableAliases.filter(item => item.channel === channel.id)) {
+  // Logical stable aliases are resolved by the outer Node gateway and have no
+  // single CPA channel target. Keep them out of the internal CPA config.
+  for (const route of routes.stableAliases.filter(item => !item.logicalModel && item.channel === channel.id)) {
     const model = channel.models.find(item => item.upstream === route.model)
     if (model && model.status !== 'disabled' && isGenerationModel(model)) modelEntries.push(renderModel(model, route.alias))
   }

@@ -38,6 +38,10 @@ export function mergeLegacyConfig({ currentEnv, currentRoutes, legacyChannels })
   const routes = {
     schemaVersion: currentRoutes.schemaVersion,
     channels: Array.isArray(currentRoutes.channels) ? currentRoutes.channels.map(channel => ({ ...channel })) : [],
+    logicalModels: Array.isArray(currentRoutes.logicalModels) ? currentRoutes.logicalModels.map(group => ({
+      ...group,
+      candidates: Array.isArray(group.candidates) ? group.candidates.map(candidate => ({ ...candidate })) : []
+    })) : undefined,
     stableAliases: Array.isArray(currentRoutes.stableAliases) ? currentRoutes.stableAliases.map(alias => ({ ...alias })) : [],
     pinnedAliases: Array.isArray(currentRoutes.pinnedAliases) ? currentRoutes.pinnedAliases.map(alias => ({ ...alias })) : []
   }

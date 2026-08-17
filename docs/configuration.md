@@ -70,7 +70,7 @@ CPA 的 Codex 兼容头由 `gateway.json` 中的 `cpa.disableCodexCloaking` 控�
 
 当前管理台提供渠道/模型状态、路由管理和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。登录后“客户端连接”区域还会根据当前访问域名生成带 `/v1` 的 Base URL，并提供复制按钮；`GATEWAY_API_KEY` 默认仅显示掩码，显式点击“显示”或“复制 API key”时才通过带 CSRF 保护的已认证同源 `POST` 取回，不写入初始 HTML，显示后 30 秒自动恢复掩码。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
 
-管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名请求体为 `{ "alias", "channel", "model" }`。禁用仍被 stable/pinned alias 引用的模型会返回 `409 model_has_aliases`。请求必须带会话 CSRF token 和同源 `Origin`；新增渠道的 API key 只写入服务器，不在变更响应中返回。成功响应包含脱敏的 `revision` 与 `restartRequired`。每次成功变更都在 `runtime/config-revisions/<revision>/` 保存变更后的完整快照和低敏 manifest；验证或 revision 写入失败会恢复原配置。
+管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。逻辑组使用 `POST /admin/api/logical-models`、`PATCH /admin/api/logical-models/<id>` 和 `DELETE /admin/api/logical-models/<id>`。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名可使用精确目标 `{ "alias", "channel", "model" }`，也可使用逻辑目标 `{ "alias", "logicalModel" }`。pinned alias 仍只允许带审批引用的精确目标。禁用或删除仍被 stable/pinned alias 或逻辑候选引用的模型/渠道会返回 409。请求必须带会话 CSRF token 和同源 `Origin`；新增渠道的 API key 只写入服务器，不在变更响应中返回。成功响应包含脱敏的 `revision` 与 `restartRequired`。每次成功变更都在 `runtime/config-revisions/<revision>/` 保存变更后的完整快照和低敏 manifest；验证或 revision 写入失败会恢复原配置。
 
 配置写入和模型同步使用单一 FIFO 控制作业队列，`GET /admin/api/status` 的 `controlJobs` 返回当前作业、等待数量和最近低敏结果；队列满时返回 `429 control_queue_full`。停用、待测试或删除当前渠道会先进入排空状态，停止新的生产预约并等待在途租约释放；禁用模型会临时抑制当前进程的该候选。正式启动脚本中的 `POST /admin/api/runtime/apply` 会在排空后替换内部 CPA/HAProxy，执行 readiness，并在失败时恢复旧 release；成功后父 Node 路由和 `loadedRevision` 一起更新。没有运行时监督器的进程仍需重启应用。
 
@@ -93,6 +93,17 @@ release digest 改变时清空调度阻断，仍存在模型的低敏测活摘�
 字段白名单、24 小时时效和隐私契约见 [控制状态持久化](control-state.md)。
 
 ## Routes
+
+`routes.local.json` 的 schema v1 继续只读兼容；显式逻辑模型使用 schema v2。迁移默认只做
+dry-run，不调用上游、不改写现有别名：
+
+```bash
+npm run migrate:routes
+npm run migrate:routes -- --apply
+```
+
+`--apply` 只把 schema 升为 2 并加入空的 `logicalModels`，通过现有原子校验和私有 revision
+保存；它不会自动猜测不同模型是否等价，也不会移动 `coding-main` 或 pinned alias。
 
 从旧格式渠道文件补充渠道时，优先使用合并导入，避免覆盖现有管理密钥、Tunnel 配置、启用状态和审核过的路由：
 
@@ -121,7 +132,31 @@ npm run sync:models
 - `<upstream-model-id>`：逻辑模型。多个渠道提供完全相同的原始 ID 时自动聚合，调度器从健康且空闲的候选中选择。
 - `<channel-id>/<upstream-model-id>`：精确模型。它固定到一个物理渠道，但仍必须取得该渠道的互斥租约。
 
-原始 ID 保留上游大小写以及 `/`、`:`、`@` 等常见模型字符，因此 `free/Provider/Model-A:free` 是合法精确 ID。`coding-main` 等现有 `stableAliases` 继续兼容；当前配置格式中的 stable/pinned alias 仍固定到审核过的渠道与模型。
+原始 ID 保留上游大小写以及 `/`、`:`、`@` 等常见模型字符，因此 `free/Provider/Model-A:free` 是合法精确 ID。`coding-main` 等现有精确 `stableAliases` 继续兼容；pinned alias 始终固定到审核过的渠道与模型。
+
+不同 upstream ID 只能由操作者显式组成逻辑模型：
+
+```json
+{
+  "schemaVersion": 2,
+  "logicalModels": [
+    {
+      "id": "coding-pool",
+      "enabled": true,
+      "candidates": [
+        { "channel": "primary", "model": "model-a", "enabled": true, "priority": 100 },
+        { "channel": "backup", "model": "model-b", "enabled": true, "priority": 80 }
+      ]
+    }
+  ],
+  "stableAliases": [
+    { "alias": "coding-main", "logicalModel": "coding-pool" }
+  ]
+}
+```
+
+逻辑组不会隐藏精确 ID；同一候选仍使用物理渠道的唯一租约。候选 `enabled` 只控制它是否
+参与该逻辑组，`priority` 只在同健康层级内排序。停用逻辑组不会停用底层精确模型。
 
 同步是显式运维动作，不在每次启动时自动执行，也不作为渠道测活。它只访问 `/models`，成功后备份并更新私有 routes；生成服务启动时仍只读取本地已验证配置，不依赖远程目录。上游目录不能证明模型支持哪种 API 或能力，新模型默认继承渠道协议，必要时必须在 routes 中覆盖并完成对应 canary。
 
@@ -143,7 +178,7 @@ npm run sync:models
 
 模型可设置 `status`：`active`（默认）、`stale` 或 `disabled`。`disabled` 用于明确淘汰或质量不达标的模型；它仍保留在私有 routes 和管理台审计数据中，但不会出现在公开模型目录、调度候选或生成的 CPA 模型配置中。目录同步会保留该决定，不会因为上游 `/models` 仍返回同一 ID 而自动恢复。
 
-渠道和模型都可以设置整数 `priority`，数值越大越优先；模型级值覆盖渠道级值。未配置时为 `0`，同健康状态和优先级下按渠道 ID 稳定排序。
+渠道、模型和显式逻辑候选都可以设置整数 `priority`，数值越大越优先；逻辑候选覆盖模型级值，模型级值覆盖渠道级值。未配置时为 `0`，同健康状态和优先级下按渠道 ID 稳定排序。
 
 可选字段：
 
@@ -157,7 +192,7 @@ npm run sync:models
 
 ## Stable and pinned aliases
 
-`stableAliases` 面向一般客户端切换，修改后客户端无需更换模型名。它是固定指针，不是自动故障转移：`coding-main` 或 `coding-backup` 指向的渠道不可用时会按该渠道返回错误，不会偷偷切到另一个渠道。需要跨渠道健康选择时使用逻辑模型 ID，或由管理员在验收后移动别名；因此两个别名不需要随每次请求频繁切换。
+`stableAliases` 面向一般客户端切换，修改后客户端无需更换模型名。精确目标仍是固定渠道指针，不做自动故障转移；逻辑目标则固定指向一个已审核的逻辑组，并在该组内部按健康、空闲和候选优先级选择。网关不会自行把 alias 从一个逻辑组改到另一个逻辑组，因此两个别名不需要随每次请求频繁切换。
 
 `pinnedAliases` 面向 AI Daily 等受审批工作流，必须包含非空 `approvalRef`。网关不会替审批系统判断某个配置是否已获批准；它只防止 pinned alias 在配置中变成无来源的浮动路由。
 

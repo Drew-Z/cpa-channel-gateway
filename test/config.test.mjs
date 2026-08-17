@@ -130,6 +130,53 @@ test('normalizes model capabilities and rejects non-generation stable aliases', 
   assert.throws(() => loadConfig(root), /must reference a generation model/)
 })
 
+test('validates explicit logical models and keeps logical aliases out of CPA child config', () => {
+  const root = fixtureRoot()
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+  routes.schemaVersion = 2
+  routes.logicalModels = [{
+    id: 'coding-pool',
+    enabled: true,
+    candidates: [
+      { channel: 'chat', model: 'model-a', enabled: true, priority: 10 },
+      { channel: 'responses', model: 'model-b', enabled: true, priority: 20 }
+    ]
+  }]
+  routes.stableAliases = [{ alias: 'coding-main', logicalModel: 'coding-pool' }]
+  fs.writeFileSync(routesPath, JSON.stringify(routes))
+
+  const loaded = loadConfig(root)
+  assert.deepEqual(loaded.logicalModels, [{
+    id: 'coding-pool',
+    enabled: true,
+    candidates: [
+      { channel: 'chat', model: 'model-a', enabled: true, priority: 10 },
+      { channel: 'responses', model: 'model-b', enabled: true, priority: 20 }
+    ]
+  }])
+  assert.deepEqual(loaded.stableAliases, [{ alias: 'coding-main', logicalModel: 'coding-pool', approvalRef: undefined }])
+  const generated = generateRelease(root)
+  assert.doesNotMatch(generated.cpa, /alias: "coding-main"/)
+
+  const invalid = fixtureRoot()
+  const invalidPath = path.join(invalid, 'config', 'routes.local.json')
+  const invalidRoutes = JSON.parse(fs.readFileSync(invalidPath, 'utf8'))
+  invalidRoutes.schemaVersion = 2
+  invalidRoutes.logicalModels = [{ id: 'coding-pool', candidates: [{ channel: 'missing', model: 'model', enabled: true }] }]
+  fs.writeFileSync(invalidPath, JSON.stringify(invalidRoutes))
+  assert.throws(() => loadConfig(invalid), /references unknown channel/)
+
+  const pinned = fixtureRoot()
+  const pinnedPath = path.join(pinned, 'config', 'routes.local.json')
+  const pinnedRoutes = JSON.parse(fs.readFileSync(pinnedPath, 'utf8'))
+  pinnedRoutes.schemaVersion = 2
+  pinnedRoutes.logicalModels = [{ id: 'coding-pool', candidates: [{ channel: 'chat', model: 'model-a' }] }]
+  pinnedRoutes.pinnedAliases = [{ alias: 'ai-daily-v1', logicalModel: 'coding-pool', approvalRef: 'approval-001' }]
+  fs.writeFileSync(pinnedPath, JSON.stringify(pinnedRoutes))
+  assert.throws(() => loadConfig(pinned), /cannot target a logical model/)
+})
+
 test('requires a private token only when Cloudflare Tunnel is enabled', () => {
   const enabledRoot = fixtureRoot()
   const enabledEnv = path.join(enabledRoot, 'config', 'channels.local.env')

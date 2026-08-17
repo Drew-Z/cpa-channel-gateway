@@ -87,6 +87,22 @@ test('stable aliases may temporarily point to a disabled channel', () => {
   assert.equal(config.stableAliases[0].channel, 'sample')
 })
 
+test('routes schema migration is explicit, revisioned, and semantically empty', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const migrated = manager.migrateRoutesSchema()
+  assert.equal(migrated.changed, true)
+  assert.equal(migrated.fromSchemaVersion, 1)
+  assert.equal(migrated.toSchemaVersion, 2)
+  const routes = JSON.parse(fs.readFileSync(path.join(root, 'config', 'routes.local.json'), 'utf8'))
+  assert.equal(routes.schemaVersion, 2)
+  assert.deepEqual(routes.logicalModels, [])
+  assert.equal(createConfigRevisionStore({ root }).read(migrated.revision).manifest.operation, 'routes-schema-migrate')
+  const unchanged = manager.migrateRoutesSchema()
+  assert.equal(unchanged.changed, false)
+  assert.equal(unchanged.revision, migrated.revision)
+})
+
 test('model status and stable alias changes are revisioned and prevent broken routes', () => {
   const root = fixtureRoot()
   const routesPath = path.join(root, 'config', 'routes.local.json')
@@ -119,6 +135,50 @@ test('model status and stable alias changes are revisioned and prevent broken ro
   assert.deepEqual(routing.stableAliases, [{ alias: 'coding-main', channel: 'sample', model: 'model-b' }])
   assert.equal(routing.models.find(item => item.model === 'model-a').status, 'disabled')
   assert.equal(loadConfig(root).channels[0].models.find(model => model.upstream === 'model-a').status, 'disabled')
+})
+
+test('logical model CRUD and logical stable aliases are atomic and reference-safe', () => {
+  const root = fixtureRoot()
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+  routes.channels[0].models.push({ upstream: 'model-b', protocol: 'responses', aliases: ['sample/model-b'] })
+  fs.writeFileSync(routesPath, JSON.stringify(routes, null, 2))
+  const manager = createPrivateConfigManager(loadConfig(root))
+
+  const created = manager.createLogicalModel({
+    id: 'coding-pool',
+    candidates: [
+      { channel: 'sample', model: 'model-a', enabled: true, priority: 20 },
+      { channel: 'sample', model: 'model-b', enabled: true, priority: 10 }
+    ]
+  })
+  assert.equal(created.restartRequired, true)
+  const revision = createConfigRevisionStore({ root }).read(created.revision)
+  assert.equal(revision.manifest.operation, 'logical-model-create')
+  assert.deepEqual(revision.manifest.affected.logicalModelIds, ['coding-pool'])
+  assert.equal(JSON.parse(revision.snapshot.routesText).schemaVersion, 2)
+
+  const alias = manager.setStableAlias('coding-main', { logicalModel: 'coding-pool' })
+  assert.equal(alias.logicalModel, 'coding-pool')
+  assert.deepEqual(manager.routing().stableAliases, [{ alias: 'coding-main', logicalModel: 'coding-pool' }])
+  assert.throws(
+    () => manager.updateModelStatus('sample', 'model-a', 'disabled'),
+    error => error.code === 'model_has_aliases'
+  )
+
+  manager.updateLogicalModel('coding-pool', {
+    candidates: [
+      { channel: 'sample', model: 'model-a', enabled: false, priority: 20 },
+      { channel: 'sample', model: 'model-b', enabled: true, priority: 30 }
+    ]
+  })
+  assert.equal(manager.updateModelStatus('sample', 'model-a', 'disabled').status, 'disabled')
+  assert.throws(() => manager.deleteLogicalModel('coding-pool'), error => error.code === 'logical_model_has_aliases')
+
+  manager.setStableAlias('coding-main', 'sample', 'model-b')
+  const deleted = manager.deleteLogicalModel('coding-pool')
+  assert.equal(deleted.deleted, true)
+  assert.deepEqual(loadConfig(root).logicalModels, [])
 })
 
 test('admin model synchronization is read-only upstream, revisioned, and marks discovered inventory', async () => {

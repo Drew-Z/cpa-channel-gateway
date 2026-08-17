@@ -99,19 +99,21 @@ function normalizeEvent(input, at) {
   const outcome = String(input.outcome ?? '')
   const transport = String(input.transport ?? 'unassigned')
   if (!requestedModel || !OUTCOMES.has(outcome) || !TRANSPORTS.has(transport)) return null
+  const upstreamModel = boundedText(input.upstreamModel, 255)
   return {
-    v: 1,
+    v: 2,
     at,
     requestedModel,
     channelId: boundedText(input.channelId, 32),
-    upstreamModel: boundedText(input.upstreamModel, 255),
+    logicalModelId: boundedText(input.logicalModelId, 255) ?? upstreamModel,
+    upstreamModel,
     outcome,
     transport
   }
 }
 
 function normalizePersistedEvent(value) {
-  if (!value || value.v !== 1 || !Number.isSafeInteger(value.at) || value.at < 0) return null
+  if (!value || ![1, 2].includes(value.v) || !Number.isSafeInteger(value.at) || value.at < 0) return null
   return normalizeEvent(value, value.at)
 }
 
@@ -132,7 +134,7 @@ function buildSnapshot(events, { hours, from, to, storage }) {
   for (const event of events) {
     addOutcome(overall, event)
     addOutcome(getStats(models, event.requestedModel), event)
-    if (event.upstreamModel) addOutcome(getStats(logicalModels, event.upstreamModel), event)
+    if (event.logicalModelId) addOutcome(getStats(logicalModels, event.logicalModelId), event)
     if (event.channelId) addOutcome(getStats(channels, event.channelId), event)
     if (event.channelId && event.upstreamModel) {
       addOutcome(getStats(physicalModels, `${event.channelId}/${event.upstreamModel}`), event)

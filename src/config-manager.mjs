@@ -118,8 +118,15 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
     routing() {
       const current = loadConfig(root, { allowEmptyEnabledChannels: true })
       return {
-        stableAliases: current.stableAliases.map(({ alias, channel, model }) => ({ alias, channel, model })),
+        stableAliases: current.stableAliases.map(item => item.logicalModel
+          ? { alias: item.alias, logicalModel: item.logicalModel }
+          : { alias: item.alias, channel: item.channel, model: item.model }),
         pinnedAliases: current.pinnedAliases.map(({ alias, channel, model, approvalRef }) => ({ alias, channel, model, approvalRef })),
+        logicalModels: current.logicalModels.map(item => ({
+          id: item.id,
+          enabled: item.enabled,
+          candidates: item.candidates.map(candidate => ({ ...candidate }))
+        })),
         models: current.channels.flatMap(channel => (channel.models ?? []).map(model => {
           const kind = normalizeModelKind(model.kind, model.upstream)
           return {
@@ -136,6 +143,20 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
           }
         }))
       }
+    },
+    migrateRoutesSchema() {
+      return mutate('routes-schema-migrate', ({ routes }) => {
+        const fromSchemaVersion = routes.schemaVersion
+        const hadLogicalModels = Array.isArray(routes.logicalModels)
+        routes.schemaVersion = 2
+        routes.logicalModels ??= []
+        return {
+          changed: fromSchemaVersion !== 2 || !hadLogicalModels,
+          fromSchemaVersion,
+          toSchemaVersion: 2,
+          logicalModelCount: routes.logicalModels.length
+        }
+      }, () => ({ logicalModelIds: [] }))
     },
     discoverChannels() {
       const env = parseEnv(fs.readFileSync(envPath, 'utf8'))
@@ -305,6 +326,12 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
           const references = [...(routes.stableAliases ?? []), ...(routes.pinnedAliases ?? [])]
             .filter(route => route.channel === channelId && route.model === modelId)
             .map(route => route.alias)
+          const logicalReferences = (routes.logicalModels ?? [])
+            .filter(group => group.enabled !== false)
+            .flatMap(group => (group.candidates ?? [])
+              .filter(candidate => candidate.channel === channelId && candidate.model === modelId && candidate.enabled !== false)
+              .map(() => group.id))
+          references.push(...logicalReferences.map(id => `logical:${id}`))
           if (references.length) {
             throw new ConfigMutationError('model_has_aliases', 409, `Move aliases before disabling this model: ${references.join(', ')}`)
           }
@@ -316,8 +343,34 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
     setStableAlias(aliasValue, channelValue, modelValue) {
       return mutate('alias-update', ({ routes }) => {
         const alias = normalizeAlias(aliasValue)
-        const channelId = normalizeChannelId(channelValue)
-        const modelId = normalizeModelId(modelValue)
+        const target = channelValue && typeof channelValue === 'object'
+          ? channelValue
+          : { channel: channelValue, model: modelValue }
+        if (target.logicalModel !== undefined) {
+          const logicalModel = normalizeLogicalModelId(target.logicalModel)
+          const group = (routes.logicalModels ?? []).find(item => item.id === logicalModel)
+          if (!group) throw new ConfigMutationError('logical_model_not_found', 404, `Unknown logical model: ${logicalModel}`)
+          if (group.enabled === false) throw new ConfigMutationError('logical_model_disabled', 409, 'A disabled logical model cannot receive a stable alias')
+          routes.schemaVersion = 2
+          routes.stableAliases ??= []
+          const current = routes.stableAliases.find(item => item.alias === alias)
+          if (!current) {
+            const conflicts = [
+              ...(routes.pinnedAliases ?? []).map(item => item.alias),
+              ...(routes.channels ?? []).flatMap(item => (item.models ?? []).flatMap(entry => entry.aliases ?? [])),
+              ...(routes.logicalModels ?? []).map(item => item.id)
+            ]
+            if (conflicts.includes(alias)) throw new ConfigMutationError('alias_conflict', 409, `Alias is already in use: ${alias}`)
+            routes.stableAliases.push({ alias, logicalModel })
+          } else {
+            delete current.channel
+            delete current.model
+            current.logicalModel = logicalModel
+          }
+          return { alias, logicalModel }
+        }
+        const channelId = normalizeChannelId(target.channel)
+        const modelId = normalizeModelId(target.model)
         const channel = (routes.channels ?? []).find(item => item.id === channelId)
         if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${channelId}`)
         const model = (channel.models ?? []).find(item => item.upstream === modelId)
@@ -331,16 +384,66 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
         if (!current) {
           const conflicts = [
             ...(routes.pinnedAliases ?? []).map(item => item.alias),
-            ...(routes.channels ?? []).flatMap(item => (item.models ?? []).flatMap(entry => entry.aliases ?? []))
+            ...(routes.channels ?? []).flatMap(item => (item.models ?? []).flatMap(entry => entry.aliases ?? [])),
+            ...(routes.logicalModels ?? []).map(item => item.id)
           ]
           if (conflicts.includes(alias)) throw new ConfigMutationError('alias_conflict', 409, `Alias is already in use: ${alias}`)
           routes.stableAliases.push({ alias, channel: channelId, model: modelId })
         } else {
+          delete current.logicalModel
           current.channel = channelId
           current.model = modelId
         }
         return { alias, channel: channelId, model: modelId }
-      }, result => ({ channelIds: [result.channel], modelIds: [`${result.channel}/${result.model}`] }))
+      }, result => result.logicalModel
+        ? { logicalModelIds: [result.logicalModel] }
+        : { channelIds: [result.channel], modelIds: [`${result.channel}/${result.model}`] })
+    },
+    createLogicalModel(input) {
+      return mutate('logical-model-create', ({ routes }) => {
+        const id = normalizeLogicalModelId(input?.id)
+        if ((routes.logicalModels ?? []).some(item => item.id === id)) {
+          throw new ConfigMutationError('logical_model_exists', 409, `Logical model already exists: ${id}`)
+        }
+        routes.schemaVersion = 2
+        routes.logicalModels ??= []
+        const group = normalizeLogicalModelMutation(routes, { ...input, id }, { requireCandidates: true })
+        routes.logicalModels.push(group)
+        return { ...group }
+      }, result => ({ logicalModelIds: [result.id], modelIds: result.candidates.map(candidate => `${candidate.channel}/${candidate.model}`) }))
+    },
+    updateLogicalModel(idValue, input) {
+      return mutate('logical-model-update', ({ routes }) => {
+        const id = normalizeLogicalModelId(idValue)
+        const group = (routes.logicalModels ?? []).find(item => item.id === id)
+        if (!group) throw new ConfigMutationError('logical_model_not_found', 404, `Unknown logical model: ${id}`)
+        routes.schemaVersion = 2
+        const patch = input && typeof input === 'object' && !Array.isArray(input) ? input : {}
+        if (patch.enabled !== undefined) {
+          if (typeof patch.enabled !== 'boolean') throw new ConfigMutationError('invalid_logical_model_enabled', 400, 'Logical model enabled must be a boolean')
+          group.enabled = patch.enabled
+        }
+        if (patch.candidates !== undefined) {
+          const next = normalizeLogicalModelMutation(routes, { id, enabled: group.enabled, candidates: patch.candidates }, { requireCandidates: true })
+          group.candidates = next.candidates
+        }
+        if (group.enabled !== false && !(group.candidates ?? []).some(candidate => candidate.enabled !== false)) {
+          throw new ConfigMutationError('logical_model_empty', 400, 'An enabled logical model must have an enabled candidate')
+        }
+        return { ...group, candidates: group.candidates.map(candidate => ({ ...candidate })) }
+      }, result => ({ logicalModelIds: [result.id], modelIds: result.candidates.map(candidate => `${candidate.channel}/${candidate.model}`) }))
+    },
+    deleteLogicalModel(idValue) {
+      return mutate('logical-model-delete', ({ routes }) => {
+        const id = normalizeLogicalModelId(idValue)
+        const index = (routes.logicalModels ?? []).findIndex(item => item.id === id)
+        if (index < 0) throw new ConfigMutationError('logical_model_not_found', 404, `Unknown logical model: ${id}`)
+        if ([...(routes.stableAliases ?? []), ...(routes.pinnedAliases ?? [])].some(route => route.logicalModel === id)) {
+          throw new ConfigMutationError('logical_model_has_aliases', 409, 'Move stable aliases before deleting the logical model')
+        }
+        const [deleted] = routes.logicalModels.splice(index, 1)
+        return { id, deleted: true, candidates: deleted.candidates ?? [] }
+      }, result => ({ logicalModelIds: [result.id], modelIds: result.candidates.map(candidate => `${candidate.channel}/${candidate.model}`) }))
     },
     deleteChannel(idValue) {
       return mutate('channel-delete', ({ routes, env, providers }) => {
@@ -356,6 +459,9 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
         }
         if ([...(routes.stableAliases ?? []), ...(routes.pinnedAliases ?? [])].some(route => route.channel === id)) {
           throw new ConfigMutationError('channel_has_aliases', 409, 'Move stable and pinned aliases before deleting the channel')
+        }
+        if ((routes.logicalModels ?? []).some(group => (group.candidates ?? []).some(candidate => candidate.channel === id))) {
+          throw new ConfigMutationError('channel_has_logical_models', 409, 'Remove logical model candidates before deleting the channel')
         }
         routes.channels.splice(index, 1)
         if (providers) providers.providers = providers.providers.filter(item => String(item.id).toLowerCase() !== id)
@@ -565,6 +671,56 @@ function normalizeAlias(value) {
   return alias
 }
 
+function normalizeLogicalModelId(value) {
+  const id = String(value ?? '').trim()
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}$/.test(id)) {
+    throw new ConfigMutationError('invalid_logical_model_id', 400, 'Logical model id is invalid')
+  }
+  return id
+}
+
+function normalizeLogicalModelMutation(routes, input, { requireCandidates = false } = {}) {
+  if (!input || Array.isArray(input) || typeof input !== 'object') {
+    throw new ConfigMutationError('invalid_logical_model', 400, 'Logical model body must be an object')
+  }
+  const id = normalizeLogicalModelId(input.id)
+  const enabled = input.enabled === undefined ? true : input.enabled
+  if (typeof enabled !== 'boolean') throw new ConfigMutationError('invalid_logical_model_enabled', 400, 'Logical model enabled must be a boolean')
+  if (requireCandidates && !Array.isArray(input.candidates)) {
+    throw new ConfigMutationError('invalid_logical_candidates', 400, 'Logical model candidates must be an array')
+  }
+  const candidates = Array.isArray(input.candidates) ? input.candidates : []
+  const seen = new Set()
+  const normalized = []
+  for (const candidateValue of candidates) {
+    if (!candidateValue || Array.isArray(candidateValue) || typeof candidateValue !== 'object') {
+      throw new ConfigMutationError('invalid_logical_candidate', 400, 'Logical model candidates must be objects')
+    }
+    const channel = normalizeChannelId(candidateValue.channel)
+    const model = normalizeModelId(candidateValue.model)
+    const key = `${channel}\0${model}`
+    if (seen.has(key)) throw new ConfigMutationError('duplicate_logical_candidate', 409, `Duplicate logical candidate: ${channel}/${model}`)
+    seen.add(key)
+    const routeChannel = (routes.channels ?? []).find(item => item.id === channel)
+    if (!routeChannel) throw new ConfigMutationError('logical_candidate_not_found', 404, `Unknown channel: ${channel}`)
+    const routeModel = (routeChannel.models ?? []).find(item => item.upstream === model)
+    if (!routeModel) throw new ConfigMutationError('logical_candidate_not_found', 404, `Unknown model: ${channel}/${model}`)
+    if (!isGenerationModel({ kind: normalizeModelKind(routeModel.kind, routeModel.upstream) })) {
+      throw new ConfigMutationError('logical_candidate_not_generation', 409, `Logical candidates must be generation models: ${channel}/${model}`)
+    }
+    const candidateEnabled = candidateValue.enabled === undefined ? true : candidateValue.enabled
+    if (typeof candidateEnabled !== 'boolean') throw new ConfigMutationError('invalid_logical_candidate_enabled', 400, 'Logical candidate enabled must be a boolean')
+    if (candidateEnabled && routeModel.status === 'disabled') throw new ConfigMutationError('logical_candidate_disabled', 409, `Disabled model cannot be an enabled logical candidate: ${channel}/${model}`)
+    const priority = candidateValue.priority === undefined ? routeModel.priority ?? routeChannel.priority ?? 0 : candidateValue.priority
+    if (!Number.isSafeInteger(priority)) throw new ConfigMutationError('invalid_logical_candidate_priority', 400, 'Logical candidate priority must be an integer')
+    normalized.push({ channel, model, enabled: candidateEnabled, priority })
+  }
+  if (enabled && !normalized.some(candidate => candidate.enabled)) {
+    throw new ConfigMutationError('logical_model_empty', 400, `Enabled logical model must have an enabled candidate: ${id}`)
+  }
+  return { id, enabled, candidates: normalized }
+}
+
 function changedModelIds(beforeRoutes, afterRoutes, channelIds) {
   const changed = []
   for (const channelId of channelIds) {
@@ -590,6 +746,11 @@ function affectedFromDiff(diff) {
       ...(diff.models?.added ?? []),
       ...(diff.models?.removed ?? []),
       ...(diff.models?.changed ?? []).map(item => item.id)
+    ],
+    logicalModelIds: [
+      ...(diff.logicalModels?.added ?? []),
+      ...(diff.logicalModels?.removed ?? []),
+      ...(diff.logicalModels?.changed ?? []).map(item => item.id)
     ]
   }
 }

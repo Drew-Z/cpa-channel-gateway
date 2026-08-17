@@ -8,8 +8,8 @@ HAProxy listener 均绑定到容器回环地址。
 ## 解决的问题
 
 - 聚合多个 OpenAI Chat Completions、OpenAI Responses 和 Claude Messages 兼容渠道，并把相同原始模型 ID 自动聚合成一个逻辑模型。
-- 通过 `coding-main` 等稳定别名切换渠道/模型，客户端配置保持不变。
-- 稳定别名是可审计的固定指针，不提供自动故障切换；需要按健康和空闲候选自动选择时使用逻辑模型 ID。
+- 通过 `coding-main` 等稳定别名切换精确模型或逻辑模型，客户端配置保持不变。
+- 稳定别名是可审计的固定指针：精确目标不自动故障切换；逻辑目标固定到一个审核过的候选组，并在组内按健康、空闲和优先级选择，别名本身不会自动漂移到其他组。
 - 每个物理渠道共享一个 HAProxy backend，`maxconn 1`，所以该渠道的全部模型和协议合计最多只有一个在途请求。
 - Node 为每个物理渠道持有一个互斥租约。渠道繁忙时会从所有模型的新请求候选中临时隐藏；没有其他空闲候选时立即返回 `429 all_candidates_busy`，不向上游排队或重复调用。
 - HAProxy 仍以 `maxconn 1` 作为最终硬约束；CPA 和网关都不会自动重放已经发往上游的生成请求。
@@ -52,7 +52,7 @@ Cloudflare Tunnel or direct allocation
    使用自有 HTTPS 域名时，再填写私密的 Cloudflare Tunnel Token；未配置时保持关闭。
 3. 执行 `npm run sync:models`，把启用渠道 `/models` 返回的目录同步到私有 routes。每个模型使用 `<渠道ID>/<原始模型ID>` 作为无冲突的公开 ID。新渠道默认进入“待测试”状态，只有完成任务型测活后才切换为生产启用。
 4. 在 `routes.local.json` 审核模型协议和能力元数据。单个渠道可以按模型分别覆盖为 `openai-compatible`、`responses` 或 `claude`。
-5. 配置稳定别名；AI Daily 等受审批约束的用途只能使用带 `approvalRef` 的 `pinnedAliases`。
+5. 按需显式配置 `logicalModels`，再配置精确或逻辑稳定别名；AI Daily 等受审批约束的用途只能使用带 `approvalRef` 的精确 `pinnedAliases`。
 6. 验证并生成：
 
    ```bash
@@ -85,6 +85,13 @@ npm run migrate:providers -- --apply
 
 迁移默认只做 dry-run；只有 `--apply` 才会写入。它会把 `channels.local.env` 中的渠道字段移出，保留网关、管理和 Tunnel 等进程级变量，并从 routes 中移除已迁移的渠道 `enabled/priority` 冗余字段。迁移前会创建私有备份，写入后会重新校验归一化配置语义；失败会恢复原文件。`providers.local.json` 与旧渠道 env 不能并存，避免两份私有配置静默覆盖。迁移结果只输出渠道 ID、数量和（apply 时的）备份路径等低敏摘要，不输出 URL、API key 或响应正文。
 
+旧 routes schema 可先做只读预览，再显式升级到支持逻辑组的 v2；该操作不会调用上游、猜测模型等价关系或移动现有别名：
+
+```bash
+npm run migrate:routes
+npm run migrate:routes -- --apply
+```
+
 ## 翼龙面板
 
 完整步骤见 [翼龙面板部署指南](docs/pterodactyl-deployment.md)。自有域名接入见 [Cloudflare Tunnel 部署](docs/cloudflare-tunnel.md)。公开仓库可直接通过 HTTPS 克隆，Git 用户名和 Access Token 均留空。私有渠道配置不通过 Git 分发，必须在安装后由操作者手工上传。
@@ -108,13 +115,13 @@ npm run migrate:providers -- --apply
 
 ### 管理台
 
-管理台会区分当前进程已加载 revision 与磁盘待重启 revision；变更未重启时会禁用测活，避免旧进程误报。失败登录按来源地址短时限速，过期会话会被主动清理。
+管理台会区分当前进程已加载 revision 与磁盘待重启 revision；变更未重启时会禁用测活，避免旧进程误报。失败登录按来源地址短时限速，过期会话会被主动清理。逻辑模型编辑器只从现有精确模型目录添加候选，支持候选启用状态和整数优先级；不同 upstream ID 不会被自动模糊合并。
 
-`CPA_MANAGEMENT_KEY` 留空时 `/admin` 不开放。填写独立的 32 字符以上随机管理密钥并重启后，访问同一域名的 `/admin` 登录。管理台的会话只保存在 Node 内存中，重启后失效；模型下拉框同时用于测活和路由管理，不需要手写 ID。忙碌或已禁用模型不能测活，但仍可被选中管理；可以直接设置 `coding-main`、`coding-backup`，或禁用/恢复精确渠道模型。禁用仍被 stable/pinned alias 引用的模型会被拒绝，必须先移动别名。配置写入但尚未重启时，测活按钮会自动禁用，路由调整仍可继续批量完成。所有配置写入和模型同步都经过单一 FIFO 控制作业队列；渠道停用、待测试或删除会立即显示“排空中”，停止新预约但允许在途请求正常结束。管理台状态会显示当前作业、等待数量和低敏最近作业记录。待测试渠道会启动内网 HAProxy/CPA listener，但不会出现在公开 `/v1/models`，也不会被生产调度；只有管理员点击“设为生产”后才会加入统一模型出口。测活使用固定诗词任务、同一渠道互斥租约和相同协议路径，只保存状态摘要、transport、延迟与正文长度，不保存诗词正文。
+`CPA_MANAGEMENT_KEY` 留空时 `/admin` 不开放。填写独立的 32 字符以上随机管理密钥并重启后，访问同一域名的 `/admin` 登录。管理台的会话只保存在 Node 内存中，重启后失效；模型下拉框同时用于测活和路由管理，不需要手写精确 ID。忙碌或已禁用模型不能测活，但仍可被选中管理；可以把 `coding-main`、`coding-backup` 指向精确模型或显式逻辑组，也可以禁用/恢复精确渠道模型。禁用仍被 stable/pinned alias 或启用逻辑候选引用的模型会被拒绝，必须先移动引用。配置写入但尚未重启时，测活按钮会自动禁用，路由调整仍可继续批量完成。所有配置写入和模型同步都经过单一 FIFO 控制作业队列；渠道停用、待测试或删除会立即显示“排空中”，停止新预约但允许在途请求正常结束。管理台状态会显示当前作业、等待数量和低敏最近作业记录。待测试渠道会启动内网 HAProxy/CPA listener，但不会出现在公开 `/v1/models`，也不会被生产调度；只有管理员点击“设为生产”后才会加入统一模型出口。测活使用固定诗词任务、同一渠道互斥租约和相同协议路径，只保存状态摘要、transport、延迟与正文长度，不保存诗词正文。
 
 管理台的 Changes 区域展示 loaded/pending revision、有限历史、结构化脱敏 diff 和最近审计结果。Base URL 在 diff 中只显示“已变化”，API key 只显示“已替换”；快照原文不会进入 API 或 DOM。回滚必须先查看目标 revision，再二次确认；它与 runtime apply 共用同一 FIFO，排空在途请求、生成并验证 release，成功激活后才提交 loaded revision。损坏 revision、排空超时或 readiness 失败都会保留当前私有配置和运行时。审计写入 Git 忽略的 `runtime/audit-events.jsonl`，只含 job ID、操作、结果、revision、耗时和分类错误码。
 
-管理台的渠道列表会向已登录管理员显示经过校验的 Base URL，方便区分名称相近的渠道；公开模型 API、未登录响应和日志不会暴露该地址。健康状态会显示为“健康”“未测试”“降级”等中文状态。模型目录同步使用已有渠道下拉框，留空时同步生产渠道，不需要手写渠道 ID；API 仍支持脚本传入精确渠道 ID。管理台会比较私有 env 与 routes：env 中已有、routes 尚未登记的渠道会出现在“渠道发现”，可一键导入为待测试，或导入后立即只读同步 `/models`；已经写入 routes 但当前进程尚未加载的渠道会显示“等待重启”。同步失败不会回滚已导入的待测试渠道，但不会把它加入生产调度。生成新配置后，正式启动脚本还提供“应用待重启配置”：排空请求、替换内部 CPA/HAProxy、检查 readiness，并在失败时恢复旧 release；没有运行时监督器时仍需重启容器。模型目录中已从上游消失、但仍被 stable/pinned alias 引用的模型会标记为 `stale`，不会自动替换 `coding-backup`。渠道健康、冷却、candidate 配置错误和最近测活摘要写入 Git 忽略的 `runtime/control-state.json`，重启后按 release 和时效规则恢复；完整隐私与失效契约见 [控制状态持久化](docs/control-state.md)。管理台还展示滚动 24 小时真实业务请求统计，包括请求总数、成功/失败/取消数量、成功率、逻辑模型、请求入口和实际渠道模型。管理台测活不计入使用统计。统计事件写入 Git 忽略的 `runtime/usage-events.jsonl`，仅包含时间、模型路由、结果和 transport；不保存提示词、响应正文、请求头、密钥、用户标识或请求 ID。成功率按完整返回的 `2xx` 请求数除以全部请求数计算，容器重启后仍可从本地事件文件恢复。
+管理台的渠道列表会向已登录管理员显示经过校验的 Base URL，方便区分名称相近的渠道；公开模型 API、未登录响应和日志不会暴露该地址。健康状态会显示为“健康”“未测试”“降级”等中文状态。模型目录同步使用已有渠道下拉框，留空时同步生产渠道，不需要手写渠道 ID；API 仍支持脚本传入精确渠道 ID。管理台会比较私有 env 与 routes：env 中已有、routes 尚未登记的渠道会出现在“渠道发现”，可一键导入为待测试，或导入后立即只读同步 `/models`；已经写入 routes 但当前进程尚未加载的渠道会显示“等待重启”。同步失败不会回滚已导入的待测试渠道，但不会把它加入生产调度。生成新配置后，正式启动脚本还提供“应用待重启配置”：排空请求、替换内部 CPA/HAProxy、检查 readiness，并在失败时恢复旧 release；没有运行时监督器时仍需重启容器。模型目录中已从上游消失、但仍被 stable/pinned alias 或逻辑候选引用的模型会标记为 `stale`，不会自动替换 `coding-backup`。渠道健康、冷却、candidate 配置错误和最近测活摘要写入 Git 忽略的 `runtime/control-state.json`，重启后按 release 和时效规则恢复；完整隐私与失效契约见 [控制状态持久化](docs/control-state.md)。管理台还展示滚动 24 小时真实业务请求统计，包括请求总数、成功/失败/取消数量、成功率、逻辑模型、请求入口和实际渠道模型。管理台测活不计入使用统计。统计事件写入 Git 忽略的 `runtime/usage-events.jsonl`，仅包含时间、模型路由、结果和 transport；不保存提示词、响应正文、请求头、密钥、用户标识或请求 ID。成功率按完整返回的 `2xx` 请求数除以全部请求数计算，容器重启后仍可从本地事件文件恢复。
 
 登录后的“客户端连接”区域会根据当前访问域名生成带 `/v1` 的 Base URL，并提供复制按钮；`GATEWAY_API_KEY` 默认只显示掩码，只有显式点击“显示”或“复制 API key”时才通过带 CSRF 保护的已认证同源请求取回，显示后 30 秒自动恢复掩码。连接接口始终 `no-store`，不会把完整密钥写入初始 HTML、日志或公开 API。渠道 API key、管理密钥和 Tunnel Token 永不回显。控制作业与排空契约见 [控制作业与排空](docs/control-jobs.md)。
 
@@ -139,7 +146,7 @@ npm run sync:models
 npm run check
 ```
 
-同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何渠道请求失败或返回空目录时都不会改写 routes；成功时会先创建 `config/routes.local.pre-model-sync-*.json` 或 revision 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`，未被引用的下线模型会删除。仍被 stable/pinned alias 引用的下线模型会保留并标记为 `stale`，待别名切走后在下次同步清理。模型可以在私有 routes 中标记为 `disabled`；该状态会在目录同步中保留，模型不会进入公开 `/v1/models`、生产调度或生成的 CPA 模型段。管理台同步支持显式指定待测试渠道，不会把它们加入公开目录。
+同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何渠道请求失败或返回空目录时都不会改写 routes；成功时会先创建 `config/routes.local.pre-model-sync-*.json` 或 revision 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`，未被引用的下线模型会删除。仍被 stable/pinned alias 或逻辑候选引用的下线模型会保留并标记为 `stale`，待引用移走后在下次同步清理。模型可以在私有 routes 中标记为 `disabled`；该状态会在目录同步中保留，模型不会进入公开 `/v1/models`、生产调度或生成的 CPA 模型段。管理台同步支持显式指定待测试渠道，不会把它们加入公开目录。
 
 上游 `/models` 可能同时列出生成、embedding、reranker 或语音模型。目录同步只证明“上游声明存在”，不证明它支持当前渠道默认协议；正式使用前仍要按能力执行任务型 canary。
 
@@ -147,7 +154,7 @@ npm run check
 
 ## 模型替换
 
-优先在 `/admin` 的“模型测活与路由”中选择精确模型并点击“设为 `coding-main`”或“设为 `coding-backup`”。需要淘汰旧模型时，先把所有稳定别名切走，再点击“禁用模型”。这些操作会创建私有 revision；完成一批调整后统一重启容器即可生效。
+优先在 `/admin` 的“模型测活与路由”中选择精确模型并设置稳定别名；需要跨不同 upstream ID 聚合时，在“逻辑模型与候选”中显式建组、设置候选优先级，再把别名固定到该组。需要淘汰旧模型时，先移走 stable/pinned alias 和逻辑候选引用，再点击“禁用模型”。这些操作会创建私有 revision；完成一批调整后统一应用或重启即可生效。
 
 也可以离线修改 `config/routes.local.json`：
 

@@ -10,6 +10,9 @@ const JOB_TYPES = new Set([
   'channel-delete',
   'model-update',
   'alias-update',
+  'logical-model-create',
+  'logical-model-update',
+  'logical-model-delete',
   'runtime-apply',
   'runtime-rollback'
 ])

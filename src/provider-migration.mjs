@@ -101,6 +101,7 @@ function configSemanticView(config) {
       priority: channel.priority,
       models: channel.models
     })),
+    logicalModels: config.logicalModels,
     stableAliases: config.stableAliases,
     pinnedAliases: config.pinnedAliases
   }

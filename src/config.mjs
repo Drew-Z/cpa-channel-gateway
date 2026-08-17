@@ -7,6 +7,7 @@ import { isChannelEnvKey } from './providers.mjs'
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const MODEL_NAME = /^[^\s/][^\r\n]{0,254}$/
 const ALIAS = /^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$/
+const LOGICAL_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}$/
 const ENV_NAME = /^[A-Z][A-Z0-9_]*$/
 
 export function loadConfig(root, { allowExamples = false, allowEmptyEnabledChannels = false } = {}) {
@@ -39,7 +40,7 @@ function readJson(filePath) {
 export function validateAndNormalize({ gateway, routes, env, providers = null, paths = {}, allowEmptyEnabledChannels = false }) {
   const errors = []
   if (gateway.schemaVersion !== 1) errors.push('gateway.json schemaVersion must be 1')
-  if (routes.schemaVersion !== 1) errors.push('routes schemaVersion must be 1')
+  if (![1, 2].includes(routes.schemaVersion)) errors.push('routes schemaVersion must be 1 or 2')
   const providerMode = providers !== null
   const providersById = providerMode ? normalizeProviders(providers, errors) : new Map()
   if (providerMode && Object.keys(env).some(isChannelEnvKey)) errors.push('providers.local.json cannot coexist with CHANNEL_* entries in channels.local.env')
@@ -139,25 +140,43 @@ export function validateAndNormalize({ gateway, routes, env, providers = null, p
     channelById.set(id, channel)
   }
 
-  const stableAliases = normalizeAliasRoutes(routes.stableAliases, 'stableAliases', false)
-  const pinnedAliases = normalizeAliasRoutes(routes.pinnedAliases, 'pinnedAliases', true)
+  const logicalModels = normalizeLogicalModels(routes.logicalModels, routes.schemaVersion, channelById, seenAliases, errors)
+  const logicalById = new Map(logicalModels.map(item => [item.id, item]))
+  const stableAliases = normalizeAliasRoutes(routes.stableAliases, 'stableAliases', false, logicalById)
+  const pinnedAliases = normalizeAliasRoutes(routes.pinnedAliases, 'pinnedAliases', true, logicalById)
 
-  function normalizeAliasRoutes(entries = [], field, pinned) {
+  function normalizeAliasRoutes(entries = [], field, pinned, logicalById) {
     return entries.map((entry, index) => {
       const alias = String(entry.alias ?? '').trim()
       validateAlias(alias, `${field}[${index}]`, seenAliases, errors)
+      const logicalModel = entry.logicalModel === undefined ? '' : String(entry.logicalModel ?? '').trim()
+      const hasLogicalTarget = Boolean(logicalModel)
       const channelId = String(entry.channel ?? '').trim().toLowerCase()
       const model = String(entry.model ?? '').trim()
+      if (hasLogicalTarget) {
+        if (pinned) errors.push(`${field}[${index}] cannot target a logical model`)
+        if (entry.channel !== undefined || entry.model !== undefined) errors.push(`${field}[${index}] cannot mix logicalModel with channel/model`)
+        if (!LOGICAL_MODEL_ID.test(logicalModel)) errors.push(`${field}[${index}].logicalModel is invalid`)
+        const target = logicalById.get(logicalModel)
+        if (!target) errors.push(`${field}[${index}] references unknown logical model ${logicalModel}`)
+        else if (!target.enabled) errors.push(`${field}[${index}] references disabled logical model ${logicalModel}`)
+      } else if (entry.logicalModel !== undefined) {
+        errors.push(`${field}[${index}].logicalModel is required when provided`)
+      }
       const channel = channelById.get(channelId)
-      if (!channel) errors.push(`${field}[${index}] references unknown channel ${channelId}`)
-      else {
-        const target = channel.models.find(item => item.upstream === model)
-        if (!target) errors.push(`${field}[${index}] references unknown model ${channelId}/${model}`)
-        else if (!isGenerationModel(target)) errors.push(`${field}[${index}] must reference a generation model: ${channelId}/${model}`)
+      if (!hasLogicalTarget) {
+        if (!channel) errors.push(`${field}[${index}] references unknown channel ${channelId}`)
+        else {
+          const target = channel.models.find(item => item.upstream === model)
+          if (!target) errors.push(`${field}[${index}] references unknown model ${channelId}/${model}`)
+          else if (!isGenerationModel(target)) errors.push(`${field}[${index}] must reference a generation model: ${channelId}/${model}`)
+        }
       }
       const approvalRef = String(entry.approvalRef ?? '').trim()
       if (pinned && !approvalRef) errors.push(`${field}[${index}] requires approvalRef`)
-      return { alias, channel: channelId, model, approvalRef: pinned ? approvalRef : undefined }
+      return hasLogicalTarget
+        ? { alias, logicalModel, approvalRef: undefined }
+        : { alias, channel: channelId, model, approvalRef: pinned ? approvalRef : undefined }
     })
   }
 
@@ -173,6 +192,7 @@ export function validateAndNormalize({ gateway, routes, env, providers = null, p
     gatewayKey,
     managementKey,
     channels,
+    logicalModels,
     stableAliases,
     pinnedAliases,
     cloudflareTunnel: {
@@ -183,6 +203,58 @@ export function validateAndNormalize({ gateway, routes, env, providers = null, p
       readyTimeoutMs: tunnelSettings.readyTimeoutSeconds * 1000
     }
   }
+}
+
+function normalizeLogicalModels(entries, schemaVersion, channelById, seenAliases, errors) {
+  if (schemaVersion === 1 && entries !== undefined && entries !== null) {
+    if (!Array.isArray(entries) || entries.length) errors.push('routes.logicalModels requires schemaVersion 2')
+    return []
+  }
+  if (entries === undefined || entries === null) return []
+  if (!Array.isArray(entries)) {
+    errors.push('routes.logicalModels must be an array')
+    return []
+  }
+  const result = []
+  const seenIds = new Set()
+  for (const [index, entryValue] of entries.entries()) {
+    const entry = entryValue && typeof entryValue === 'object' && !Array.isArray(entryValue) ? entryValue : {}
+    const id = String(entry.id ?? '').trim()
+    if (!LOGICAL_MODEL_ID.test(id)) errors.push(`logicalModels[${index}].id is invalid`)
+    if (seenIds.has(id)) errors.push(`Duplicate logical model id: ${id}`)
+    seenIds.add(id)
+    validateAlias(id, `logicalModels[${index}]`, seenAliases, errors)
+    const enabled = entry.enabled === undefined ? true : entry.enabled
+    if (typeof enabled !== 'boolean') errors.push(`logicalModels[${index}].enabled must be boolean`)
+    if (!Array.isArray(entry.candidates)) {
+      errors.push(`logicalModels[${index}].candidates must be an array`)
+      result.push({ id, enabled: Boolean(enabled), candidates: [] })
+      continue
+    }
+    const candidates = []
+    const seenCandidates = new Set()
+    for (const [candidateIndex, candidateValue] of entry.candidates.entries()) {
+      const candidate = candidateValue && typeof candidateValue === 'object' && !Array.isArray(candidateValue) ? candidateValue : {}
+      const channelId = String(candidate.channel ?? '').trim().toLowerCase()
+      const modelId = String(candidate.model ?? '').trim()
+      const key = `${channelId}\0${modelId}`
+      if (seenCandidates.has(key)) errors.push(`Duplicate logical candidate: ${id} -> ${channelId}/${modelId}`)
+      seenCandidates.add(key)
+      const channel = channelById.get(channelId)
+      const target = channel?.models.find(item => item.upstream === modelId)
+      if (!channel) errors.push(`logicalModels[${index}].candidates[${candidateIndex}] references unknown channel ${channelId}`)
+      else if (!target) errors.push(`logicalModels[${index}].candidates[${candidateIndex}] references unknown model ${channelId}/${modelId}`)
+      else if (!isGenerationModel(target)) errors.push(`logicalModels[${index}].candidates[${candidateIndex}] must reference a generation model`)
+      const candidateEnabled = candidate.enabled === undefined ? true : candidate.enabled
+      if (typeof candidateEnabled !== 'boolean') errors.push(`logicalModels[${index}].candidates[${candidateIndex}].enabled must be boolean`)
+      if (target?.status === 'disabled' && candidateEnabled === true) errors.push(`logicalModels[${index}].candidates[${candidateIndex}] references a disabled model`)
+      const priority = optionalInteger(candidate.priority ?? target?.priority ?? channel?.priority ?? 0, `logicalModels[${index}].candidates[${candidateIndex}].priority`, errors) ?? 0
+      candidates.push({ channel: channelId, model: modelId, enabled: Boolean(candidateEnabled), priority })
+    }
+    if (enabled === true && !candidates.some(candidate => candidate.enabled)) errors.push(`Enabled logical model ${id} must have an enabled candidate`)
+    result.push({ id, enabled: Boolean(enabled), candidates })
+  }
+  return result
 }
 
 function normalizeProviders(document, errors) {

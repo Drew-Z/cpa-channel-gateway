@@ -53,6 +53,38 @@ test('native Responses forwarding preserves reviewed client headers and replaces
   assert.equal(captured.headers['cf-ray'], undefined)
 })
 
+test('production usage keeps an explicit logical group across upstream ids', async t => {
+  const upstream = http.createServer((request, response) => {
+    request.resume()
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"output_text":"ok"}')
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+
+  const config = fixtureConfig(upstreamAddress.port)
+  config.logicalModels = [{
+    id: 'coding-pool',
+    enabled: true,
+    candidates: [{ channel: 'free', model: 'shared-model', enabled: true, priority: 10 }]
+  }]
+  config.stableAliases = [{ alias: 'coding-main', logicalModel: 'coding-pool' }]
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const result = await request({
+    port: address.port,
+    path: '/v1/responses',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'coding-main', input: 'logical usage test' }
+  })
+  assert.equal(result.statusCode, 200)
+  const usage = gateway.usageMonitor.snapshot()
+  assert.deepEqual(usage.logicalModels.map(item => [item.id, item.total]), [['coding-pool', 1]])
+  assert.equal(usage.physicalModels[0].id, 'free/shared-model')
+})
+
 test('rejects unsupported streaming mode before contacting the upstream', async t => {
   let upstreamCalls = 0
   const upstream = http.createServer((request, response) => {
@@ -601,6 +633,7 @@ test('admin API updates model status and stable aliases through the private conf
     routing: () => ({
       stableAliases: [{ alias: 'coding-main', channel: 'free', model: 'shared-model' }],
       pinnedAliases: [],
+      logicalModels: [{ id: 'coding-pool', enabled: true, candidates: [{ channel: 'free', model: 'shared-model', enabled: true, priority: 10 }] }],
       models: [
         { channel: 'free', model: 'shared-model', status: 'disabled' },
         { channel: 'future', model: 'pending-model', protocol: 'responses', kind: 'generation', streaming: 'both', canaryEligible: true, staged: true, channelEnabled: false, status: 'active' }
@@ -610,9 +643,21 @@ test('admin API updates model status and stable aliases through the private conf
       calls.push({ operation: 'model', channel, model, status })
       return { channel, model, status, revision: 'next-model-revision', restartRequired: true }
     },
-    setStableAlias: (alias, channel, model) => {
-      calls.push({ operation: 'alias', alias, channel, model })
-      return { alias, channel, model, revision: 'next-alias-revision', restartRequired: true }
+    setStableAlias: (alias, target) => {
+      calls.push({ operation: 'alias', alias, target })
+      return { alias, ...target, revision: 'next-alias-revision', restartRequired: true }
+    },
+    createLogicalModel: body => {
+      calls.push({ operation: 'logical-create', body })
+      return { ...body, revision: 'logical-create-revision', restartRequired: true }
+    },
+    updateLogicalModel: (id, body) => {
+      calls.push({ operation: 'logical-update', id, body })
+      return { id, ...body, revision: 'logical-update-revision', restartRequired: true }
+    },
+    deleteLogicalModel: id => {
+      calls.push({ operation: 'logical-delete', id })
+      return { id, deleted: true, revision: 'logical-delete-revision', restartRequired: true }
     }
   }
   const gateway = createControlGateway(config, { configManager })
@@ -626,6 +671,7 @@ test('admin API updates model status and stable aliases through the private conf
 
   const status = await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })
   assert.equal(JSON.parse(status.body).stableAliases[0].alias, 'coding-main')
+  assert.equal(JSON.parse(status.body).logicalModels[0].id, 'coding-pool')
   const connection = await request({ port: address.port, method: 'GET', path: '/admin/api/connection', headers: { cookie } })
   const connectionData = JSON.parse(connection.body)
   assert.equal(connection.statusCode, 200)
@@ -668,9 +714,43 @@ test('admin API updates model status and stable aliases through the private conf
     body: { alias: 'coding-backup', channel: 'free', model: 'shared-model' }
   })
   assert.equal(aliasUpdate.statusCode, 202)
+  const logicalCreate = await request({
+    port: address.port,
+    path: '/admin/api/logical-models',
+    headers,
+    body: { id: 'merged-coding', candidates: [{ channel: 'free', model: 'shared-model', enabled: true, priority: 10 }] }
+  })
+  assert.equal(logicalCreate.statusCode, 202)
+  const logicalUpdate = await request({
+    port: address.port,
+    method: 'PATCH',
+    path: '/admin/api/logical-models/merged-coding',
+    headers,
+    body: { enabled: false }
+  })
+  assert.equal(logicalUpdate.statusCode, 202)
+  const logicalAlias = await request({
+    port: address.port,
+    method: 'PUT',
+    path: '/admin/api/stable-aliases',
+    headers,
+    body: { alias: 'coding-main', logicalModel: 'coding-pool' }
+  })
+  assert.equal(logicalAlias.statusCode, 202)
+  const logicalDelete = await request({
+    port: address.port,
+    method: 'DELETE',
+    path: '/admin/api/logical-models/merged-coding',
+    headers
+  })
+  assert.equal(logicalDelete.statusCode, 202)
   assert.deepEqual(calls, [
     { operation: 'model', channel: 'free', model: 'shared-model', status: 'active' },
-    { operation: 'alias', alias: 'coding-backup', channel: 'free', model: 'shared-model' }
+    { operation: 'alias', alias: 'coding-backup', target: { channel: 'free', model: 'shared-model' } },
+    { operation: 'logical-create', body: { id: 'merged-coding', candidates: [{ channel: 'free', model: 'shared-model', enabled: true, priority: 10 }] } },
+    { operation: 'logical-update', id: 'merged-coding', body: { enabled: false } },
+    { operation: 'alias', alias: 'coding-main', target: { logicalModel: 'coding-pool' } },
+    { operation: 'logical-delete', id: 'merged-coding' }
   ])
 })
 
@@ -889,6 +969,10 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.body, /rollbackSelectedRevision/)
   assert.match(first.body, /confirmRevision/)
   assert.match(first.body, /apiKeyReplaced/)
+  assert.match(first.body, /id="logicalModelSelect"/)
+  assert.match(first.body, /\/admin\/api\/logical-models/)
+  assert.match(first.body, /setLogicalStableAlias/)
+  assert.match(first.body, /候选优先级/)
   assert.match(first.body, /复制 Base URL/)
   assert.match(first.body, /复制 API key/)
   assert.doesNotMatch(first.body, new RegExp(GATEWAY_KEY))

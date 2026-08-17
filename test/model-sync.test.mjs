@@ -95,6 +95,24 @@ test('preserves stale models until stable or pinned aliases move away from them'
   assert.equal(result.routes.channels[0].models.find(model => model.upstream === 'new-model').status, 'active')
 })
 
+test('preserves stale models referenced by explicit logical candidates', () => {
+  const routes = {
+    schemaVersion: 2,
+    channels: [{ id: 'sample', models: [{ upstream: 'old-model', aliases: ['sample/old-model'] }] }],
+    logicalModels: [{
+      id: 'coding-pool',
+      enabled: true,
+      candidates: [{ channel: 'sample', model: 'old-model', enabled: true, priority: 10 }]
+    }],
+    stableAliases: [],
+    pinnedAliases: []
+  }
+  const result = synchronizeRouteModels(routes, new Map([['sample', ['new-model']]]))
+  assert.deepEqual(result.routes.channels[0].models.map(model => model.upstream), ['new-model', 'old-model'])
+  assert.equal(result.routes.channels[0].models.find(model => model.upstream === 'old-model').status, 'stale')
+  assert.deepEqual(result.routes.logicalModels, routes.logicalModels)
+})
+
 test('preserves disabled model decisions during catalog synchronization', () => {
   const routes = {
     schemaVersion: 1,

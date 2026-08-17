@@ -18,6 +18,7 @@
     "merge:legacy": "node scripts/import-legacy-env.mjs --merge",
     "replace:legacy": "node scripts/import-legacy-env.mjs --replace",
     "migrate:providers": "node scripts/migrate-providers.mjs",
+    "migrate:routes": "node scripts/migrate-routes.mjs",
     "sync:models": "node scripts/sync-models.mjs",
     "canary": "node scripts/canary.mjs",
     "verify:deployment": "node scripts/verify-deployment.mjs",

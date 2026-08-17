@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "channels": [
     {
       "id": "sample",
@@ -21,11 +21,24 @@
       ]
     }
   ],
+  "logicalModels": [
+    {
+      "id": "coding-pool",
+      "enabled": true,
+      "candidates": [
+        {
+          "channel": "sample",
+          "model": "example-coding-model",
+          "enabled": true,
+          "priority": 100
+        }
+      ]
+    }
+  ],
   "stableAliases": [
     {
       "alias": "coding-main",
-      "channel": "sample",
-      "model": "example-coding-model"
+      "logicalModel": "coding-pool"
     }
   ],
   "pinnedAliases": [

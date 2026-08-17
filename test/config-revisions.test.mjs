@@ -64,3 +64,21 @@ test('produces structured diffs without returning provider URLs or keys', () => 
   assert.deepEqual(diff.aliases.stable.changed, [{ alias: 'coding-main', from: 'main/model-a', to: 'main/model-b' }])
   assert.doesNotMatch(output, /old\.example\.test|new\.example\.test|old-secret|new-secret/)
 })
+
+test('diffs logical model membership and logical alias targets without snapshot content', () => {
+  const base = {
+    schemaVersion: 2,
+    channels: [{ id: 'main', models: [{ upstream: 'model-a' }, { upstream: 'model-b' }] }],
+    logicalModels: [{ id: 'coding-pool', enabled: true, candidates: [{ channel: 'main', model: 'model-a', priority: 10 }] }],
+    stableAliases: [{ alias: 'coding-main', logicalModel: 'coding-pool' }],
+    pinnedAliases: []
+  }
+  const next = structuredClone(base)
+  next.logicalModels[0].candidates = [{ channel: 'main', model: 'model-b', priority: 20 }]
+  next.stableAliases = [{ alias: 'coding-main', channel: 'main', model: 'model-b' }]
+  const snapshot = routes => ({ envText: 'GATEWAY_API_KEY=fixture\n', routesText: JSON.stringify(routes), providersText: null })
+  const diff = diffSnapshots(snapshot(base), snapshot(next))
+  assert.deepEqual(diff.logicalModels.changed, [{ id: 'coding-pool', candidatesChanged: true }])
+  assert.deepEqual(diff.aliases.stable.changed, [{ alias: 'coding-main', from: 'logical:coding-pool', to: 'main/model-b' }])
+  assert.equal(JSON.stringify(diff).includes('routesText'), false)
+})

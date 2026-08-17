@@ -39,23 +39,64 @@ export function buildModelCatalog(config) {
     }
   }
 
-  for (const route of [...config.stableAliases, ...config.pinnedAliases]) {
-    const candidate = findCandidate(config, candidatesByKey, route.channel, route.model)
-    if (candidate && isGenerationModel(candidate)) routeAliases.set(route.alias, candidate)
+  // Exact upstream IDs remain automatically grouped for backward compatibility.
+  // An explicit logical model replaces the automatic group with the same public
+  // ID, while still allowing its candidates to participate in other groups.
+  for (const candidates of logicalModels.values()) candidates.sort(compareCandidates)
+  for (const logical of config.logicalModels ?? []) {
+    const selected = []
+    for (const reference of logical.candidates ?? []) {
+      if (reference.enabled === false) continue
+      const candidate = findCandidateByModel(candidatesByKey, reference.channel, reference.model)
+      if (!candidate || !candidate.channel.enabled || candidate.model.status === 'disabled' || !isGenerationModel(candidate)) continue
+      selected.push({
+        ...candidate,
+        logicalModelId: logical.id,
+        priority: reference.priority ?? candidate.priority
+      })
+    }
+    if (!logical.enabled) {
+      logicalModels.delete(logical.id)
+    } else if (selected.length) {
+      logicalModels.set(logical.id, selected.sort(compareCandidates))
+    } else {
+      logicalModels.delete(logical.id)
+    }
   }
 
-  for (const candidates of logicalModels.values()) candidates.sort(compareCandidates)
+  for (const route of [...config.stableAliases, ...config.pinnedAliases]) {
+    if (route.logicalModel) {
+      const candidates = logicalModels.get(route.logicalModel)
+      if (candidates?.length) routeAliases.set(route.alias, {
+        kind: 'logical-alias',
+        logicalModelId: route.logicalModel,
+        candidates: [...candidates]
+      })
+      continue
+    }
+    const candidate = findCandidate(config, candidatesByKey, route.channel, route.model)
+    if (candidate && isGenerationModel(candidate)) routeAliases.set(route.alias, {
+      kind: 'route-alias',
+      logicalModelId: candidate.upstreamModel,
+      candidates: [candidate]
+    })
+  }
 
   return {
     resolve(modelId) {
-      const routeCandidate = routeAliases.get(modelId)
-      if (routeCandidate) return { requestedModel: modelId, kind: 'route-alias', candidates: [routeCandidate] }
+      const route = routeAliases.get(modelId)
+      if (route) return {
+        requestedModel: modelId,
+        kind: route.kind,
+        logicalModelId: route.logicalModelId,
+        candidates: [...route.candidates]
+      }
       const logicalCandidates = logicalModels.get(modelId)
-      if (logicalCandidates) return { requestedModel: modelId, kind: 'logical', candidates: [...logicalCandidates] }
+      if (logicalCandidates) return { requestedModel: modelId, kind: 'logical', logicalModelId: modelId, candidates: [...logicalCandidates] }
       const exactCandidate = exactAliases.get(modelId)
-      if (exactCandidate) return { requestedModel: modelId, kind: 'direct', candidates: [exactCandidate] }
+      if (exactCandidate) return { requestedModel: modelId, kind: 'direct', logicalModelId: exactCandidate.upstreamModel, candidates: [exactCandidate] }
       const stagedCandidate = stagedExactAliases.get(modelId)
-      if (stagedCandidate) return { requestedModel: modelId, kind: 'staged-direct', candidates: [stagedCandidate] }
+      if (stagedCandidate) return { requestedModel: modelId, kind: 'staged-direct', logicalModelId: stagedCandidate.upstreamModel, candidates: [stagedCandidate] }
       return null
     },
     listPublicModels() {
@@ -92,4 +133,8 @@ function findCandidate(config, candidatesByKey, channelId, upstreamModel) {
   const model = channel.models.find(item => item.upstream === upstreamModel)
   if (!model) return null
   return candidatesByKey.get(`${channel.id}\0${model.upstream}\0${model.protocol}`) ?? null
+}
+
+function findCandidateByModel(candidatesByKey, channelId, upstreamModel) {
+  return [...candidatesByKey.values()].find(candidate => candidate.channelId === channelId && candidate.upstreamModel === upstreamModel) ?? null
 }

@@ -24,17 +24,18 @@ runtime/usage-events.jsonl
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "at": 1776216000000,
   "requestedModel": "coding-main",
   "channelId": "free",
-  "upstreamModel": "gpt-4o",
+  "logicalModelId": "coding-pool",
+  "upstreamModel": "provider-model-a",
   "outcome": "success",
   "transport": "native-passthrough"
 }
 ```
 
-`outcome` 只能是 `success`、`failure` 或 `cancelled`；`transport` 只能是 `native-passthrough`、`adapted` 或 `unassigned`。
+`logicalModelId` 是 catalog 已解析的逻辑组 ID；旧 v1 事件在读取时回退到 `upstreamModel`，因此升级不会丢失现有统计。`outcome` 只能是 `success`、`failure` 或 `cancelled`；`transport` 只能是 `native-passthrough`、`adapted` 或 `unassigned`。
 
 ## 3. Contracts
 
@@ -63,7 +64,7 @@ runtime/usage-events.jsonl
 }
 ```
 
-- `logicalModels` 按原始模型 ID 聚合，跨渠道合并同名模型。
+- `logicalModels` 按 catalog 已解析的逻辑组 ID 聚合；自动同名组仍使用原始模型 ID，显式跨 ID 组使用操作者定义的组 ID。
 - `models` 按客户端请求入口聚合，例如稳定别名、逻辑 ID 或精确渠道 ID。
 - `physicalModels` 按 `<channelId>/<upstreamModel>` 聚合，反映真实渠道表现。
 - `channels` 按物理渠道聚合。
@@ -138,6 +139,7 @@ logs.push({
 usageMonitor.record({
   requestedModel,
   channelId: candidate.channelId,
+  logicalModelId: selection.resolved.logicalModelId,
   upstreamModel: candidate.upstreamModel,
   outcome: 'success',
   transport: 'native-passthrough'

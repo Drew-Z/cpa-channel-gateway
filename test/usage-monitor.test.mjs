@@ -85,6 +85,54 @@ test('usage monitor rejects malformed events and remains in-memory without priva
   assert.equal(monitor.snapshot().storage, 'memory')
 })
 
+test('usage monitor attributes different upstream ids to an explicit logical model', () => {
+  let clock = 1_000
+  const monitor = createUsageMonitor({}, { filePath: null, now: () => clock })
+  monitor.record({
+    requestedModel: 'coding-main',
+    channelId: 'deepseek',
+    logicalModelId: 'coding-pool',
+    upstreamModel: 'DeepSeek-V4-Flash',
+    outcome: 'success',
+    transport: 'native-passthrough'
+  })
+  clock += 1
+  monitor.record({
+    requestedModel: 'coding-pool',
+    channelId: 'glm',
+    logicalModelId: 'coding-pool',
+    upstreamModel: 'glm-5.2',
+    outcome: 'success',
+    transport: 'adapted'
+  })
+
+  const snapshot = monitor.snapshot()
+  assert.deepEqual(snapshot.logicalModels.map(item => [item.id, item.total]), [['coding-pool', 2]])
+  assert.deepEqual(snapshot.physicalModels.map(item => item.id), [
+    'deepseek/DeepSeek-V4-Flash',
+    'glm/glm-5.2'
+  ])
+})
+
+test('usage monitor restores v1 events using their upstream model as the logical id', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-usage-v1-'))
+  const filePath = path.join(root, 'runtime', 'usage-events.jsonl')
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  fs.writeFileSync(filePath, `${JSON.stringify({
+    v: 1,
+    at: 1_000,
+    requestedModel: 'coding-main',
+    channelId: 'legacy',
+    upstreamModel: 'legacy-model',
+    outcome: 'success',
+    transport: 'adapted'
+  })}\n`)
+
+  const snapshot = createUsageMonitor({}, { filePath, now: () => 1_001 }).snapshot()
+  assert.deepEqual(snapshot.logicalModels.map(item => [item.id, item.total]), [['legacy-model', 1]])
+  assert.equal(snapshot.physicalModels[0].id, 'legacy/legacy-model')
+})
+
 test('usage monitor falls back to memory when its private event file is not writable', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-usage-fallback-'))
   const blocker = path.join(root, 'not-a-directory')

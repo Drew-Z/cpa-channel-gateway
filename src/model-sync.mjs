@@ -172,5 +172,8 @@ function referencedModels(routes) {
   return new Set([
     ...(routes.stableAliases ?? []),
     ...(routes.pinnedAliases ?? [])
-  ].map(route => `${route.channel}\0${route.model}`))
+  ].filter(route => route.channel && route.model).map(route => `${route.channel}\0${route.model}`)
+    .concat((routes.logicalModels ?? []).flatMap(group => group.candidates ?? [])
+      .filter(candidate => candidate.channel && candidate.model)
+      .map(candidate => `${candidate.channel}\0${candidate.model}`)))
 }

@@ -21,6 +21,40 @@ test('aggregates exact model ids and selects an idle alternate channel', () => {
   second.release()
 })
 
+test('explicit logical models merge different upstream ids and honor candidate priority', () => {
+  const config = fixtureConfig()
+  config.logicalModels = [{
+    id: 'coding-pool',
+    enabled: true,
+    candidates: [
+      { channel: 'alpha', model: 'other-model', enabled: true, priority: 10 },
+      { channel: 'beta', model: 'shared-model', enabled: true, priority: 200 }
+    ]
+  }]
+  config.stableAliases = [{ alias: 'coding-main', logicalModel: 'coding-pool' }]
+  const scheduler = createModelScheduler(config)
+  const publicIds = scheduler.catalog.listPublicModels().map(item => item.id)
+  assert.ok(publicIds.includes('coding-pool'))
+  assert.ok(publicIds.includes('coding-main'))
+  assert.ok(publicIds.includes('shared-model'))
+  assert.ok(publicIds.includes('alpha/other-model'))
+  assert.equal(scheduler.catalog.resolve('coding-pool').logicalModelId, 'coding-pool')
+  assert.equal(scheduler.catalog.resolve('coding-main').logicalModelId, 'coding-pool')
+  assert.equal(scheduler.catalog.resolve('shared-model').logicalModelId, 'shared-model')
+  assert.equal(scheduler.catalog.resolve('alpha/other-model').logicalModelId, 'other-model')
+
+  const first = scheduler.reserve('coding-pool')
+  assert.equal(first.candidate.channelId, 'beta')
+  const second = scheduler.reserve('coding-main')
+  assert.equal(second.candidate.channelId, 'alpha')
+  first.release()
+  second.release()
+
+  const direct = scheduler.reserve('alpha/other-model')
+  assert.equal(direct.candidate.upstreamModel, 'other-model')
+  direct.release()
+})
+
 test('a direct model id cannot bypass a channel-wide reservation', () => {
   const scheduler = createModelScheduler(fixtureConfig())
   const active = scheduler.reserve('alpha/shared-model')

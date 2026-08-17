@@ -166,8 +166,9 @@ export function diffSnapshots(beforeSnapshot, afterSnapshot) {
   }
 
   const models = diffModels(beforeRoutes, afterRoutes)
+  const logicalModels = diffLogicalModels(beforeRoutes, afterRoutes)
   const aliases = diffAliases(beforeRoutes, afterRoutes)
-  return { channels, models, aliases }
+  return { channels, models, logicalModels, aliases }
 }
 
 function readRevision(revisionRoot, revisionValue) {
@@ -290,6 +291,44 @@ function diffAliases(beforeRoutes, afterRoutes) {
   }
 }
 
+function diffLogicalModels(beforeRoutes, afterRoutes) {
+  const before = logicalModelMap(beforeRoutes)
+  const after = logicalModelMap(afterRoutes)
+  const ids = [...new Set([...before.keys(), ...after.keys()])].sort((left, right) => left.localeCompare(right))
+  const result = { added: [], removed: [], changed: [] }
+  for (const id of ids) {
+    const left = before.get(id)
+    const right = after.get(id)
+    if (!left) result.added.push(id)
+    else if (!right) result.removed.push(id)
+    else {
+      const fields = {}
+      if (left.enabled !== right.enabled) fields.enabledChanged = true
+      if (JSON.stringify(left.candidates) !== JSON.stringify(right.candidates)) fields.candidatesChanged = true
+      if (Object.keys(fields).length) result.changed.push({ id, ...fields })
+    }
+  }
+  return result
+}
+
+function logicalModelMap(routes) {
+  const result = new Map()
+  for (const item of Array.isArray(routes.logicalModels) ? routes.logicalModels : []) {
+    const id = String(item?.id ?? '').trim()
+    if (!id) continue
+    const candidates = (Array.isArray(item.candidates) ? item.candidates : [])
+      .map(candidate => ({
+        channel: String(candidate?.channel ?? '').trim(),
+        model: String(candidate?.model ?? '').trim(),
+        enabled: candidate?.enabled !== false,
+        priority: candidate?.priority ?? 0
+      }))
+      .sort((left, right) => left.channel.localeCompare(right.channel) || left.model.localeCompare(right.model))
+    result.set(id, { enabled: item.enabled !== false, candidates })
+  }
+  return result
+}
+
 function diffAliasList(before = [], after = []) {
   const left = new Map((Array.isArray(before) ? before : []).map(item => [String(item?.alias ?? ''), aliasTarget(item)]))
   const right = new Map((Array.isArray(after) ? after : []).map(item => [String(item?.alias ?? ''), aliasTarget(item)]))
@@ -305,6 +344,7 @@ function diffAliasList(before = [], after = []) {
 }
 
 function aliasTarget(item) {
+  if (item?.logicalModel) return `logical:${String(item.logicalModel).trim()}`
   return `${String(item?.channel ?? '').trim()}/${String(item?.model ?? '').trim()}`
 }
 
@@ -341,7 +381,8 @@ function normalizeAffected(value) {
   const input = value && typeof value === 'object' && !Array.isArray(value) ? value : {}
   return {
     channelIds: normalizeList(input.channelIds, CHANNEL_ID, 100),
-    modelIds: normalizeList(input.modelIds, /^[^\r\n\0]{1,512}$/, 500)
+    modelIds: normalizeList(input.modelIds, /^[^\r\n\0]{1,512}$/, 500),
+    logicalModelIds: normalizeList(input.logicalModelIds, /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}$/, 200)
   }
 }
 
