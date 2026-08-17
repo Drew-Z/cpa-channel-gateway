@@ -570,6 +570,18 @@ export function createControlGateway(config, {
     const snapshot = scheduler.snapshot()
     const configStatus = configManager?.status()
     const routing = configManager?.routing() ?? { stableAliases: config.stableAliases, pinnedAliases: config.pinnedAliases, logicalModels: config.logicalModels ?? [] }
+    const channels = routing.channels ?? config.channels.map(channel => ({
+      id: channel.id,
+      name: channel.name,
+      baseUrl: channel.upstream.toString(),
+      enabled: channel.enabled,
+      staged: channel.staged,
+      runtimeEnabled: channel.runtimeEnabled,
+      protocol: channel.protocol,
+      priority: channel.priority ?? 0,
+      modelCount: channel.models.length,
+      hasApiKey: Boolean(channel.apiKey)
+    }))
     return {
       ready: true,
       configRevision: configStatus?.revision ?? null,
@@ -587,14 +599,17 @@ export function createControlGateway(config, {
       suppressedCandidates: snapshot.suppressedCandidates ?? [],
       lastTests: Object.fromEntries(lastTests),
       controlState: controlState.status(),
-      channels: config.channels.map(channel => ({
+      channels: channels.map(channel => ({
         id: channel.id,
         name: channel.name,
-        baseUrl: channel.upstream.toString(),
+        baseUrl: channel.baseUrl,
         enabled: channel.enabled,
         staged: channel.staged,
         runtimeEnabled: channel.runtimeEnabled,
-        modelCount: channel.models.length,
+        protocol: channel.protocol,
+        priority: channel.priority,
+        modelCount: channel.modelCount,
+        hasApiKey: channel.hasApiKey,
         busy: snapshot.reservations.some(item => item.channelId === channel.id),
         draining: (snapshot.draining ?? []).includes(channel.id),
         health: snapshot.channels[channel.id]?.health ?? 'unknown',

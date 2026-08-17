@@ -118,6 +118,18 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
     routing() {
       const current = loadConfig(root, { allowEmptyEnabledChannels: true })
       return {
+        channels: current.channels.map(channel => ({
+          id: channel.id,
+          name: channel.name,
+          baseUrl: channel.upstream.toString(),
+          enabled: channel.enabled,
+          staged: channel.staged,
+          runtimeEnabled: channel.runtimeEnabled,
+          protocol: channel.protocol,
+          priority: channel.priority ?? 0,
+          modelCount: channel.models.length,
+          hasApiKey: Boolean(channel.apiKey)
+        })),
         stableAliases: current.stableAliases.map(item => item.logicalModel
           ? { alias: item.alias, logicalModel: item.logicalModel }
           : { alias: item.alias, channel: item.channel, model: item.model }),

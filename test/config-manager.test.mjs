@@ -41,6 +41,34 @@ test('channel mutations are private, revisioned, validated, and restart-required
   assert.notEqual(manager.status().loadedRevision, manager.status().pendingRevision)
   assert.equal(loadConfig(root).channels.some(channel => channel.id === 'backup' && !channel.enabled && channel.staged && channel.runtimeEnabled), true)
 
+  const updated = manager.updateChannel('backup', {
+    name: 'Backup Updated',
+    baseUrl: 'https://backup-updated.example.test/v1',
+    apiKey: 'replacement_secret_key_123456',
+    protocol: 'claude',
+    priority: 30
+  })
+  assert.equal(updated.name, 'Backup Updated')
+  assert.equal(updated.protocol, 'claude')
+  assert.equal(updated.priority, 30)
+  assert.equal(updated.hasApiKey, true)
+  assert.equal(JSON.stringify(updated).includes('replacement_secret_key'), false)
+  assert.equal(JSON.stringify(updated).includes('backup-updated.example.test'), false)
+  const pendingChannel = manager.routing().channels.find(channel => channel.id === 'backup')
+  assert.deepEqual(pendingChannel, {
+    id: 'backup',
+    name: 'Backup Updated',
+    baseUrl: 'https://backup-updated.example.test/v1',
+    enabled: false,
+    staged: true,
+    runtimeEnabled: true,
+    protocol: 'claude',
+    priority: 30,
+    modelCount: 0,
+    hasApiKey: true
+  })
+  assert.equal(JSON.stringify(manager.routing()).includes('replacement_secret_key'), false)
+
   assert.throws(
     () => manager.updateChannel('backup', { enabled: true }),
     error => error.code === 'configuration_validation_failed'

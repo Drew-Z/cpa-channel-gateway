@@ -450,7 +450,23 @@ test('channel updates enter drain mode before the pending restart', async t => {
   config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
   const configManager = {
     status: () => ({ revision: 'pending-revision', restartRequired: true }),
-    routing: () => ({ stableAliases: config.stableAliases, pinnedAliases: [], models: [] }),
+    routing: () => ({
+      channels: [{
+        id: 'free',
+        name: 'Pending Free',
+        baseUrl: 'https://pending.example.test/v1',
+        enabled: false,
+        staged: false,
+        runtimeEnabled: false,
+        protocol: 'claude',
+        priority: 42,
+        modelCount: 1,
+        hasApiKey: true
+      }],
+      stableAliases: config.stableAliases,
+      pinnedAliases: [],
+      models: []
+    }),
     updateChannel: id => ({ id, name: 'Free', enabled: false, staged: false, priority: 100, modelCount: 1 })
   }
   const gateway = createControlGateway(config, { configManager })
@@ -469,6 +485,11 @@ test('channel updates enter drain mode before the pending restart', async t => {
   const status = JSON.parse((await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })).body)
   assert.deepEqual(status.draining, ['free'])
   assert.equal(status.channels[0].draining, true)
+  assert.equal(status.channels[0].name, 'Pending Free')
+  assert.equal(status.channels[0].protocol, 'claude')
+  assert.equal(status.channels[0].priority, 42)
+  assert.equal(status.channels[0].hasApiKey, true)
+  assert.doesNotMatch(JSON.stringify(status.channels[0]), /fixture-upstream-key/)
   assert.equal(status.controlJobs.recent.at(-1).type, 'channel-update')
   assert.equal(status.controlJobs.recent.at(-1).status, 'completed')
 })
@@ -684,7 +705,12 @@ test('admin session protects status and runs a redacted exact-model canary', asy
   const status = await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })
   assert.equal(status.statusCode, 200)
   assert.equal(status.headers['cache-control'], 'no-store')
-  assert.equal(JSON.parse(status.body).channels[0].baseUrl, 'https://upstream.example.test/v1')
+  const adminStatus = JSON.parse(status.body)
+  assert.equal(adminStatus.channels[0].baseUrl, 'https://upstream.example.test/v1')
+  assert.equal(adminStatus.channels[0].protocol, 'responses')
+  assert.equal(adminStatus.channels[0].priority, 100)
+  assert.equal(adminStatus.channels[0].hasApiKey, true)
+  assert.doesNotMatch(status.body, /fixture-upstream-key/)
 
   const missingCsrf = await request({
     port: address.port,
@@ -1095,6 +1121,9 @@ test('admin page serves the built app with strict static CSP and immutable asset
   assert.match(asset.body, /客户端连接/)
   assert.match(asset.body, /current-password/)
   assert.match(asset.body, /FormData/)
+  assert.match(asset.body, /编辑渠道/)
+  assert.match(asset.body, /替换 API key/)
+  assert.match(asset.body, /留空保持现有密钥/)
   assert.match(asset.body, /\/admin\/api\/stable-aliases/)
   assert.match(asset.body, /\/admin\/api\/runtime\/apply/)
   assert.match(asset.body, /\/admin\/api\/revisions/)
