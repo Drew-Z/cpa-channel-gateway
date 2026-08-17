@@ -166,6 +166,13 @@ apply 均复用既有 API。桌面/移动布局使用紧凑表格和可访问确
 `npm test` 135/135、`npm run check`、`npm run audit:public` 和静态资源 CSP/缓存集成测试均通过。
 构建产物 `admin/dist/` 随代码发布，翼龙 `index.js` 入口无需额外服务或端口。
 
+生产验收已完成：`AUTO_UPDATE=1` 重启后公开 `/healthz` 返回 `200 {"ready":true}`，
+认证管理台加载新的 React/Vite 资源，运行与待应用 revision 一致、当前预约为 0，
+控制状态显示持久化。五个视图（概览、渠道、模型、路由、变更）均在桌面和 390px
+移动视口打开且无页面级横向溢出；回滚确认对话框可打开并通过 `Escape` 取消。浏览器
+控制台未发现本项目脚本异常；Cloudflare 自动注入的统计脚本被管理台 CSP 拦截，属于
+外部脚本，不影响管理台资源和 API。未执行回滚、配置写入、Renew 或新的上游生成请求。
+
 ### Stage 5: Protocol Matrix and Operational Closeout
 
 - 用 fixture upstream 完整覆盖 Responses SSE/JSON、Chat Completions 流式/非流式、Claude
