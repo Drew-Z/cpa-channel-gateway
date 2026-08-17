@@ -22,6 +22,16 @@
 
 仓库公开后不需要 GitHub 凭据。不要把渠道 API key 填入 Git Username、Git Access Token、Additional Arguments 或可公开的面板描述。
 
+管理台使用仓库内随版本发布的 Vite 构建产物 `admin/dist/`。它由 `index.js` 启动的同一个 Node 进程在 `/admin` 和 `/admin/assets/*` 提供，不需要额外端口、服务或数据库。发布新版本时不要只上传 `admin/src/`；`admin/dist/` 也必须随 Git 提交一起更新。常规本地验证命令为：
+
+```bash
+npm ci
+npm run build:admin
+npm test
+```
+
+翼龙面板的主文件仍保持 `index.js`，不会单独启动 Vite 开发服务器。`AUTO_UPDATE=1` 拉取新提交并重启后，静态管理台和 Node API 会同时更新。
+
 已验证镜像是翼龙的 `Nodejs 22`（Debian 13、非 root 用户）。面板可以切换镜像，但当前运行时安装器还要求 Linux `x64`/`arm64`、Node.js 22 以上、Debian APT 源以及 `apt-get`、`dpkg-deb`、`tar`、`make` 和 C 编译工具链；不满足这些条件的镜像不能视为兼容。
 
 ## 2. 设置端口

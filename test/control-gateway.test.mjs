@@ -4,7 +4,6 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import vm from 'node:vm'
 import { createControlGateway } from '../src/control-gateway.mjs'
 import { createControlState } from '../src/control-state.mjs'
 
@@ -1013,7 +1012,7 @@ test('admin models honor an explicitly empty pending catalog', async t => {
   assert.deepEqual(JSON.parse(models.body).data, [])
 })
 
-test('admin page is no-store and uses a per-response CSP nonce', async t => {
+test('admin page serves the built app with strict static CSP and immutable assets', async t => {
   const config = fixtureConfig(19001)
   config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
   const gateway = createControlGateway(config)
@@ -1023,46 +1022,22 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   const second = await request({ port: address.port, method: 'GET', path: '/admin' })
   assert.equal(first.statusCode, 200)
   assert.equal(first.headers['cache-control'], 'no-store')
-  assert.match(first.headers['content-security-policy'], /script-src 'nonce-/)
-  assert.notEqual(first.headers['content-security-policy'], second.headers['content-security-policy'])
-  assert.match(first.body, /id="addChannelForm"/)
-  assert.match(first.body, /新增并同步模型/)
-  assert.match(first.body, /<select id="syncChannelIds"/)
-  assert.match(first.body, /<select id="model"/)
-  assert.match(first.body, /设为 coding-main/)
-  assert.match(first.body, /\/admin\/api\/stable-aliases/)
-  assert.match(first.body, /method:'PATCH'/)
-  assert.match(first.body, /healthLabel/)
-  assert.match(first.body, /candidate\.channel\+'\/'/)
-  assert.match(first.body, /请先从下拉框选择一个精确模型/)
-  assert.match(first.body, /忙碌、熔断或已禁用模型不能测活/)
-  assert.match(first.body, /id="usage"/)
-  assert.match(first.body, /channel-discovery/)
-  assert.match(first.body, /\/admin\/api\/usage/)
-  assert.match(first.body, /\/admin\/api\/model-sync/)
-  assert.match(first.body, /待测试渠道/)
-  assert.match(first.body, /<th>Base URL<\/th>/)
-  assert.match(first.body, /mode:'same-origin'/)
-  assert.match(first.body, /headers\['x-csrf-token'\]=csrf/)
-  assert.match(first.body, /客户端连接/)
-  assert.match(first.body, /id="applyButton"/)
-  assert.match(first.body, /\/admin\/api\/runtime\/apply/)
-  assert.match(first.body, /id="changes"/)
-  assert.match(first.body, /\/admin\/api\/revisions\?limit=20/)
-  assert.match(first.body, /\/admin\/api\/audit-events\?limit=20/)
-  assert.match(first.body, /rollbackSelectedRevision/)
-  assert.match(first.body, /confirmRevision/)
-  assert.match(first.body, /apiKeyReplaced/)
-  assert.match(first.body, /id="logicalModelSelect"/)
-  assert.match(first.body, /\/admin\/api\/logical-models/)
-  assert.match(first.body, /setLogicalStableAlias/)
-  assert.match(first.body, /候选优先级/)
-  assert.match(first.body, /复制 Base URL/)
-  assert.match(first.body, /复制 API key/)
+  assert.match(first.headers['content-security-policy'], /script-src 'self'/)
+  assert.equal(first.headers['content-security-policy'], second.headers['content-security-policy'])
+  assert.match(first.body, /\/admin\/assets\/index-[A-Za-z0-9_-]+\.js/)
+  assert.match(first.body, /\/admin\/assets\/index-[A-Za-z0-9_-]+\.css/)
+  assert.doesNotMatch(first.body, /management_key|gateway_key|upstream-key/)
+  const assetPath = /src="([^\"]+\.js)"/.exec(first.body)?.[1]
+  assert.ok(assetPath)
+  const asset = await request({ port: address.port, method: 'GET', path: assetPath })
+  assert.equal(asset.statusCode, 200)
+  assert.match(asset.headers['cache-control'], /immutable/)
+  assert.match(asset.headers['content-security-policy'], /default-src 'none'/)
+  assert.match(asset.body, /客户端连接/)
+  assert.match(asset.body, /\/admin\/api\/stable-aliases/)
+  assert.match(asset.body, /\/admin\/api\/runtime\/apply/)
+  assert.match(asset.body, /\/admin\/api\/revisions/)
   assert.doesNotMatch(first.body, new RegExp(GATEWAY_KEY))
-  const script = /<script nonce="[^"]+">([\s\S]+)<\/script>/.exec(first.body)?.[1]
-  assert.ok(script)
-  assert.doesNotThrow(() => new vm.Script(script))
 })
 
 test('rate limits repeated failed admin logins', async t => {

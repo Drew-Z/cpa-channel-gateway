@@ -158,6 +158,14 @@ Node 进程在 `/admin` 提供，不增加服务、数据库或公网端口。
 验收条件：日常渠道、模型、路由、变更和回滚操作无需手改文件；页面首屏不是营销页，
 无嵌套卡片和密钥泄露；构建后仍保持单端口部署。
 
+本地实现已完成：管理台已迁移到 Vite + React + TypeScript，使用 `lucide-react`，由同一
+Node 进程提供 `/admin` 和带 immutable 缓存的 `/admin/assets/*`；登录、CSRF、连接信息、
+渠道发现与同步、固定诗词测活、模型状态、逻辑模型、别名、Changes diff/rollback 和运行时
+apply 均复用既有 API。桌面/移动布局使用紧凑表格和可访问确认对话框，API key 仍按需取回
+并在 30 秒后重新掩码，渠道密钥保持只写。`npm run build:admin`、TypeScript 检查、
+`npm test` 135/135、`npm run check`、`npm run audit:public` 和静态资源 CSP/缓存集成测试均通过。
+构建产物 `admin/dist/` 随代码发布，翼龙 `index.js` 入口无需额外服务或端口。
+
 ### Stage 5: Protocol Matrix and Operational Closeout
 
 - 用 fixture upstream 完整覆盖 Responses SSE/JSON、Chat Completions 流式/非流式、Claude
