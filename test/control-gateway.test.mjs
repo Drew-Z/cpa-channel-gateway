@@ -1160,6 +1160,28 @@ test('rate limits repeated failed admin logins', async t => {
   assert.ok(Number(limited.headers['retry-after']) > 0)
 })
 
+test('bounds failed login sources without blocking a valid management key', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const gateway = createControlGateway(config, {
+    adminLoginSourceLimit: 2,
+    adminClientKey: request => request.headers['x-fixture-client'] ?? 'unknown'
+  })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const first = await request({ port: address.port, path: '/admin/api/session', headers: { 'x-fixture-client': 'first' }, body: { key: 'wrong-key' } })
+  const second = await request({ port: address.port, path: '/admin/api/session', headers: { 'x-fixture-client': 'second' }, body: { key: 'wrong-key' } })
+  const overflow = await request({ port: address.port, path: '/admin/api/session', headers: { 'x-fixture-client': 'overflow' }, body: { key: 'wrong-key' } })
+  const valid = await request({ port: address.port, path: '/admin/api/session', headers: { 'x-fixture-client': 'overflow' }, body: { key: config.managementKey } })
+
+  assert.equal(first.statusCode, 401)
+  assert.equal(second.statusCode, 401)
+  assert.equal(overflow.statusCode, 429)
+  assert.equal(JSON.parse(overflow.body).error.code, 'admin_login_rate_limited')
+  assert.equal(valid.statusCode, 200)
+})
+
 test('bounds active admin sessions and evicts the oldest login', async t => {
   const config = fixtureConfig(19001)
   config.managementKey = 'fixture_management_key_that_is_long_enough_123456'

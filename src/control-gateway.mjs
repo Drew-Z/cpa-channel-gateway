@@ -28,6 +28,7 @@ const ADMIN_SESSION_LIMIT = 64
 const ADMIN_TEST_COOLDOWN_MS = 5_000
 const ADMIN_LOGIN_WINDOW_MS = 5 * 60 * 1000
 const ADMIN_LOGIN_MAX_FAILURES = 5
+const ADMIN_LOGIN_SOURCE_LIMIT = 1024
 const CANARY_PROMPT = '请写一首四句七言绝句，主题是秋夜读书。只输出诗题和诗句。'
 
 export function createControlGateway(config, {
@@ -41,12 +42,18 @@ export function createControlGateway(config, {
   runtimeManager = null,
   auditStore: auditStoreOption = null,
   monotonicNow = () => performance.now(),
-  adminSessionLimit = ADMIN_SESSION_LIMIT
+  adminSessionLimit = ADMIN_SESSION_LIMIT,
+  adminLoginSourceLimit = ADMIN_LOGIN_SOURCE_LIMIT,
+  adminClientKey = request => request.socket.remoteAddress ?? 'unknown'
 } = {}) {
   const sessions = new Map()
   const sessionLimit = Number.isSafeInteger(adminSessionLimit) && adminSessionLimit > 0
     ? adminSessionLimit
     : ADMIN_SESSION_LIMIT
+  const loginSourceLimit = Number.isSafeInteger(adminLoginSourceLimit) && adminLoginSourceLimit > 0
+    ? adminLoginSourceLimit
+    : ADMIN_LOGIN_SOURCE_LIMIT
+  if (typeof adminClientKey !== 'function') throw new TypeError('An admin client key resolver is required')
   const loginFailures = new Map()
   const auditStore = auditStoreOption ?? createAuditEventStore(config)
   const controlJobs = createControlJobQueue({
@@ -392,7 +399,7 @@ export function createControlGateway(config, {
     const now = Date.now()
     pruneSessions(now)
     pruneLoginFailures(now)
-    const clientKey = request.socket.remoteAddress ?? 'unknown'
+    const clientKey = String(adminClientKey(request) ?? 'unknown').slice(0, 128)
     const prior = loginFailures.get(clientKey)
     if (prior?.blockedUntil > now) {
       const error = publicError('admin_login_rate_limited', 429, 'Too many failed admin logins; try again later')
@@ -401,6 +408,11 @@ export function createControlGateway(config, {
     }
     const provided = typeof body.key === 'string' ? body.key : ''
     if (!safeEqual(provided, config.managementKey)) {
+      if (!prior && loginFailures.size >= loginSourceLimit) {
+        const error = publicError('admin_login_rate_limited', 429, 'Too many failed admin logins; try again later')
+        error.retryAfterMs = ADMIN_LOGIN_WINDOW_MS
+        throw error
+      }
       const failures = prior?.windowStartedAt > now - ADMIN_LOGIN_WINDOW_MS ? (prior.failures + 1) : 1
       loginFailures.set(clientKey, {
         failures,

@@ -62,7 +62,7 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 ## Admin UI
 
-管理台状态同时返回 `loadedRevision`（当前进程已加载）和 `pendingRevision`（磁盘私有配置当前 revision）。两者不同表示配置已写入但必须重启；管理台会继续允许批量路由调整，但会禁用模型测活，避免用旧进程验证新配置。渠道目录使用待应用私有配置的脱敏摘要，因此连续编辑不会用旧运行值覆盖尚未应用的修改。失败登录按来源地址做短时限速，会返回 `429 admin_login_rate_limited` 和 `Retry-After`；会话只保存在内存并主动清理过期条目，同时最多保留 64 个有效会话。
+管理台状态同时返回 `loadedRevision`（当前进程已加载）和 `pendingRevision`（磁盘私有配置当前 revision）。两者不同表示配置已写入但必须重启；管理台会继续允许批量路由调整，但会禁用模型测活，避免用旧进程验证新配置。渠道目录使用待应用私有配置的脱敏摘要，因此连续编辑不会用旧运行值覆盖尚未应用的修改。失败登录按来源地址做短时限速，会返回 `429 admin_login_rate_limited` 和 `Retry-After`；来源桶最多保留 1024 个，容量耗尽只拒绝新的错误密钥，正确管理密钥仍可登录。会话只保存在内存并主动清理过期条目，同时最多保留 64 个有效会话。
 
 `CPA_MANAGEMENT_KEY` 是独立于 `GATEWAY_API_KEY` 的本地管理密钥，长度至少 32 个字符；为空时 `/admin` 返回 404。启用后，管理员在同一公网端口访问 `/admin`，登录会建立仅存于内存的 HttpOnly/Secure/SameSite 会话。管理 API 的变更请求还需要匹配会话 CSRF token 和同源 `Origin`。
 
