@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
+import { performance } from 'node:perf_hooks'
 import { createAuditEventStore } from './audit-events.mjs'
 import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol } from './canary.mjs'
 import { ConfigMutationError, createPrivateConfigManager } from './config-manager.mjs'
@@ -36,7 +37,8 @@ export function createControlGateway(config, {
   usageMonitor = createUsageMonitor(config),
   configManager = createPrivateConfigManager(config),
   runtimeManager = null,
-  auditStore: auditStoreOption = null
+  auditStore: auditStoreOption = null,
+  monotonicNow = () => performance.now()
 } = {}) {
   const sessions = new Map()
   const loginFailures = new Map()
@@ -429,7 +431,7 @@ export function createControlGateway(config, {
     }
     const selection = scheduler.reserve(requestedModel, { source: 'manual-test', streaming: 'non-stream' })
     lastTestStarted.set(requestedModel, Date.now())
-    const startedAt = Date.now()
+    const startedAt = monotonicNow()
     const protocol = normalizeCanaryProtocol(selection.candidate.protocol)
     const requestShape = buildCanaryRequest(protocol, selection.candidate.upstreamModel, CANARY_PROMPT)
     const transport = protocol === 'responses' && selection.candidate.protocol === 'responses'
@@ -450,6 +452,7 @@ export function createControlGateway(config, {
           incomingHeaders: canaryHeaders(protocol)
         })
       } catch {
+        scheduler.recordTransportError(selection, elapsedMs(startedAt))
         return rememberTest(requestedModel, {
           ok: false,
           status: 'failed',
@@ -457,10 +460,16 @@ export function createControlGateway(config, {
           statusCode: null,
           protocol: selection.candidate.protocol,
           transport,
-          latencyMs: Date.now() - startedAt
+          latencyMs: elapsedMs(startedAt)
         })
       }
-      scheduler.recordOutcome(selection, result.statusCode, result.headers)
+      const durationMs = elapsedMs(startedAt)
+      scheduler.recordOutcome(selection, {
+        kind: result.statusCode >= 200 && result.statusCode < 300 ? 'success' : 'http-failure',
+        transient: result.statusCode >= 500,
+        statusCode: result.statusCode,
+        durationMs
+      }, result.headers)
       if (result.statusCode < 200 || result.statusCode >= 300) {
         return rememberTest(requestedModel, {
           ok: false,
@@ -469,7 +478,7 @@ export function createControlGateway(config, {
           statusCode: result.statusCode,
           protocol: selection.candidate.protocol,
           transport,
-          latencyMs: Date.now() - startedAt
+          latencyMs: durationMs
         })
       }
       let parsed
@@ -483,7 +492,7 @@ export function createControlGateway(config, {
           statusCode: result.statusCode,
           protocol: selection.candidate.protocol,
           transport,
-          latencyMs: Date.now() - startedAt
+          latencyMs: durationMs
         })
       }
       return rememberTest(requestedModel, {
@@ -492,7 +501,7 @@ export function createControlGateway(config, {
         statusCode: result.statusCode,
         protocol: selection.candidate.protocol,
         transport,
-        latencyMs: Date.now() - startedAt,
+        latencyMs: durationMs,
         contentLength: content.trim().length
       })
     } finally {
@@ -542,10 +551,7 @@ export function createControlGateway(config, {
         }))
       })
       upstreamRequest.setTimeout(config.gateway.timeouts.serverSeconds * 1000, () => upstreamRequest.destroy(new Error('Upstream request timed out')))
-      upstreamRequest.once('error', error => {
-        scheduler.recordTransportError(selection)
-        reject(error)
-      })
+      upstreamRequest.once('error', error => reject(error))
       upstreamRequest.end(payload)
     })
   }
@@ -672,6 +678,9 @@ export function createControlGateway(config, {
             busy: loaded ? scheduler.reservations.isBusy(model.channel) : false,
             draining: scheduler.isChannelDraining?.(model.channel) ?? false,
             suppressed: scheduler.isCandidateSuppressed?.(model.channel, model.model) ?? false,
+            scheduling: loaded
+              ? scheduler.candidateStatus?.(loaded) ?? null
+              : { evidence: null, reasonCodes: ['configuration-pending-restart'] },
             lastTest: lastTests.get(directId) ?? null
           }
         })
@@ -690,6 +699,7 @@ export function createControlGateway(config, {
           busy: scheduler.reservations.isBusy(candidate.channelId),
           draining: scheduler.isChannelDraining?.(candidate.channelId) ?? false,
           suppressed: scheduler.isCandidateSuppressed?.(candidate.channelId, candidate.upstreamModel) ?? false,
+          scheduling: scheduler.candidateStatus?.(candidate) ?? null,
           lastTest: lastTests.get(candidate.directAlias) ?? null
         }))
     const groups = new Map()
@@ -714,6 +724,7 @@ export function createControlGateway(config, {
   function proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel }) {
     return new Promise(resolve => {
       const payload = Buffer.from(JSON.stringify(outboundBody))
+      const startedAt = monotonicNow()
       const native = transport === 'native-passthrough'
       const target = native
         ? {
@@ -732,9 +743,15 @@ export function createControlGateway(config, {
       let completed = false
       let clientClosed = false
       let upstreamRequest
-      const finish = outcome => {
+      let upstreamStatusCode = null
+      let upstreamResponseHeaders = {}
+      const finish = (outcome, observation = null) => {
         if (completed) return
         completed = true
+        if (observation) scheduler.recordOutcome(selection, {
+          ...observation,
+          durationMs: observation.durationMs ?? elapsedMs(startedAt)
+        }, upstreamResponseHeaders)
         usageMonitor.record({
           requestedModel,
           channelId: selection.candidate.channelId,
@@ -762,14 +779,30 @@ export function createControlGateway(config, {
         headers
       }, upstreamResponse => {
         const statusCode = upstreamResponse.statusCode ?? 502
-        scheduler.recordOutcome(selection, statusCode, upstreamResponse.headers)
+        upstreamStatusCode = statusCode
+        upstreamResponseHeaders = upstreamResponse.headers
         const responseHeaders = filteredResponseHeaders(upstreamResponse.headers)
         response.writeHead(statusCode, responseHeaders)
-        upstreamResponse.once('end', () => finish(statusCode >= 200 && statusCode < 300 ? 'success' : 'failure'))
-        upstreamResponse.once('close', () => finish('failure'))
+        upstreamResponse.once('end', () => finish(
+          statusCode >= 200 && statusCode < 300 ? 'success' : 'failure',
+          {
+            kind: statusCode >= 200 && statusCode < 300 ? 'success' : 'http-failure',
+            statusCode,
+            transient: statusCode >= 500
+          }
+        ))
+        upstreamResponse.once('close', () => finish('failure', {
+          kind: 'transport-failure',
+          transient: true,
+          statusCode: upstreamStatusCode
+        }))
         upstreamResponse.once('error', error => {
           if (!clientClosed) response.destroy(error)
-          finish('failure')
+          finish('failure', {
+            kind: 'transport-failure',
+            transient: true,
+            statusCode: upstreamStatusCode
+          })
         })
         upstreamResponse.pipe(response)
       })
@@ -780,14 +813,18 @@ export function createControlGateway(config, {
       })
       upstreamRequest.once('error', error => {
         if (!clientClosed) {
-          scheduler.recordTransportError(selection)
           if (!response.headersSent) sendJson(response, 502, { error: { code: 'upstream_unavailable', message: 'Upstream request failed' } })
           else response.destroy(error)
         }
-        finish('failure')
+        finish('failure', { kind: 'transport-failure', transient: true })
       })
       upstreamRequest.end(payload)
     })
+  }
+
+  function elapsedMs(startedAt) {
+    const duration = monotonicNow() - startedAt
+    return Number.isFinite(duration) ? Math.max(0, Math.round(duration)) : 0
   }
 
   return {
@@ -1032,7 +1069,7 @@ function changeFieldLabel(value){return ({nameChanged:'名称',baseUrlChanged:'B
 async function rollbackSelectedRevision(){const revision=$('revisionSelect').value;if(!revision||!confirm('确认回滚到 revision '+revision+'？运行请求会先排空。'))return;const button=$('revisionRollbackButton');const output=$('changeDiff');button.disabled=true;output.className='muted';output.textContent='正在排空请求并回滚…';try{const data=await call('/admin/api/revisions/'+encodeURIComponent(revision)+'/rollback',{method:'POST',body:JSON.stringify({confirmRevision:revision})});output.className='ok';output.textContent=data.changed?'回滚完成，运行 revision '+data.revision:'当前配置已与目标 revision 一致';await refresh()}catch(e){output.className='error';output.textContent=e.message}finally{button.disabled=false}}
 function populateSyncChannelSelect(channels){const select=$('syncChannelIds');const previous=select.value;select.replaceChildren(new Option('全部生产渠道',''));for(const channel of channels.slice().sort((left,right)=>left.id.localeCompare(right.id))){const state=channel.staged?'待测试':channel.enabled?'生产启用':'已停用';select.add(new Option(channel.id+' ['+state+']',channel.id))}if(channels.some(channel=>channel.id===previous))select.value=previous}
 function healthLabel(value){return ({healthy:'健康',unknown:'未测试',degraded:'降级',cooling:'冷却中','auth-failed':'认证失败','payment-blocked':'支付受限'}[value]||value||'未测试')}
-function populateModelSelect(groups){const select=$('model');const previous=select.value;select.replaceChildren(new Option('请选择要测试或管理的精确模型',''));const candidates=groups.flatMap(group=>group.candidates||[]).filter((candidate,index,list)=>list.findIndex(item=>item.directId===candidate.directId)===index).sort((left,right)=>left.channel.localeCompare(right.channel)||left.upstreamModel.localeCompare(right.upstreamModel));modelCandidates=new Map();const byChannel=new Map();for(const candidate of candidates){const optionGroup=byChannel.get(candidate.channel)||(()=>{const created=document.createElement('optgroup');created.label=candidate.channel;select.append(created);byChannel.set(candidate.channel,created);return created})();const states=[modelKindLabel(candidate.kind),streamingLabel(candidate.streaming)];if(candidate.staged)states.push('待测试');if(candidate.channelEnabled===false&&!candidate.staged)states.push('已停用');if(candidate.status==='stale')states.push('stale');if(candidate.status==='disabled')states.push('已禁用');if(candidate.busy)states.push('当前忙碌');if(candidate.draining)states.push('排空中');if(candidate.suppressed)states.push('配置待应用');const directId=candidate.directId||candidate.channel+'/'+candidate.upstreamModel;modelCandidates.set(directId,candidate);const option=new Option(directId+' ['+states.join('，')+']',directId);option.title=directId;optionGroup.append(option)}if(modelCandidates.has(previous))select.value=previous;updateModelButtons();$('testHint').textContent=restartRequired?'配置已更新；仍可继续调整路由，重启后再执行模型测活':candidates.length?'请选择一个精确模型；忙碌或已禁用模型不能测活；仅生成型且具备测活资格的模型可执行固定任务':'暂无模型，请先同步模型目录'}
+ function populateModelSelect(groups){const select=$('model');const previous=select.value;select.replaceChildren(new Option('请选择要测试或管理的精确模型',''));const candidates=groups.flatMap(group=>group.candidates||[]).filter((candidate,index,list)=>list.findIndex(item=>item.directId===candidate.directId)===index).sort((left,right)=>left.channel.localeCompare(right.channel)||left.upstreamModel.localeCompare(right.upstreamModel));modelCandidates=new Map();const byChannel=new Map();for(const candidate of candidates){const optionGroup=byChannel.get(candidate.channel)||(()=>{const created=document.createElement('optgroup');created.label=candidate.channel;select.append(created);byChannel.set(candidate.channel,created);return created})();const states=[modelKindLabel(candidate.kind),streamingLabel(candidate.streaming)];const reasons=candidate.scheduling?.reasonCodes||[];if(candidate.staged)states.push('待测试');if(candidate.channelEnabled===false&&!candidate.staged)states.push('已停用');if(candidate.status==='stale')states.push('stale');if(candidate.status==='disabled')states.push('已禁用');if(candidate.busy||reasons.includes('channel-busy'))states.push('当前忙碌');if(candidate.draining||reasons.includes('channel-draining'))states.push('排空中');if(candidate.suppressed||reasons.includes('configuration-pending-restart'))states.push('配置待应用');if(reasons.includes('circuit-open'))states.push('熔断中');if(reasons.includes('half-open-ready'))states.push('半开恢复');const directId=candidate.directId||candidate.channel+'/'+candidate.upstreamModel;modelCandidates.set(directId,candidate);const option=new Option(directId+' ['+states.join('，')+']',directId);option.title=directId;optionGroup.append(option)}if(modelCandidates.has(previous))select.value=previous;updateModelButtons();$('testHint').textContent=restartRequired?'配置已更新；仍可继续调整路由，重启后再执行模型测活':candidates.length?'请选择一个精确模型；忙碌、熔断或已禁用模型不能测活；仅生成型且具备测活资格的模型可执行固定任务':'暂无模型，请先同步模型目录'}
 function renderLogicalModels(groups){const select=$('logicalModelSelect');const preferred=select.dataset.preferred||select.value;delete select.dataset.preferred;logicalGroups=(groups||[]).map(group=>({...group,candidates:(group.candidates||[]).map(candidate=>({...candidate}))})).sort((left,right)=>left.id.localeCompare(right.id));select.replaceChildren(new Option('新建逻辑模型',''));for(const group of logicalGroups)select.add(new Option(group.id+(group.enabled===false?' [已禁用]':''),group.id));if(logicalGroups.some(group=>group.id===preferred))select.value=preferred;const candidateSelect=$('logicalCandidateSelect');const previousCandidate=candidateSelect.value;candidateSelect.replaceChildren(new Option('请选择精确模型',''));for(const candidate of [...modelCandidates.values()].filter(item=>item.kind==='generation'&&item.status!=='disabled').sort((left,right)=>left.directId.localeCompare(right.directId)))candidateSelect.add(new Option(candidate.directId,candidate.directId));if(modelCandidates.has(previousCandidate))candidateSelect.value=previousCandidate;loadLogicalModel()}
 function loadLogicalModel(){const selected=logicalGroups.find(group=>group.id===$('logicalModelSelect').value);$('logicalModelId').value=selected?.id||'';$('logicalModelId').disabled=Boolean(selected);$('logicalModelEnabled').checked=selected?.enabled!==false;logicalDraftCandidates=(selected?.candidates||[]).map(candidate=>({...candidate}));$('deleteLogicalModelButton').disabled=!selected;$('setLogicalMainButton').disabled=!selected||selected.enabled===false;$('setLogicalBackupButton').disabled=!selected||selected.enabled===false;renderLogicalCandidates()}
 function renderLogicalCandidates(){const container=$('logicalCandidates');if(!logicalDraftCandidates.length){container.innerHTML='<p class="muted">尚未添加候选。</p>';return}container.innerHTML='<table><tr><th>精确候选</th><th>启用</th><th>优先级</th><th>操作</th></tr>'+logicalDraftCandidates.map((candidate,index)=>'<tr><td><code>'+esc(candidate.channel+'/'+candidate.model)+'</code></td><td><input class="logicalCandidateEnabled" data-index="'+index+'" type="checkbox" '+(candidate.enabled!==false?'checked':'')+'></td><td><input class="logicalCandidatePriority" data-index="'+index+'" type="number" step="1" value="'+Number(candidate.priority||0)+'"></td><td><button class="removeLogicalCandidate secondary" data-index="'+index+'" type="button">移除</button></td></tr>').join('')+'</table>';container.onchange=e=>{const index=Number(e.target.dataset.index);if(!Number.isSafeInteger(index)||!logicalDraftCandidates[index])return;if(e.target.classList.contains('logicalCandidateEnabled'))logicalDraftCandidates[index].enabled=e.target.checked;if(e.target.classList.contains('logicalCandidatePriority')){const priority=Number(e.target.value);if(Number.isSafeInteger(priority))logicalDraftCandidates[index].priority=priority}};container.onclick=e=>{const button=e.target.closest('.removeLogicalCandidate');if(!button)return;logicalDraftCandidates.splice(Number(button.dataset.index),1);renderLogicalCandidates()}}
@@ -1042,10 +1079,12 @@ async function saveLogicalModel(){const result=$('logicalResult');const id=$('lo
 async function deleteLogicalModel(){const id=$('logicalModelSelect').value;const result=$('logicalResult');if(!id||!confirm('确认删除逻辑模型 '+id+'？'))return;try{const data=await call('/admin/api/logical-models/'+encodeURIComponent(id),{method:'DELETE'});$('logicalModelSelect').dataset.preferred='';result.className='ok';result.textContent='已删除 '+id+'，revision '+data.revision+'；应用配置后生效';await refresh()}catch(e){result.className='error';result.textContent=e.message}}
 async function setLogicalStableAlias(alias){const id=$('logicalModelSelect').value;const result=$('logicalResult');if(!id)return;try{const data=await call('/admin/api/stable-aliases',{method:'PUT',body:JSON.stringify({alias,logicalModel:id})});result.className='ok';result.textContent='已将 '+alias+' 固定指向逻辑模型 '+id+'，revision '+data.revision+'；应用配置后生效';await refresh()}catch(e){result.className='error';result.textContent=e.message}}
 function selectedModel(){return modelCandidates.get($('model').value)}
-function updateModelButtons(){const candidate=selectedModel();const unavailable=!candidate;const disabled=candidate?.status==='disabled';const generation=candidate?.kind==='generation';const canary=generation&&candidate?.canaryEligible!==false;$('testButton').disabled=restartRequired||unavailable||disabled||Boolean(candidate?.busy)||Boolean(candidate?.draining)||Boolean(candidate?.suppressed)||!canary;$('setMainButton').disabled=unavailable||disabled||!generation;$('setBackupButton').disabled=unavailable||disabled||!generation;$('toggleModelButton').disabled=unavailable;$('toggleModelButton').textContent=disabled?'恢复模型':'禁用模型'}
+ function updateModelButtons(){const candidate=selectedModel();const unavailable=!candidate;const disabled=candidate?.status==='disabled';const generation=candidate?.kind==='generation';const canary=generation&&candidate?.canaryEligible!==false;const blockedReasons=['channel-busy','channel-draining','configuration-pending-restart','channel-auth-failed','channel-payment-blocked','channel-cooling','candidate-misconfigured','circuit-open','half-open-busy'];const blocked=Boolean(candidate?.scheduling?.reasonCodes?.some(code=>blockedReasons.includes(code)));$('testButton').disabled=restartRequired||unavailable||disabled||Boolean(candidate?.busy)||Boolean(candidate?.draining)||Boolean(candidate?.suppressed)||blocked||!canary;$('setMainButton').disabled=unavailable||disabled||!generation;$('setBackupButton').disabled=unavailable||disabled||!generation;$('toggleModelButton').disabled=unavailable;$('toggleModelButton').textContent=disabled?'恢复模型':'禁用模型'}
 function modelKindLabel(value){return ({generation:'生成',embedding:'向量',rerank:'重排',audio:'音频',image:'图像',video:'视频',ocr:'OCR',moderation:'审核'}[value]||value||'生成')}
 function streamingLabel(value){return ({both:'流式/非流式', 'stream-only':'仅流式', 'non-stream-only':'仅非流式'}[value]||'流式/非流式')}
-function modelsHtml(groups){const rows=groups.flatMap(group=>group.candidates||[]);if(!rows.length)return '<p class="muted">暂无模型目录。</p>';return '<table><tr><th>精确模型</th><th>类型</th><th>请求模式</th><th>状态</th><th>测活</th></tr>'+rows.map(item=>'<tr><td><code>'+esc(item.directId)+'</code></td><td>'+esc(modelKindLabel(item.kind))+'</td><td>'+esc(streamingLabel(item.streaming))+'</td><td>'+esc(item.draining?'排空中':item.suppressed?'配置待应用':item.staged?'待测试':item.channelEnabled===false?'已停用':item.status||'active')+'</td><td>'+esc(item.canaryEligible&&item.kind==='generation'?'可用':'不适用')+'</td></tr>').join('')+'</table>'}
+ function modelsHtml(groups){const rows=groups.flatMap(group=>group.candidates||[]);if(!rows.length)return '<p class="muted">暂无模型目录。</p>';return '<table><tr><th>精确模型</th><th>类型</th><th>请求模式</th><th>状态</th><th>运行证据</th><th>调度原因</th><th>测活</th></tr>'+rows.map(item=>'<tr><td><code>'+esc(item.directId)+'</code></td><td>'+esc(modelKindLabel(item.kind))+'</td><td>'+esc(streamingLabel(item.streaming))+'</td><td>'+esc(item.draining?'排空中':item.suppressed?'配置待应用':item.staged?'待测试':item.channelEnabled===false?'已停用':item.status||'active')+'</td><td>'+esc(evidenceText(item.scheduling?.evidence))+'</td><td>'+esc(reasonText(item.scheduling?.reasonCodes))+'</td><td>'+esc(item.canaryEligible&&item.kind==='generation'?'可用':'不适用')+'</td></tr>').join('')+'</table>'}
+ function evidenceText(value){if(!value||!value.sampleCount)return '暂无样本';const rateText=value.successRate===null?'—':(value.successRate*100).toFixed(1)+'%';const circuit=value.circuit==='open'?'熔断中':value.circuit==='half-open'?'半开恢复':'闭合';const latency=value.ewmaLatencyMs===null?'—':formatLatency(value.ewmaLatencyMs);return value.sampleCount+' 次，成功 '+value.successCount+'，失败 '+value.failureCount+'，成功率 '+rateText+'，EWMA '+latency+'，'+circuit}
+ function reasonText(values){const labels={priority:'优先级', 'better-success-rate':'成功率更高', 'lower-ewma-latency':'延迟更低', 'channel-cooling':'渠道冷却中', 'channel-auth-failed':'认证失败', 'channel-payment-blocked':'支付受限', 'channel-busy':'渠道忙碌', 'channel-draining':'渠道排空中', 'candidate-misconfigured':'候选配置错误', 'circuit-open':'候选熔断中', 'half-open-busy':'半开试运行忙碌', 'half-open-ready':'等待半开试运行', 'staged-manual-only':'仅允许手动测活', 'configuration-pending-restart':'等待应用配置', 'candidate-ready':'可调度'};return (values||[]).map(value=>labels[value]||value).join('、')||'—'}
 function routingHtml(aliases){if(!aliases.length)return '<p class="muted">尚未配置稳定别名。</p>';return '<h3>稳定别名</h3><table><tr><th>别名</th><th>当前目标</th></tr>'+aliases.map(item=>'<tr><td><code>'+esc(item.alias)+'</code></td><td><code>'+esc(item.logicalModel?'logical:'+item.logicalModel:item.channel+'/'+item.model)+'</code></td></tr>').join('')+'</table>'}
 function channelState(c){return c.draining?'排空中':c.staged?'待测试':c.enabled?'生产启用':'已停用'}
 function channelActions(c){const id=esc(c.id);let actions='';if(c.staged)actions='<button class="channelAction" data-id="'+id+'" data-mode="production">设为生产</button> <button class="channelAction secondary" data-id="'+id+'" data-mode="disabled">移出待测</button>';else if(c.enabled)actions='<button class="channelAction secondary" data-id="'+id+'" data-mode="disabled">停用</button>';else actions='<button class="channelAction" data-id="'+id+'" data-mode="staged">设为待测试</button> <button class="channelAction secondary" data-id="'+id+'" data-mode="production">直接启用</button>';if(!c.enabled&&!c.staged&&!c.busy)actions+=' <button class="deleteChannel secondary" data-id="'+id+'">删除</button>';return actions}

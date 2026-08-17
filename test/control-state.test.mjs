@@ -143,6 +143,73 @@ test('restores a prior release state snapshot after a failed runtime reload', t 
   assert.equal(state.lastTests()['alpha/shared-model'].status, 'success')
 })
 
+test('migrates v1 blockers to v2 and starts evidence empty', t => {
+  const root = temporaryRoot(t)
+  const filePath = path.join(root, 'runtime', 'control-state.json')
+  const config = fixtureConfig(root)
+  const timestamp = 2_000
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  fs.writeFileSync(filePath, JSON.stringify({
+    v: 1,
+    configRevision: 'release-a',
+    updatedAt: new Date(timestamp).toISOString(),
+    channels: { alpha: { health: 'auth-failed', updatedAt: timestamp } },
+    candidates: { ['alpha\0shared-model\0responses']: { health: 'misconfigured', updatedAt: timestamp } },
+    lastTests: {}
+  }))
+
+  const restored = createControlState(config, { filePath, now: () => timestamp })
+  assert.deepEqual(restored.schedulerState(), {
+    channels: { alpha: { health: 'auth-failed', updatedAt: timestamp } },
+    candidates: { ['alpha\0shared-model\0responses']: { health: 'misconfigured', updatedAt: timestamp } }
+  })
+  const migrated = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+  assert.equal(migrated.v, 2)
+  assert.equal(migrated.candidates['alpha\0shared-model\0responses'].evidence, undefined)
+})
+
+test('persists and restores allowlisted candidate evidence without sensitive fields', t => {
+  const root = temporaryRoot(t)
+  const filePath = path.join(root, 'runtime', 'control-state.json')
+  const config = fixtureConfig(root)
+  const timestamp = 3_000
+  const state = createControlState(config, { filePath, now: () => timestamp })
+  state.replaceSchedulerState({
+    candidates: {
+      ['alpha\0shared-model\0responses']: {
+        updatedAt: timestamp,
+        evidence: {
+          sampleCount: 5,
+          successCount: 4,
+          failureCount: 1,
+          consecutiveTransientFailures: 0,
+          ewmaLatencyMs: 120,
+          lastOutcomeAt: timestamp,
+          circuit: 'closed',
+          cooldownUntil: null,
+          openCount: 0,
+          prompt: 'must-not-persist'
+        },
+        responseBody: 'must-not-persist'
+      }
+    }
+  })
+  const restored = createControlState(config, { filePath, now: () => timestamp + 1 })
+  const candidate = restored.schedulerState().candidates['alpha\0shared-model\0responses']
+  assert.deepEqual(candidate.evidence, {
+    sampleCount: 5,
+    successCount: 4,
+    failureCount: 1,
+    consecutiveTransientFailures: 0,
+    ewmaLatencyMs: 120,
+    lastOutcomeAt: timestamp,
+    circuit: 'closed',
+    cooldownUntil: null,
+    openCount: 0
+  })
+  assert.doesNotMatch(fs.readFileSync(filePath, 'utf8'), /must-not-persist|prompt|responseBody/)
+})
+
 function fixtureConfig(root, channelIds = ['alpha']) {
   return {
     digest: 'release-a',

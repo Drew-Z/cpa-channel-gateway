@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
-import { buildModelCatalog, compareCandidates } from './catalog.mjs'
+import { buildModelCatalog, compareCandidatePriority, compareCandidates } from './catalog.mjs'
+import { circuitStatus, compareEvidence, emptyEvidence, normalizeEvidence, observeEvidence, successRate } from './candidate-evidence.mjs'
 import { supportsStreaming } from './model-metadata.mjs'
 
 const BLOCKED_CHANNEL_STATES = new Set(['auth-failed', 'payment-blocked'])
@@ -63,9 +64,10 @@ export function createModelScheduler(config, {
   let validChannelIds = new Set(config.channels.map(channel => channel.id))
   let validCandidateKeys = new Set([...catalog.allModels.values()].flat().map(candidate => candidate.key))
   const channelState = restoreChannelState(initialState.channels, validChannelIds)
-  const candidateState = restoreCandidateState(initialState.candidates, validCandidateKeys)
+  const candidateState = restoreCandidateState(initialState.candidates, validCandidateKeys, now())
   const drainingChannels = new Set()
   const suppressedCandidates = new Set()
+  const halfOpenCandidates = new Set()
 
   function reserve(modelId, metadata = {}) {
     const resolved = catalog.resolve(modelId)
@@ -81,12 +83,14 @@ export function createModelScheduler(config, {
         candidateCount: resolved.candidates.length
       })
     }
-    const eligible = modeCandidates.filter(candidate => isEligible(candidate, channelState, candidateState, drainingChannels, suppressedCandidates, now(), metadata.source ?? 'production'))
+    const eligible = modeCandidates.filter(candidate => isEligible(candidate, channelState, candidateState, drainingChannels, suppressedCandidates, halfOpenCandidates, now(), metadata.source ?? 'production'))
     if (!eligible.length) {
       throw new GatewayRoutingError('no_eligible_candidates', 503, `No eligible channel is available for model: ${modelId}`)
     }
     const ordered = [...eligible].sort((left, right) => {
       return healthRank(channelState.get(left.channelId)?.health) - healthRank(channelState.get(right.channelId)?.health)
+        || compareCandidatePriority(left, right)
+        || compareEvidence(candidateState.get(left.key)?.evidence, candidateState.get(right.key)?.evidence, now())
         || compareCandidates(left, right)
     })
     for (const candidate of ordered) {
@@ -95,45 +99,81 @@ export function createModelScheduler(config, {
         requestedModel: modelId,
         upstreamModel: candidate.upstreamModel
       })
-      if (lease) return { ...lease, candidate, resolved }
+      if (!lease) continue
+      const circuit = circuitStatus(candidateState.get(candidate.key)?.evidence, now())
+      if (circuit === 'half-open') {
+        if (halfOpenCandidates.has(candidate.key)) {
+          lease.release()
+          continue
+        }
+        halfOpenCandidates.add(candidate.key)
+      }
+      return {
+        ...lease,
+        release: () => {
+          halfOpenCandidates.delete(candidate.key)
+          return lease.release()
+        },
+        candidate,
+        resolved,
+        halfOpen: circuit === 'half-open'
+      }
     }
     throw new GatewayRoutingError('all_candidates_busy', 429, `All candidates are busy for model: ${modelId}`, {
       candidateCount: ordered.length
     })
   }
 
-  function recordOutcome(selection, statusCode, headers = {}) {
+  function recordOutcome(selection, statusOrObservation, headers = {}) {
+    if (!selection?.candidate || selection.outcomeRecorded) return false
     const candidate = selection.candidate
+    const observation = normalizeObservation(statusOrObservation, headers)
+    if (observation.kind === 'cancelled') {
+      selection.outcomeRecorded = true
+      halfOpenCandidates.delete(candidate.key)
+      return true
+    }
+    const timestamp = now()
+    const statusCode = observation.statusCode
     const previous = channelState.get(candidate.channelId) ?? { health: 'unknown' }
     if (statusCode >= 200 && statusCode < 300) {
-      channelState.set(candidate.channelId, { health: 'healthy', updatedAt: now() })
-      candidateState.delete(candidate.key)
-      notifyStateChange()
-      return
-    }
-    if (statusCode === 401 || statusCode === 403) {
-      channelState.set(candidate.channelId, { health: 'auth-failed', updatedAt: now() })
+      channelState.set(candidate.channelId, { health: 'healthy', updatedAt: timestamp })
+    } else if (statusCode === 401 || statusCode === 403) {
+      channelState.set(candidate.channelId, { health: 'auth-failed', updatedAt: timestamp })
     } else if (statusCode === 402) {
-      channelState.set(candidate.channelId, { health: 'payment-blocked', updatedAt: now() })
+      channelState.set(candidate.channelId, { health: 'payment-blocked', updatedAt: timestamp })
     } else if (statusCode === 429) {
       channelState.set(candidate.channelId, {
         health: 'cooling',
-        cooldownUntil: retryAt(headers['retry-after'], now()),
-        updatedAt: now()
+        cooldownUntil: retryAt(headers['retry-after'], timestamp),
+        updatedAt: timestamp
       })
     } else if ([400, 404, 405, 422].includes(statusCode)) {
-      candidateState.set(candidate.key, { health: 'misconfigured', updatedAt: now() })
-    } else if (statusCode >= 500) {
-      channelState.set(candidate.channelId, { ...previous, health: 'degraded', updatedAt: now() })
-    } else {
-      return
+      const current = candidateState.get(candidate.key) ?? { updatedAt: timestamp }
+      candidateState.set(candidate.key, { ...current, health: 'misconfigured', updatedAt: timestamp })
+    } else if (statusCode >= 500 || observation.kind === 'transport-failure') {
+      channelState.set(candidate.channelId, { ...previous, health: 'degraded', updatedAt: timestamp })
     }
+
+    if (!candidate.key) {
+      selection.outcomeRecorded = true
+      notifyStateChange()
+      return true
+    }
+    const current = candidateState.get(candidate.key) ?? { updatedAt: timestamp }
+    const evidence = observeEvidence(current.evidence, observation, { now: timestamp })
+    const next = { ...current, evidence, updatedAt: timestamp }
+    if (statusCode >= 200 && statusCode < 300) delete next.health
+    candidateState.set(candidate.key, next)
+    selection.outcomeRecorded = true
+    halfOpenCandidates.delete(candidate.key)
     notifyStateChange()
+    return true
   }
 
-  function recordTransportError(selection) {
-    channelState.set(selection.candidate.channelId, { health: 'degraded', updatedAt: now() })
-    notifyStateChange()
+  function recordTransportError(selection, durationMs) {
+    if (!selection?.candidate) return false
+    return recordOutcome(selection, { kind: 'transport-failure', transient: true, durationMs })
   }
 
   function reload(nextConfig, { initialState = {} } = {}) {
@@ -146,9 +186,10 @@ export function createModelScheduler(config, {
     channelState.clear()
     candidateState.clear()
     for (const [channelId, value] of restoreChannelState(initialState.channels, validChannelIds)) channelState.set(channelId, value)
-    for (const [candidateKey, value] of restoreCandidateState(initialState.candidates, validCandidateKeys)) candidateState.set(candidateKey, value)
+    for (const [candidateKey, value] of restoreCandidateState(initialState.candidates, validCandidateKeys, now())) candidateState.set(candidateKey, value)
     drainingChannels.clear()
     suppressedCandidates.clear()
+    halfOpenCandidates.clear()
     notifyStateChange()
     return true
   }
@@ -193,6 +234,34 @@ export function createModelScheduler(config, {
     const matches = candidatesFor(channelId, upstreamModel)
     for (const candidate of matches) suppressedCandidates.delete(candidate.key)
     return matches.length > 0
+  }
+
+  function evidenceFor(candidate) {
+    const value = candidateState.get(candidate?.key)?.evidence
+    return value ? normalizeEvidence(value, { now: now() }) : emptyEvidence()
+  }
+
+  function candidateStatus(candidate) {
+    if (!candidate?.key || !validCandidateKeys.has(candidate.key)) {
+      return { evidence: publicEvidence(emptyEvidence(), 'closed'), reasonCodes: ['configuration-pending-restart'] }
+    }
+    const timestamp = now()
+    const evidence = evidenceFor(candidate)
+    const circuit = circuitStatus(evidence, timestamp)
+    const reasons = []
+    const channel = channelState.get(candidate.channelId)
+    if (candidate.channel.staged) reasons.push('staged-manual-only')
+    if (drainingChannels.has(candidate.channelId)) reasons.push('channel-draining')
+    if (suppressedCandidates.has(candidate.key)) reasons.push('configuration-pending-restart')
+    if (reservations.isBusy(candidate.channelId)) reasons.push('channel-busy')
+    if (channel?.health === 'auth-failed') reasons.push('channel-auth-failed')
+    if (channel?.health === 'payment-blocked') reasons.push('channel-payment-blocked')
+    if (channel?.health === 'cooling' && channel.cooldownUntil > timestamp) reasons.push('channel-cooling')
+    if (candidateState.get(candidate.key)?.health === 'misconfigured') reasons.push('candidate-misconfigured')
+    if (circuit === 'open') reasons.push('circuit-open')
+    if (circuit === 'half-open') reasons.push(halfOpenCandidates.has(candidate.key) ? 'half-open-busy' : 'half-open-ready')
+    if (!reasons.length) reasons.push('candidate-ready')
+    return { evidence: publicEvidence(evidence, circuit), reasonCodes: reasons }
   }
 
   function candidatesFor(channelId, upstreamModel) {
@@ -243,6 +312,8 @@ export function createModelScheduler(config, {
     isCandidateSuppressed(channelId, upstreamModel) {
       return candidatesFor(channelId, upstreamModel).some(candidate => suppressedCandidates.has(candidate.key))
     },
+    evidenceFor,
+    candidateStatus,
     snapshot() {
       return {
         reservations: reservations.snapshot(),
@@ -255,13 +326,28 @@ export function createModelScheduler(config, {
   }
 }
 
-function isEligible(candidate, channelState, candidateState, drainingChannels, suppressedCandidates, now, source) {
+function publicEvidence(evidence, circuit) {
+  return {
+    sampleCount: evidence.sampleCount,
+    successCount: evidence.successCount,
+    failureCount: evidence.failureCount,
+    successRate: successRate(evidence),
+    ewmaLatencyMs: evidence.ewmaLatencyMs,
+    consecutiveTransientFailures: evidence.consecutiveTransientFailures,
+    circuit,
+    cooldownUntil: evidence.cooldownUntil
+  }
+}
+
+function isEligible(candidate, channelState, candidateState, drainingChannels, suppressedCandidates, halfOpenCandidates, now, source) {
   if (candidate.channel.staged && source !== 'manual-test') return false
   if (drainingChannels.has(candidate.channelId) || suppressedCandidates.has(candidate.key)) return false
   const channel = channelState.get(candidate.channelId)
   if (BLOCKED_CHANNEL_STATES.has(channel?.health)) return false
   if (channel?.health === 'cooling' && channel.cooldownUntil > now) return false
-  return candidateState.get(candidate.key)?.health !== 'misconfigured'
+  if (candidateState.get(candidate.key)?.health === 'misconfigured') return false
+  const circuit = circuitStatus(candidateState.get(candidate.key)?.evidence, now)
+  return circuit !== 'open' && !(circuit === 'half-open' && halfOpenCandidates.has(candidate.key))
 }
 
 function restoreChannelState(input, validChannelIds) {
@@ -276,11 +362,15 @@ function restoreChannelState(input, validChannelIds) {
   }))
 }
 
-function restoreCandidateState(input, validCandidateKeys) {
+function restoreCandidateState(input, validCandidateKeys, now) {
   return new Map(Object.entries(objectValue(input)).flatMap(([candidateKey, value]) => {
-    if (!validCandidateKeys.has(candidateKey) || value?.health !== 'misconfigured') return []
+    if (!validCandidateKeys.has(candidateKey) || !value || typeof value !== 'object' || Array.isArray(value)) return []
     if (!Number.isSafeInteger(value.updatedAt) || value.updatedAt < 0) return []
-    return [[candidateKey, { health: value.health, updatedAt: value.updatedAt }]]
+    if (value.health !== undefined && value.health !== 'misconfigured') return []
+    const result = { updatedAt: value.updatedAt }
+    if (value.health !== undefined) result.health = value.health
+    if (value.evidence !== undefined) result.evidence = normalizeEvidence(value.evidence, { now })
+    return Object.keys(result).length > 1 ? [[candidateKey, result]] : []
   }))
 }
 
@@ -300,4 +390,22 @@ function retryAt(value, now) {
   const date = Date.parse(Array.isArray(value) ? value[0] : value)
   if (Number.isFinite(date)) return Math.max(now, date)
   return now + 30_000
+}
+
+function normalizeObservation(value, headers = {}) {
+  if (value && typeof value === 'object' && typeof value.kind === 'string') {
+    return {
+      kind: value.kind,
+      transient: value.transient === true,
+      durationMs: value.durationMs,
+      statusCode: Number.isSafeInteger(value.statusCode) ? value.statusCode : null
+    }
+  }
+  const statusCode = Number.isSafeInteger(value) ? value : null
+  return {
+    kind: statusCode >= 200 && statusCode < 300 ? 'success' : 'http-failure',
+    transient: statusCode >= 500,
+    durationMs: undefined,
+    statusCode
+  }
 }

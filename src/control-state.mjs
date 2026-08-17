@@ -1,7 +1,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
+import { normalizeEvidence } from './candidate-evidence.mjs'
 
-const VERSION = 1
+const VERSION = 2
 const DEFAULT_HEALTH_STALE_MS = 24 * 60 * 60 * 1000
 const MAX_LAST_TESTS = 1_000
 const CHANNEL_HEALTH = new Set(['healthy', 'degraded', 'auth-failed', 'payment-blocked', 'cooling'])
@@ -52,7 +53,7 @@ export function createControlState(config, {
         configRevision,
         updatedAt: new Date(timestamp).toISOString(),
         channels: sameRelease ? normalizeChannels(state.channels, { now: timestamp, healthStaleMs, validChannels }) : {},
-        candidates: sameRelease ? normalizeCandidates(state.candidates, validCandidates) : {},
+        candidates: sameRelease ? normalizeCandidates(state.candidates, { now: timestamp, validCandidates }) : {},
         lastTests: normalizeLastTests(state.lastTests, validModels)
       }
       persist()
@@ -71,7 +72,7 @@ export function createControlState(config, {
         configRevision,
         updatedAt: new Date(timestamp).toISOString(),
         channels: normalizeChannels(snapshot.schedulerState?.channels, { now: timestamp, healthStaleMs, validChannels }),
-        candidates: normalizeCandidates(snapshot.schedulerState?.candidates, validCandidates),
+        candidates: normalizeCandidates(snapshot.schedulerState?.candidates, { now: timestamp, validCandidates }),
         lastTests: normalizeLastTests(snapshot.lastTests, validModels)
       }
       persist()
@@ -82,7 +83,7 @@ export function createControlState(config, {
     },
     replaceSchedulerState(input) {
       state.channels = normalizeChannels(input?.channels, { now: now(), healthStaleMs, validChannels })
-      state.candidates = normalizeCandidates(input?.candidates, validCandidates)
+      state.candidates = normalizeCandidates(input?.candidates, { now: now(), validCandidates })
       persist()
       return true
     },
@@ -109,7 +110,7 @@ export function createControlState(config, {
   function load() {
     try {
       const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'))
-      if (parsed?.v !== VERSION) throw new Error('Unsupported control state version')
+      if (![1, VERSION].includes(parsed?.v)) throw new Error('Unsupported control state version')
       const timestamp = now()
       state = {
         v: VERSION,
@@ -119,11 +120,11 @@ export function createControlState(config, {
           ? normalizeChannels(parsed.channels, { now: timestamp, healthStaleMs, validChannels })
           : {},
         candidates: parsed.configRevision === configRevision
-          ? normalizeCandidates(parsed.candidates, validCandidates)
+          ? normalizeCandidates(parsed.candidates, { now: timestamp, validCandidates })
           : {},
         lastTests: normalizeLastTests(parsed.lastTests, validModels)
       }
-      if (parsed.configRevision !== configRevision || JSON.stringify(parsed) !== JSON.stringify(state)) persist()
+      if (parsed.v !== VERSION || parsed.configRevision !== configRevision || JSON.stringify(parsed) !== JSON.stringify(state)) persist()
     } catch {
       state = emptyState(configRevision, now())
       writable = false
@@ -174,11 +175,16 @@ function normalizeChannels(input, { now, healthStaleMs, validChannels }) {
   return Object.fromEntries(result)
 }
 
-function normalizeCandidates(input, validCandidates) {
+function normalizeCandidates(input, { now, validCandidates }) {
   return Object.fromEntries(Object.entries(objectValue(input)).flatMap(([candidateKey, value]) => {
-    if (!validCandidates.has(candidateKey) || !value || !CANDIDATE_HEALTH.has(value.health)) return []
+    if (!validCandidates.has(candidateKey) || !value || typeof value !== 'object' || Array.isArray(value)) return []
+    if (value.health !== undefined && !CANDIDATE_HEALTH.has(value.health)) return []
     const updatedAt = nonNegativeInteger(value.updatedAt)
-    return updatedAt === null ? [] : [[candidateKey, { health: value.health, updatedAt }]]
+    if (updatedAt === null) return []
+    const result = {}
+    if (value.health !== undefined) result.health = value.health
+    if (value.evidence !== undefined) result.evidence = normalizeEvidence(value.evidence, { now })
+    return Object.keys(result).length ? [[candidateKey, { ...result, updatedAt }]] : []
   }))
 }
 

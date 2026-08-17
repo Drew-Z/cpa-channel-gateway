@@ -78,6 +78,107 @@ test('passive authentication failure removes a channel from later selection', ()
   next.release()
 })
 
+test('opens a transient candidate circuit and permits one half-open recovery trial', () => {
+  let clock = 1_000
+  const scheduler = createModelScheduler(fixtureConfig(), { now: () => clock })
+  for (let index = 0; index < 3; index += 1) {
+    const selection = scheduler.reserve('alpha/shared-model')
+    scheduler.recordOutcome(selection, { kind: 'transport-failure', transient: true, durationMs: 100 })
+    selection.release()
+    clock += 1
+  }
+
+  assert.equal(scheduler.snapshot().candidates['alpha\0shared-model\0responses'].evidence.circuit, 'open')
+  assert.throws(
+    () => scheduler.reserve('alpha/shared-model'),
+    error => error instanceof GatewayRoutingError && error.code === 'no_eligible_candidates'
+  )
+
+  clock += 30_000
+  const halfOpen = scheduler.reserve('alpha/shared-model')
+  assert.equal(halfOpen.halfOpen, true)
+  assert.throws(
+    () => scheduler.reserve('alpha/shared-model'),
+    error => error instanceof GatewayRoutingError && error.code === 'no_eligible_candidates'
+  )
+  scheduler.recordOutcome(halfOpen, { kind: 'success', statusCode: 200, durationMs: 80 })
+  halfOpen.release()
+
+  const recovered = scheduler.reserve('alpha/shared-model')
+  assert.equal(recovered.halfOpen, false)
+  recovered.release()
+})
+
+test('evidence ordering is used only after priority and minimum samples tie', () => {
+  let clock = 1_000
+  const config = fixtureConfig()
+  config.channels[0].priority = 100
+  config.channels[1].priority = 100
+  config.channels[0].models[0].priority = 100
+  config.channels[1].models[0].priority = 100
+  const scheduler = createModelScheduler(config, { now: () => clock })
+  for (let index = 0; index < 5; index += 1) {
+    for (const [model, durationMs] of [['alpha/shared-model', 500], ['beta/shared-model', 100]]) {
+      const selection = scheduler.reserve(model)
+      scheduler.recordOutcome(selection, { kind: 'success', statusCode: 200, durationMs })
+      selection.release()
+      clock += 1
+    }
+  }
+  const selected = scheduler.reserve('shared-model')
+  assert.equal(selected.candidate.channelId, 'beta')
+  selected.release()
+})
+
+test('duplicate terminal observations do not inflate evidence', () => {
+  const scheduler = createModelScheduler(fixtureConfig(), { now: () => 1_000 })
+  const selection = scheduler.reserve('shared-model')
+  assert.equal(scheduler.recordOutcome(selection, { kind: 'success', statusCode: 200, durationMs: 50 }), true)
+  assert.equal(scheduler.recordOutcome(selection, { kind: 'success', statusCode: 200, durationMs: 50 }), false)
+  selection.release()
+  const evidence = scheduler.snapshot().candidates['alpha\0shared-model\0responses'].evidence
+  assert.equal(evidence.sampleCount, 1)
+  assert.equal(evidence.successCount, 1)
+})
+
+test('cancellation releases observation without creating candidate evidence', () => {
+  const scheduler = createModelScheduler(fixtureConfig(), { now: () => 1_000 })
+  const selection = scheduler.reserve('shared-model')
+  assert.equal(scheduler.recordOutcome(selection, { kind: 'cancelled' }), true)
+  selection.release()
+  assert.equal(scheduler.snapshot().candidates['alpha\0shared-model\0responses'], undefined)
+})
+
+test('candidate status exposes only bounded evidence and reason codes', () => {
+  let clock = 1_000
+  const scheduler = createModelScheduler(fixtureConfig(), { now: () => clock })
+  const candidate = scheduler.catalog.resolve('alpha/shared-model').candidates[0]
+  const ready = scheduler.candidateStatus(candidate)
+  assert.deepEqual(ready, {
+    evidence: {
+      sampleCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      successRate: null,
+      ewmaLatencyMs: null,
+      consecutiveTransientFailures: 0,
+      circuit: 'closed',
+      cooldownUntil: null
+    },
+    reasonCodes: ['candidate-ready']
+  })
+  for (let index = 0; index < 3; index += 1) {
+    const selection = scheduler.reserve('alpha/shared-model')
+    scheduler.recordOutcome(selection, { kind: 'transport-failure', transient: true, durationMs: 50 })
+    selection.release()
+    clock += 1
+  }
+  const blocked = scheduler.candidateStatus(candidate)
+  assert.equal(blocked.evidence.circuit, 'open')
+  assert.deepEqual(blocked.reasonCodes, ['circuit-open'])
+  assert.equal(JSON.stringify(blocked).includes('example.test'), false)
+})
+
 test('restores validated health state and persists expired cooldown cleanup', () => {
   let clock = 1_000
   const changes = []

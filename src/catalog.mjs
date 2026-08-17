@@ -127,6 +127,10 @@ export function compareCandidates(left, right) {
     || left.protocol.localeCompare(right.protocol)
 }
 
+export function compareCandidatePriority(left, right) {
+  return right.priority - left.priority
+}
+
 function findCandidate(config, candidatesByKey, channelId, upstreamModel) {
   const channel = config.channels.find(item => item.enabled && item.id === channelId)
   if (!channel) return null

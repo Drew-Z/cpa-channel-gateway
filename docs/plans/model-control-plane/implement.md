@@ -133,6 +133,11 @@ readiness 失败均保留原运行配置；公开审计扫描证明历史、API 
 验收条件：排序测试覆盖样本不足、并列、过期统计、进程重启和 half-open；已经发出的
 生成请求始终只执行一次；只有一个候选时也不会因统计异常形成永久锁死。
 
+本地实现已完成 3A–3D：候选证据 reducer、v1 到 v2 状态迁移、保守熔断/half-open、
+流式完整生命周期终态记录、无重放集成覆盖，以及管理台低敏证据和排除原因码均已接入。
+当前本地门禁为 `npm test` 135/135、`npm run check` 和 `npm run audit:public` 通过；真实翼龙
+环境的重启、认证后低敏状态读取、一次精确诗词 canary，以及流式/非流式小任务仍待生产验收。
+
 ### Stage 4: WebUI MVP on Stable APIs
 
 API 契约稳定后再把当前内联页面迁移到 Vite + React + TypeScript；构建产物仍由同一个

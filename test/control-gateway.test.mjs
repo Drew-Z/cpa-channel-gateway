@@ -53,6 +53,69 @@ test('native Responses forwarding preserves reviewed client headers and replaces
   assert.equal(captured.headers['cf-ray'], undefined)
 })
 
+test('records a 2xx outcome only after the complete upstream response ends', async t => {
+  let releaseResponse
+  let upstreamHeadersSent
+  const headersSent = new Promise(resolve => { upstreamHeadersSent = resolve })
+  const upstream = http.createServer((request, response) => {
+    request.resume()
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.write('{"output_text":"partial')
+    upstreamHeadersSent()
+    releaseResponse = () => response.end('"}')
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+  const gateway = createControlGateway(fixtureConfig(upstreamAddress.port))
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const pending = request({
+    port: address.port,
+    path: '/v1/responses',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'shared-model', input: 'complete response' }
+  })
+  await headersSent
+  assert.equal(gateway.scheduler.snapshot().candidates['free\0shared-model\0responses'], undefined)
+  releaseResponse()
+  assert.equal((await pending).statusCode, 200)
+  const evidence = gateway.scheduler.snapshot().candidates['free\0shared-model\0responses'].evidence
+  assert.equal(evidence.sampleCount, 1)
+  assert.equal(evidence.successCount, 1)
+})
+
+test('records a stream interruption as one transient failure', async t => {
+  let upstreamHeadersSent
+  const headersSent = new Promise(resolve => { upstreamHeadersSent = resolve })
+  const upstream = http.createServer((request, response) => {
+    request.resume()
+    response.writeHead(200, { 'content-type': 'text/event-stream' })
+    response.write('data: partial\\n\\n')
+    upstreamHeadersSent()
+    setImmediate(() => response.destroy())
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+  const gateway = createControlGateway(fixtureConfig(upstreamAddress.port))
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const pending = request({
+    port: address.port,
+    path: '/v1/responses',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'shared-model', input: 'stream interruption', stream: true }
+  })
+  await headersSent
+  await assert.rejects(pending)
+  await waitFor(() => gateway.scheduler.snapshot().reservations.length === 0)
+  const evidence = gateway.scheduler.snapshot().candidates['free\0shared-model\0responses'].evidence
+  assert.equal(evidence.sampleCount, 1)
+  assert.equal(evidence.failureCount, 1)
+  assert.equal(evidence.consecutiveTransientFailures, 1)
+})
+
 test('production usage keeps an explicit logical group across upstream ids', async t => {
   const upstream = http.createServer((request, response) => {
     request.resume()
@@ -303,6 +366,9 @@ test('an upstream transport failure is not replayed on another candidate', async
   assert.equal(result.statusCode, 502)
   assert.equal(preferredCalls, 1)
   assert.equal(alternateCalls, 0)
+  const evidence = gateway.scheduler.snapshot().candidates['free\0shared-model\0responses'].evidence
+  assert.equal(evidence.sampleCount, 1)
+  assert.equal(evidence.failureCount, 1)
 })
 
 test('models endpoint exposes logical, stable, and direct ids', async t => {
@@ -584,6 +650,24 @@ test('admin session protects status and runs a redacted exact-model canary', asy
   assert.equal(summary.content, undefined)
   assert.equal(upstreamBody.model, 'shared-model')
   assert.match(upstreamBody.input, /秋夜读书/)
+  const canaryEvidence = gateway.scheduler.snapshot().candidates['free\0shared-model\0responses'].evidence
+  assert.equal(canaryEvidence.sampleCount, 1)
+  assert.equal(canaryEvidence.successCount, 1)
+  const modelGroups = JSON.parse((await request({ port: address.port, method: 'GET', path: '/admin/api/models', headers: { cookie } })).body).data
+  const adminCandidate = modelGroups.flatMap(group => group.candidates).find(candidate => candidate.directId === 'free/shared-model')
+  assert.deepEqual(Object.keys(adminCandidate.scheduling.evidence).sort(), [
+    'circuit',
+    'consecutiveTransientFailures',
+    'cooldownUntil',
+    'ewmaLatencyMs',
+    'failureCount',
+    'sampleCount',
+    'successCount',
+    'successRate'
+  ])
+  assert.equal(adminCandidate.scheduling.evidence.sampleCount, 1)
+  assert.deepEqual(adminCandidate.scheduling.reasonCodes, ['candidate-ready'])
+  assert.doesNotMatch(JSON.stringify(adminCandidate), /upstream\.example\.test|fixture-upstream-key|秋夜读书/)
 
   const beforeUsage = await request({ port: address.port, method: 'GET', path: '/admin/api/usage', headers: { cookie } })
   assert.equal(beforeUsage.statusCode, 200)
@@ -951,7 +1035,7 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.body, /healthLabel/)
   assert.match(first.body, /candidate\.channel\+'\/'/)
   assert.match(first.body, /请先从下拉框选择一个精确模型/)
-  assert.match(first.body, /忙碌或已禁用模型不能测活/)
+  assert.match(first.body, /忙碌、熔断或已禁用模型不能测活/)
   assert.match(first.body, /id="usage"/)
   assert.match(first.body, /channel-discovery/)
   assert.match(first.body, /\/admin\/api\/usage/)
