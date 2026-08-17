@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { createPrivateConfigManager } from '../src/config-manager.mjs'
+import { createConfigRevisionStore } from '../src/config-revisions.mjs'
 import { loadConfig } from '../src/config.mjs'
 
 test('channel mutations are private, revisioned, validated, and restart-required', () => {
@@ -13,6 +14,9 @@ test('channel mutations are private, revisioned, validated, and restart-required
   const loadedStatus = manager.status()
   assert.equal(loadedStatus.loadedRevision, loadedStatus.pendingRevision)
   assert.equal(loadedStatus.restartRequired, false)
+  const baseline = manager.revisions()[0]
+  assert.equal(baseline.operation, 'startup-baseline')
+  assert.equal(baseline.parentRevision, null)
   const created = manager.createChannel({
     id: 'backup',
     name: 'Backup Channel',
@@ -26,6 +30,13 @@ test('channel mutations are private, revisioned, validated, and restart-required
   assert.equal(created.hasApiKey, true)
   assert.equal(JSON.stringify(created).includes('backup_secret_key'), false)
   assert.equal(JSON.stringify(created).includes('backup.example.test'), false)
+  const createdRevision = createConfigRevisionStore({ root }).read(created.revision)
+  assert.equal(createdRevision.manifest.parentRevision, baseline.revision)
+  assert.equal(createdRevision.manifest.operation, 'channel-create')
+  assert.deepEqual(createdRevision.manifest.affected.channelIds, ['backup'])
+  assert.equal(JSON.parse(createdRevision.snapshot.routesText).channels.some(channel => channel.id === 'backup'), true)
+  assert.equal(JSON.stringify(manager.revisions()).includes('backup_secret_key'), false)
+  assert.equal(JSON.stringify(manager.revisions()).includes('backup.example.test'), false)
   assert.equal(manager.status().restartRequired, true)
   assert.notEqual(manager.status().loadedRevision, manager.status().pendingRevision)
   assert.equal(loadConfig(root).channels.some(channel => channel.id === 'backup' && !channel.enabled && channel.staged && channel.runtimeEnabled), true)
@@ -87,6 +98,10 @@ test('model status and stable alias changes are revisioned and prevent broken ro
   const main = manager.setStableAlias('coding-main', 'sample', 'model-a')
   assert.equal(main.alias, 'coding-main')
   assert.equal(main.restartRequired, true)
+  const revisionCount = manager.revisions().length
+  const unchanged = manager.setStableAlias('coding-main', 'sample', 'model-a')
+  assert.equal(unchanged.revision, main.revision)
+  assert.equal(manager.revisions().length, revisionCount)
   assert.throws(
     () => manager.updateModelStatus('sample', 'model-a', 'disabled'),
     error => error.code === 'model_has_aliases'
@@ -119,13 +134,117 @@ test('admin model synchronization is read-only upstream, revisioned, and marks d
   const result = await manager.syncModels(['sample'])
   assert.equal(result.changed, true)
   assert.equal(result.channels[0].added, 1)
-  assert.match(result.backup, /^runtime\/config-revisions\//)
+  const revision = createConfigRevisionStore({ root }).read(result.revision)
+  assert.equal(revision.manifest.operation, 'model-sync')
+  assert.deepEqual(revision.manifest.affected.channelIds, ['sample'])
+  assert.deepEqual(revision.manifest.affected.modelIds, ['sample/model-a', 'sample/model-b'])
+  assert.equal(JSON.parse(revision.snapshot.routesText).channels[0].models.some(model => model.upstream === 'model-b'), true)
+  assert.equal(revision.snapshot.envText.includes('sample_secret_key_123456'), true)
   assert.equal(calls[0].url, 'https://sample.example.test/v1/models')
   assert.equal(calls[0].headers.Authorization, 'Bearer sample_secret_key_123456')
   assert.equal(loadConfig(root).channels[0].models.some(model => model.upstream === 'model-b'), true)
   const unchanged = await manager.syncModels(['sample'])
   assert.equal(unchanged.changed, false)
   assert.equal(unchanged.restartRequired, true)
+})
+
+test('an external valid file change is recorded as a linked revision', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const baseline = manager.status().revision
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+  routes.channels[0].priority = 7
+  fs.writeFileSync(routesPath, `${JSON.stringify(routes, null, 2)}\n`)
+
+  const status = manager.status()
+  const revision = manager.revisions().find(item => item.revision === status.pendingRevision)
+  assert.equal(revision.operation, 'external-change')
+  assert.equal(revision.parentRevision, baseline)
+  assert.equal(status.restartRequired, true)
+})
+
+test('restores private files when the revision manifest cannot be committed', () => {
+  const root = fixtureRoot()
+  const store = createConfigRevisionStore({ root })
+  let rejectWrites = false
+  const revisionStore = {
+    ...store,
+    create(input) {
+      if (rejectWrites) throw new Error('fixture revision failure')
+      return store.create(input)
+    }
+  }
+  const manager = createPrivateConfigManager(loadConfig(root), { revisionStore })
+  const envPath = path.join(root, 'config', 'channels.local.env')
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const beforeEnv = fs.readFileSync(envPath, 'utf8')
+  const beforeRoutes = fs.readFileSync(routesPath, 'utf8')
+  rejectWrites = true
+
+  assert.throws(
+    () => manager.createChannel({
+      id: 'rejected',
+      name: 'Rejected',
+      baseUrl: 'https://rejected.example.test/v1',
+      apiKey: 'rejected_secret_key_123456',
+      protocol: 'responses',
+      priority: 2
+    }),
+    error => error.code === 'configuration_revision_failed'
+  )
+  assert.equal(fs.readFileSync(envPath, 'utf8'), beforeEnv)
+  assert.equal(fs.readFileSync(routesPath, 'utf8'), beforeRoutes)
+  assert.equal(loadConfig(root).channels.some(channel => channel.id === 'rejected'), false)
+  assert.equal(store.list().length, 1)
+})
+
+test('prepares a rollback revision and restores the prior snapshot on runtime failure', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const baseline = manager.status().revision
+  const created = manager.createChannel({
+    id: 'rollback',
+    name: 'Rollback',
+    baseUrl: 'https://rollback.example.test/v1',
+    apiKey: 'rollback_secret_key_123456',
+    protocol: 'responses',
+    priority: 3
+  })
+  assert.equal(loadConfig(root).channels.some(channel => channel.id === 'rollback'), true)
+
+  const transaction = manager.prepareRollback(baseline)
+  assert.equal(transaction.changed, true)
+  assert.equal(manager.revisions().find(item => item.revision === transaction.revision).operation, 'runtime-rollback')
+  assert.equal(loadConfig(root).channels.some(channel => channel.id === 'rollback'), false)
+
+  manager.restoreRollback(transaction)
+  assert.equal(loadConfig(root).channels.some(channel => channel.id === 'rollback'), true)
+  assert.equal(manager.status().pendingRevision, created.revision)
+  assert.equal(manager.status().restartRequired, true)
+})
+
+test('rejects a corrupted rollback target without changing the current private files', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const baseline = manager.status().revision
+  manager.createChannel({
+    id: 'current',
+    name: 'Current',
+    baseUrl: 'https://current.example.test/v1',
+    apiKey: 'current_secret_key_123456',
+    protocol: 'responses',
+    priority: 4
+  })
+  const envPath = path.join(root, 'config', 'channels.local.env')
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const beforeEnv = fs.readFileSync(envPath, 'utf8')
+  const beforeRoutes = fs.readFileSync(routesPath, 'utf8')
+  fs.appendFileSync(path.join(root, 'runtime', 'config-revisions', baseline, 'routes.local.json'), '\ntampered')
+
+  assert.throws(() => manager.prepareRollback(baseline), error => error.code === 'revision_invalid')
+  assert.equal(fs.readFileSync(envPath, 'utf8'), beforeEnv)
+  assert.equal(fs.readFileSync(routesPath, 'utf8'), beforeRoutes)
 })
 
 test('a newly created staged channel can be synchronized without enabling it', async () => {

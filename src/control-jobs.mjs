@@ -27,7 +27,8 @@ export function createControlJobQueue({
   maxQueued = DEFAULT_MAX_QUEUED,
   maxHistory = DEFAULT_MAX_HISTORY,
   now = () => Date.now(),
-  idFactory = () => crypto.randomUUID()
+  idFactory = () => crypto.randomUUID(),
+  onFinished = null
 } = {}) {
   if (!Number.isSafeInteger(maxQueued) || maxQueued < 1) throw new TypeError('maxQueued must be a positive integer')
   if (!Number.isSafeInteger(maxHistory) || maxHistory < 1) throw new TypeError('maxHistory must be a positive integer')
@@ -78,12 +79,14 @@ export function createControlJobQueue({
     job.status = 'running'
     job.startedAt = isoNow()
     try {
-      const result = await job.task()
+      const result = await job.task(taskContext(job))
       finish(job, 'completed')
+      await notifyFinished(job, result)
       job.resolve(result)
     } catch (error) {
       job.error = classifyError(error)
       finish(job, 'failed')
+      await notifyFinished(job, null)
       job.reject(error)
     } finally {
       running = null
@@ -98,11 +101,44 @@ export function createControlJobQueue({
     while (history.length > maxHistory) history.shift()
   }
 
+  async function notifyFinished(job, result) {
+    if (typeof onFinished !== 'function') return
+    try {
+      await onFinished({
+        ...publicJob(job),
+        durationMs: duration(job),
+        revision: safeRevision(result)
+      })
+    } catch {
+      // Audit failures must never change the outcome of the control job.
+    }
+  }
+
   function isoNow() {
     return new Date(now()).toISOString()
   }
 
   return { run, status }
+}
+
+function taskContext(job) {
+  return {
+    id: job.id,
+    type: job.type,
+    submittedAt: job.submittedAt,
+    startedAt: job.startedAt
+  }
+}
+
+function duration(job) {
+  const started = Date.parse(job.startedAt ?? '')
+  const finished = Date.parse(job.finishedAt ?? '')
+  return Number.isFinite(started) && Number.isFinite(finished) ? Math.max(0, finished - started) : 0
+}
+
+function safeRevision(result) {
+  const revision = result && typeof result === 'object' && !Array.isArray(result) ? result.revision : null
+  return typeof revision === 'string' && /^\d{8}T\d{9}Z-[a-f0-9]{16}-[a-f0-9]{8}$/.test(revision) ? revision : null
 }
 
 function normalizeJobType(value) {

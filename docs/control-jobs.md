@@ -1,13 +1,18 @@
 # Control Jobs and Draining
 
 所有会写入私有渠道配置或同步模型目录的管理操作都经过同一个内存 FIFO
-控制作业队列。队列覆盖渠道新增/导入/编辑/删除、模型状态、稳定别名和模型同步；
+控制作业队列。队列覆盖渠道新增/导入/编辑/删除、模型状态、稳定别名、模型同步、
+runtime apply 和 revision rollback；
 同一时刻最多执行一个作业，后续请求等待前一个作业结束。队列满时返回
 `429 control_queue_full`，不会偷偷丢弃或并发执行配置写入。
 
 `GET /admin/api/status` 返回低敏的 `controlJobs`：当前作业、等待数量和最近作业的
 类型、状态、时间以及分类错误码。作业 ID 不包含配置内容。失败状态只保留安全错误码和
 HTTP 状态，不保存异常正文、URL、API key 或上游响应。
+
+每个已完成作业还会向 `runtime/audit-events.jsonl` 写入一条有界白名单事件：job ID、
+操作、成功/失败、revision、耗时和分类错误码。`GET /admin/api/audit-events` 只向已认证
+管理员返回这些字段。审计写入失败时作业结果不受影响，状态会退化为 `memory-fallback`。
 
 ## Pending restart drain
 
@@ -21,3 +26,15 @@ HTTP 状态，不保存异常正文、URL、API key 或上游响应。
 CPA/HAProxy 子进程，等待新进程 readiness，然后切换父 Node 路由和 active release。
 任何启动或切换失败都会重启旧 release，并恢复旧的父路由。没有运行时监督器的测试/只读
 进程仍会报告 apply 不可用，此时按传统流程重启容器。
+
+## Revision rollback
+
+`GET /admin/api/revisions` 返回有限 manifest 历史，
+`GET /admin/api/revisions/<revision>/diff` 返回结构化脱敏差异。URL 和 API key 只返回
+`baseUrlChanged` / `apiKeyReplaced` 布尔标志，不返回值。
+
+`POST /admin/api/revisions/<revision>/rollback` 必须携带与路径完全一致的
+`confirmRevision`，并通过同源和 CSRF 检查。作业先校验目标快照 digest，再保存新的
+`runtime-rollback` revision，随后复用 runtime apply 的排空、生成、readiness、reload 和
+activate 流程。成功后才更新 loaded revision；任何运行时错误都会恢复回滚前私有快照，
+而 runtime manager 负责恢复旧 release。损坏 revision 在写入私有配置前即被拒绝。

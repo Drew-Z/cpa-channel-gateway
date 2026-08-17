@@ -126,7 +126,7 @@ npm run canary
 
 ## 6. 更新和回退
 
-保持 Auto Update 为 `1`。公开代码可由面板自动拉取，但私有配置不会从 Git 更新；更新前仍应备份两个 `config/*.local.*` 文件，并在代码更新后重启容器使新进程加载。固定 CPA/HAProxy/cloudflared 版本改变时只重新安装对应运行时组件。
+保持 Auto Update 为 `1`。公开代码可由面板自动拉取，但私有配置不会从 Git 更新；更新前仍应备份两个或三个 `config/*.local.*` 文件，并在代码更新后重启容器使新进程加载。固定 CPA/HAProxy/cloudflared 版本改变时只重新安装对应运行时组件。
 
 只替换渠道或模型时，先在可信本地副本中执行 `npm run sync:models`，审核并重新上传 `config/routes.local.json`。不要在自动启动流程中周期性同步模型目录。如果面板提供容器终端，再执行：
 
@@ -135,7 +135,9 @@ npm run check
 npm run activate
 ```
 
-没有终端权限时，直接重启服务器；启动流程会根据最新私有配置生成并激活 release。需要回到上一个已激活版本且没有终端权限时，重新上传上一版私有配置并重启；有终端权限时可执行 `npm run rollback`，然后再次重启。
+没有终端权限时，直接重启服务器；启动流程会根据最新私有配置生成并激活 release。新版本管理台的 Changes 区域会保存完整私有 revision，并可在明确确认后同时回滚私有配置和运行时；回滚会自动排空、检查 readiness，失败时恢复原配置和 release。
+
+旧的 `npm run rollback` 只切换 active/previous release，不恢复 `config/*.local.*`。只有在管理台 rollback 不可用且操作者明确理解这一区别时才使用它，并在之后重启。`runtime/config-revisions/` 含完整私有快照，`runtime/audit-events.jsonl` 含低敏作业历史；两者都不得下载到公开工单、日志或仓库。
 
 ## 7. 常见故障
 

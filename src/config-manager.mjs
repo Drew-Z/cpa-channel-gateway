@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { loadConfig } from './config.mjs'
+import { createConfigRevisionStore, diffSnapshots, digestSnapshot } from './config-revisions.mjs'
 import { parseEnv, serializeEnv } from './env.mjs'
 import { fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from './model-sync.mjs'
 import { isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
@@ -22,18 +23,20 @@ export class ConfigMutationError extends Error {
   }
 }
 
-export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
+export function createPrivateConfigManager(config, { fetchImpl = fetch, revisionStore: revisionStoreOption = null } = {}) {
   if (!config.paths?.routesPath || !config.paths?.envPath) return null
   const routesPath = config.paths.routesPath
   const envPath = config.paths.envPath
   const root = path.dirname(path.dirname(routesPath))
   const providersPath = config.paths.providersPath ?? path.join(path.dirname(routesPath), 'providers.local.json')
-  let loadedRevision = currentRevision()
+  const revisionStore = revisionStoreOption ?? createConfigRevisionStore({ root })
+  let pendingManifest = initialRevision()
+  let loadedRevision = pendingManifest.revision
   let modelSyncActive = false
 
   return {
     status() {
-      const pendingRevision = currentRevision()
+      const pendingRevision = refreshCurrentRevision().revision
       return {
         revision: pendingRevision,
         loadedRevision,
@@ -43,13 +46,74 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
     },
     markApplied() {
       const previousRevision = loadedRevision
-      loadedRevision = currentRevision()
+      loadedRevision = refreshCurrentRevision().revision
       try {
         return this.status()
       } catch (error) {
         loadedRevision = previousRevision
         throw error
       }
+    },
+    revisions(options) {
+      return revisionStore.list(options)
+    },
+    revision(revision) {
+      return revisionStore.read(revision).manifest
+    },
+    revisionDiff(revision) {
+      const current = refreshCurrentRevision()
+      const target = revisionStore.read(revision)
+      return {
+        from: current,
+        to: target.manifest,
+        diff: diffSnapshots(revisionStore.snapshotCurrent(), target.snapshot)
+      }
+    },
+    prepareRollback(revision) {
+      const parentManifest = refreshCurrentRevision()
+      const currentSnapshot = revisionStore.snapshotCurrent()
+      const target = revisionStore.read(revision)
+      if (target.manifest.contentDigest === parentManifest.contentDigest) {
+        return {
+          changed: false,
+          revision: parentManifest.revision,
+          previousManifest: parentManifest,
+          previousSnapshot: currentSnapshot,
+          targetRevision: target.manifest.revision
+        }
+      }
+      const diff = diffSnapshots(currentSnapshot, target.snapshot)
+      let phase = 'write'
+      let manifest
+      try {
+        writeCurrentSnapshot(target.snapshot)
+        phase = 'validate'
+        loadConfig(root, { allowEmptyEnabledChannels: true })
+        phase = 'revision'
+        manifest = revisionStore.create({
+          parentRevision: parentManifest.revision,
+          operation: 'runtime-rollback',
+          affected: affectedFromDiff(diff),
+          snapshot: target.snapshot
+        })
+      } catch (error) {
+        restoreAfterFailure(currentSnapshot)
+        throw mutationFailure(error, phase)
+      }
+      pendingManifest = manifest
+      return {
+        changed: true,
+        revision: manifest.revision,
+        previousManifest: parentManifest,
+        previousSnapshot: currentSnapshot,
+        targetRevision: target.manifest.revision
+      }
+    },
+    restoreRollback(transaction) {
+      if (!transaction?.changed) return
+      writeCurrentSnapshot(transaction.previousSnapshot)
+      loadConfig(root, { allowEmptyEnabledChannels: true })
+      pendingManifest = transaction.previousManifest
     },
     routing() {
       const current = loadConfig(root, { allowEmptyEnabledChannels: true })
@@ -129,7 +193,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
       }
     },
     createChannel(input) {
-      return mutate(({ routes, env, providers }) => {
+      return mutate('channel-create', ({ routes, env, providers }) => {
         const id = normalizeChannelId(input.id)
         if ((routes.channels ?? []).some(channel => channel.id === id)) {
           throw new ConfigMutationError('channel_exists', 409, `Channel already exists: ${id}`)
@@ -149,10 +213,10 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
         routes.channels ??= []
         routes.channels.push(providers ? { id, staged: true, models: [] } : { id, enabled: false, staged: true, priority: values.priority, models: [] })
         return { id, name: values.name, enabled: false, staged: true, protocol: values.protocol, priority: values.priority, modelCount: 0, hasApiKey: true }
-      })
+      }, result => ({ channelIds: [result.id] }))
     },
     importChannel(idValue) {
-      return mutate(({ routes, env, providers }) => {
+      return mutate('channel-import', ({ routes, env, providers }) => {
         const id = normalizeChannelId(idValue)
         if ((routes.channels ?? []).some(channel => channel.id === id)) {
           throw new ConfigMutationError('channel_exists', 409, `Channel already exists: ${id}`)
@@ -175,10 +239,10 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
         routes.channels ??= []
         routes.channels.push(providers ? { id, staged: true, models: [] } : { id, enabled: false, staged: true, priority: values.priority, models: [] })
         return { id, name: values.name, enabled: false, staged: true, protocol: values.protocol, priority: values.priority, modelCount: 0, hasApiKey: true }
-      })
+      }, result => ({ channelIds: [result.id] }))
     },
     updateChannel(idValue, input) {
-      return mutate(({ routes, env, providers }) => {
+      return mutate('channel-update', ({ routes, env, providers }) => {
         const id = normalizeChannelId(idValue)
         const channel = (routes.channels ?? []).find(item => item.id === id)
         if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${id}`)
@@ -225,10 +289,10 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
           modelCount: (channel.models ?? []).length,
           hasApiKey: Boolean(providers ? provider.apiKey : env[`${prefix}_API_KEY`])
         }
-      })
+      }, result => ({ channelIds: [result.id] }))
     },
     updateModelStatus(channelValue, modelValue, statusValue) {
-      return mutate(({ routes }) => {
+      return mutate('model-update', ({ routes }) => {
         const channelId = normalizeChannelId(channelValue)
         const modelId = normalizeModelId(modelValue)
         const status = String(statusValue ?? '').trim()
@@ -247,10 +311,10 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
         }
         model.status = status
         return { channel: channelId, model: modelId, status }
-      })
+      }, result => ({ channelIds: [result.channel], modelIds: [`${result.channel}/${result.model}`] }))
     },
     setStableAlias(aliasValue, channelValue, modelValue) {
-      return mutate(({ routes }) => {
+      return mutate('alias-update', ({ routes }) => {
         const alias = normalizeAlias(aliasValue)
         const channelId = normalizeChannelId(channelValue)
         const modelId = normalizeModelId(modelValue)
@@ -276,10 +340,10 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
           current.model = modelId
         }
         return { alias, channel: channelId, model: modelId }
-      })
+      }, result => ({ channelIds: [result.channel], modelIds: [`${result.channel}/${result.model}`] }))
     },
     deleteChannel(idValue) {
-      return mutate(({ routes, env, providers }) => {
+      return mutate('channel-delete', ({ routes, env, providers }) => {
         const id = normalizeChannelId(idValue)
         const index = (routes.channels ?? []).findIndex(item => item.id === id)
         if (index < 0) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${id}`)
@@ -297,12 +361,14 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
         if (providers) providers.providers = providers.providers.filter(item => String(item.id).toLowerCase() !== id)
         else for (const key of Object.keys(env)) if (key.startsWith(`${prefix}_`)) delete env[key]
         return { id, deleted: true }
-      })
+      }, result => ({ channelIds: [result.id] }))
     },
     async syncModels(requestedIds = []) {
       if (modelSyncActive) throw new ConfigMutationError('model_sync_in_progress', 409, 'A model synchronization is already in progress')
       modelSyncActive = true
       try {
+        const parentManifest = refreshCurrentRevision()
+        const originalSnapshot = revisionStore.snapshotCurrent()
         const current = loadConfig(root, { allowEmptyEnabledChannels: true })
         let selected
         try {
@@ -318,31 +384,42 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
           throw new ConfigMutationError('model_sync_failed', 502, error instanceof Error ? error.message : 'Model synchronization failed')
         }
         const { routes, summaries } = synchronizeRouteModels(current.routes, discoveries)
-        const originalRoutes = fs.readFileSync(routesPath, 'utf8')
         const nextRoutes = JSON.stringify(routes, null, 2) + '\n'
-        if (nextRoutes === originalRoutes) {
-          const revision = currentRevision()
-          return { changed: false, channels: summaries, revision, restartRequired: revision !== loadedRevision }
+        const nextSnapshot = { ...originalSnapshot, routesText: nextRoutes }
+        if (digestSnapshot(nextSnapshot) === parentManifest.contentDigest) {
+          return {
+            changed: false,
+            channels: summaries,
+            revision: parentManifest.revision,
+            restartRequired: parentManifest.revision !== loadedRevision
+          }
         }
-        const providerText = fs.existsSync(providersPath) ? fs.readFileSync(providersPath, 'utf8') : null
-        const revision = digest(fs.readFileSync(envPath, 'utf8'), nextRoutes, providerText)
-        const backupDir = path.join(root, 'runtime', 'config-revisions', `${timestamp()}-${revision}`)
-        fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 })
-        fs.writeFileSync(path.join(backupDir, 'routes.local.json'), originalRoutes, { mode: 0o600 })
-        if (providerText !== null) fs.writeFileSync(path.join(backupDir, 'providers.local.json'), providerText, { mode: 0o600 })
+        let manifest
+        let phase = 'write'
         try {
-          atomicWrite(routesPath, nextRoutes)
+          writeCurrentSnapshot(nextSnapshot)
+          phase = 'validate'
           loadConfig(root, { allowEmptyEnabledChannels: true })
+          phase = 'revision'
+          manifest = revisionStore.create({
+            parentRevision: parentManifest.revision,
+            operation: 'model-sync',
+            affected: {
+              channelIds: selected.map(channel => channel.id),
+              modelIds: changedModelIds(current.routes, routes, selected.map(channel => channel.id))
+            },
+            snapshot: nextSnapshot
+          })
         } catch (error) {
-          atomicWrite(routesPath, originalRoutes)
-          throw new ConfigMutationError('configuration_validation_failed', 400, error instanceof Error ? error.message : 'Configuration validation failed')
+          restoreAfterFailure(originalSnapshot)
+          throw mutationFailure(error, phase)
         }
+        pendingManifest = manifest
         return {
           changed: true,
           channels: summaries,
-          backup: path.relative(root, path.join(backupDir, 'routes.local.json')).replaceAll('\\', '/'),
-          revision,
-          restartRequired: revision !== loadedRevision
+          revision: manifest.revision,
+          restartRequired: manifest.revision !== loadedRevision
         }
       } finally {
         modelSyncActive = false
@@ -350,43 +427,79 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch } = {}) {
     }
   }
 
-  function mutate(change) {
+  function mutate(operation, change, affected) {
     if (modelSyncActive) throw new ConfigMutationError('model_sync_in_progress', 409, 'Configuration changes are paused while model synchronization is in progress')
-    const originalEnv = fs.readFileSync(envPath, 'utf8')
-    const originalRoutes = fs.readFileSync(routesPath, 'utf8')
-    const providerMode = fs.existsSync(providersPath)
-    const originalProviders = providerMode ? fs.readFileSync(providersPath, 'utf8') : null
-    const env = parseEnv(originalEnv)
-    const routes = JSON.parse(originalRoutes)
-    const providers = providerMode ? JSON.parse(originalProviders) : null
+    const parentManifest = refreshCurrentRevision()
+    const originalSnapshot = revisionStore.snapshotCurrent()
+    const providerMode = originalSnapshot.providersText !== null
+    const env = parseEnv(originalSnapshot.envText)
+    const routes = JSON.parse(originalSnapshot.routesText)
+    const providers = providerMode ? JSON.parse(originalSnapshot.providersText) : null
     const result = change({ routes, env, providers })
     const nextEnv = serializeEnv(providerMode ? stripLegacyChannelEnv(env) : env)
     const nextRoutes = JSON.stringify(routes, null, 2) + '\n'
     const nextProviders = providerMode ? JSON.stringify(providers, null, 2) + '\n' : null
-    const revision = digest(nextEnv, nextRoutes, nextProviders)
-    const backupDir = path.join(root, 'runtime', 'config-revisions', `${timestamp()}-${revision}`)
-    fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 })
-    fs.writeFileSync(path.join(backupDir, 'channels.local.env'), originalEnv, { mode: 0o600 })
-    fs.writeFileSync(path.join(backupDir, 'routes.local.json'), originalRoutes, { mode: 0o600 })
-    if (originalProviders !== null) fs.writeFileSync(path.join(backupDir, 'providers.local.json'), originalProviders, { mode: 0o600 })
-    try {
-      if (nextProviders !== null) atomicWrite(providersPath, nextProviders)
-      atomicWrite(envPath, nextEnv)
-      atomicWrite(routesPath, nextRoutes)
-      loadConfig(root)
-    } catch (error) {
-      atomicWrite(envPath, originalEnv)
-      atomicWrite(routesPath, originalRoutes)
-      if (originalProviders !== null) atomicWrite(providersPath, originalProviders)
-      if (error instanceof ConfigMutationError) throw error
-      throw new ConfigMutationError('configuration_validation_failed', 400, error instanceof Error ? error.message : 'Configuration validation failed')
+    const nextSnapshot = { envText: nextEnv, routesText: nextRoutes, providersText: nextProviders }
+    if (digestSnapshot(nextSnapshot) === parentManifest.contentDigest) {
+      return { ...result, revision: parentManifest.revision, restartRequired: parentManifest.revision !== loadedRevision }
     }
-    return { ...result, revision, restartRequired: revision !== loadedRevision }
+    let manifest
+    let phase = 'write'
+    try {
+      writeCurrentSnapshot(nextSnapshot)
+      phase = 'validate'
+      loadConfig(root)
+      phase = 'revision'
+      manifest = revisionStore.create({
+        parentRevision: parentManifest.revision,
+        operation,
+        affected: affected(result),
+        snapshot: nextSnapshot
+      })
+    } catch (error) {
+      restoreAfterFailure(originalSnapshot)
+      throw mutationFailure(error, phase)
+    }
+    pendingManifest = manifest
+    return { ...result, revision: manifest.revision, restartRequired: manifest.revision !== loadedRevision }
   }
 
-  function currentRevision() {
-    const providers = fs.existsSync(providersPath) ? fs.readFileSync(providersPath, 'utf8') : null
-    return digest(fs.readFileSync(envPath, 'utf8'), fs.readFileSync(routesPath, 'utf8'), providers)
+  function initialRevision() {
+    const snapshot = revisionStore.snapshotCurrent()
+    const existing = revisionStore.findByDigest(digestSnapshot(snapshot))
+    if (existing) return existing
+    return revisionStore.create({ operation: 'startup-baseline', snapshot })
+  }
+
+  function refreshCurrentRevision() {
+    const snapshot = revisionStore.snapshotCurrent()
+    const contentDigest = digestSnapshot(snapshot)
+    if (contentDigest === pendingManifest.contentDigest) return pendingManifest
+    loadConfig(root, { allowEmptyEnabledChannels: true })
+    pendingManifest = revisionStore.create({
+      parentRevision: pendingManifest.revision,
+      operation: 'external-change',
+      snapshot
+    })
+    return pendingManifest
+  }
+
+  function writeCurrentSnapshot(snapshot) {
+    if (snapshot.providersText === null) {
+      if (fs.existsSync(providersPath)) fs.rmSync(providersPath)
+    } else {
+      atomicWrite(providersPath, snapshot.providersText)
+    }
+    atomicWrite(envPath, snapshot.envText)
+    atomicWrite(routesPath, snapshot.routesText)
+  }
+
+  function restoreAfterFailure(snapshot) {
+    try {
+      writeCurrentSnapshot(snapshot)
+    } catch {
+      throw new ConfigMutationError('configuration_restore_failed', 500, 'Private configuration could not be restored')
+    }
   }
 }
 
@@ -452,23 +565,59 @@ function normalizeAlias(value) {
   return alias
 }
 
-function digest(envText, routesText, providersText = null) {
-  return crypto.createHash('sha256')
-    .update(envText)
-    .update('\0')
-    .update(routesText)
-    .update('\0')
-    .update(providersText ?? '')
-    .digest('hex')
-    .slice(0, 16)
+function changedModelIds(beforeRoutes, afterRoutes, channelIds) {
+  const changed = []
+  for (const channelId of channelIds) {
+    const before = modelsByUpstream(beforeRoutes, channelId)
+    const after = modelsByUpstream(afterRoutes, channelId)
+    for (const modelId of new Set([...before.keys(), ...after.keys()])) {
+      if (JSON.stringify(before.get(modelId) ?? null) !== JSON.stringify(after.get(modelId) ?? null)) {
+        changed.push(`${channelId}/${modelId}`)
+      }
+    }
+  }
+  return changed.sort((left, right) => left.localeCompare(right))
+}
+
+function affectedFromDiff(diff) {
+  return {
+    channelIds: [
+      ...(diff.channels?.added ?? []),
+      ...(diff.channels?.removed ?? []),
+      ...(diff.channels?.changed ?? []).map(item => item.id)
+    ],
+    modelIds: [
+      ...(diff.models?.added ?? []),
+      ...(diff.models?.removed ?? []),
+      ...(diff.models?.changed ?? []).map(item => item.id)
+    ]
+  }
+}
+
+function modelsByUpstream(routes, channelId) {
+  const channel = (routes.channels ?? []).find(item => item.id === channelId)
+  const models = new Map()
+  for (const model of channel?.models ?? []) {
+    const entries = models.get(model.upstream) ?? []
+    entries.push(model)
+    models.set(model.upstream, entries)
+  }
+  return models
+}
+
+function mutationFailure(error, phase) {
+  if (error instanceof ConfigMutationError) return error
+  if (phase === 'validate') {
+    return new ConfigMutationError('configuration_validation_failed', 400, 'Configuration validation failed')
+  }
+  if (phase === 'revision') {
+    return new ConfigMutationError('configuration_revision_failed', 500, 'Configuration revision could not be written')
+  }
+  return new ConfigMutationError('configuration_write_failed', 500, 'Private configuration could not be written')
 }
 
 function atomicWrite(filePath, content) {
   const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`
   fs.writeFileSync(temporary, content, { mode: 0o600 })
   fs.renameSync(temporary, filePath)
-}
-
-function timestamp() {
-  return new Date().toISOString().replaceAll(':', '').replaceAll('.', '-')
 }

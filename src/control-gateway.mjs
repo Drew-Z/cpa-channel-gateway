@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
+import { createAuditEventStore } from './audit-events.mjs'
 import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol } from './canary.mjs'
 import { ConfigMutationError, createPrivateConfigManager } from './config-manager.mjs'
 import { createControlState } from './control-state.mjs'
@@ -34,11 +35,22 @@ export function createControlGateway(config, {
   }),
   usageMonitor = createUsageMonitor(config),
   configManager = createPrivateConfigManager(config),
-  runtimeManager = null
+  runtimeManager = null,
+  auditStore: auditStoreOption = null
 } = {}) {
   const sessions = new Map()
   const loginFailures = new Map()
-  const controlJobs = createControlJobQueue()
+  const auditStore = auditStoreOption ?? createAuditEventStore(config)
+  const controlJobs = createControlJobQueue({
+    onFinished: event => auditStore.record({
+      jobId: event.id,
+      operation: event.type,
+      result: event.status === 'completed' ? 'success' : 'failure',
+      revision: event.revision,
+      durationMs: event.durationMs,
+      ...(event.status === 'failed' ? { errorCode: event.error?.code ?? 'control_job_failed' } : {})
+    })
+  })
   const lastTests = new Map(Object.entries(controlState.lastTests()))
   const lastTestStarted = new Map()
   const server = http.createServer((request, response) => {
@@ -193,6 +205,61 @@ export function createControlGateway(config, {
       sendJson(response, 200, configManager?.status() ?? { revision: null, restartRequired: false, writable: false })
       return
     }
+    if (url.pathname === '/admin/api/revisions' && request.method === 'GET') {
+      requireConfigManager()
+      const limit = Number(url.searchParams.get('limit') ?? 50)
+      sendJson(response, 200, { data: configManager.revisions({ limit: Number.isSafeInteger(limit) ? limit : 50 }) })
+      return
+    }
+    if (url.pathname === '/admin/api/audit-events' && request.method === 'GET') {
+      const limit = Number(url.searchParams.get('limit') ?? 50)
+      sendJson(response, 200, { data: auditStore.list({ limit: Number.isSafeInteger(limit) ? limit : 50 }) })
+      return
+    }
+    const revisionDiffRoute = /^\/admin\/api\/revisions\/(\d{8}T\d{9}Z-[a-f0-9]{16}-[a-f0-9]{8})\/diff$/.exec(url.pathname)
+    if (revisionDiffRoute && request.method === 'GET') {
+      requireConfigManager()
+      sendJson(response, 200, configManager.revisionDiff(revisionDiffRoute[1]))
+      return
+    }
+    const revisionRollbackRoute = /^\/admin\/api\/revisions\/(\d{8}T\d{9}Z-[a-f0-9]{16}-[a-f0-9]{8})\/rollback$/.exec(url.pathname)
+    if (revisionRollbackRoute && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      if (!runtimeManager?.apply || !configManager.prepareRollback || !configManager.restoreRollback) {
+        throw publicError('runtime_rollback_unavailable', 409, 'Runtime rollback is not available in this process')
+      }
+      const body = await readJsonBody(request, requestBodyLimit())
+      if (body.confirmRevision !== revisionRollbackRoute[1]) {
+        throw publicError('rollback_confirmation_required', 400, 'Rollback requires an exact confirmRevision value')
+      }
+      const targetRevision = revisionRollbackRoute[1]
+      const result = await controlJobs.run('runtime-rollback', async () => {
+        const transaction = configManager.prepareRollback(targetRevision)
+        if (!transaction.changed) return { changed: false, revision: transaction.revision, targetRevision }
+        try {
+          const runtime = await runtimeManager.apply()
+          return {
+            ...runtime,
+            changed: true,
+            revision: configManager.status?.().loadedRevision ?? transaction.revision,
+            rollbackRevision: transaction.revision,
+            targetRevision
+          }
+        } catch (error) {
+          try {
+            configManager.restoreRollback(transaction)
+          } catch (restoreError) {
+            const failure = publicError('rollback_restore_failed', 503, 'Rollback failed and the previous configuration could not be restored')
+            failure.cause = restoreError
+            throw failure
+          }
+          throw error
+        }
+      })
+      sendJson(response, 202, result)
+      return
+    }
     if (url.pathname === '/admin/api/runtime' && request.method === 'GET') {
       sendJson(response, 200, runtimeManager?.status?.() ?? { active: null, transitioning: false, available: false })
       return
@@ -200,7 +267,11 @@ export function createControlGateway(config, {
     if (url.pathname === '/admin/api/runtime/apply' && request.method === 'POST') {
       requireAdminMutation(request, session)
       if (!runtimeManager?.apply) throw publicError('runtime_apply_unavailable', 409, 'Runtime apply is not available in this process')
-      sendJson(response, 200, await controlJobs.run('runtime-apply', () => runtimeManager.apply()))
+      const result = await controlJobs.run('runtime-apply', async () => ({
+        ...(await runtimeManager.apply()),
+        revision: configManager?.status?.().loadedRevision ?? null
+      }))
+      sendJson(response, 200, result)
       return
     }
     if (url.pathname === '/admin/api/model-sync' && request.method === 'POST') {
@@ -222,7 +293,7 @@ export function createControlGateway(config, {
       const result = await controlJobs.run('channel-create', async () => {
         const created = configManager.createChannel(body)
         const sync = body.sync === true ? await configManager.syncModels([created.id]) : null
-        return { ...created, sync }
+        return { ...created, ...(sync?.changed ? { revision: sync.revision } : {}), sync }
       })
       sendJson(response, result.sync ? 200 : 202, result)
       return
@@ -234,7 +305,7 @@ export function createControlGateway(config, {
       const result = await controlJobs.run('channel-import', async () => {
         const imported = configManager.importChannel(body.id)
         const sync = body.sync === true ? await configManager.syncModels([imported.id]) : null
-        return { imported, sync }
+        return { imported, ...(sync?.changed ? { revision: sync.revision } : {}), sync }
       })
       sendJson(response, 200, result)
       return
@@ -467,6 +538,7 @@ export function createControlGateway(config, {
       reservations: snapshot.reservations,
       controlJobs: controlJobs.status(),
       runtime: runtimeManager?.status?.() ?? { active: null, transitioning: false, available: false },
+      audit: auditStore.status(),
       draining: snapshot.draining ?? [],
       suppressedCandidates: snapshot.suppressedCandidates ?? [],
       lastTests: Object.fromEntries(lastTests),
@@ -693,6 +765,7 @@ export function createControlGateway(config, {
     server,
     scheduler,
     usageMonitor,
+    auditStore,
     controlJobs,
     runtimeManager,
     reloadConfig,
@@ -912,15 +985,22 @@ function sendHtml(response, html, nonce) {
 function adminHtml(nonce) {
   return `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CPA Channel Gateway</title>
-<style nonce="${nonce}">*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#f5f7fb;color:#152033;margin:0}main{max-width:1100px;margin:2rem auto;padding:0 1rem}section{background:#fff;border:1px solid #dce3ef;border-radius:8px;padding:1rem;margin:1rem 0;box-shadow:0 2px 10px #1520330d}h1{font-size:1.35rem}h2{font-size:1.05rem;margin:1.25rem 0 .7rem}h3{font-size:.95rem;margin:1rem 0 .5rem}button{border:0;border-radius:8px;padding:.6rem .9rem;background:#2458d6;color:#fff;cursor:pointer}button.secondary{background:#526078}button:disabled{opacity:.6;cursor:wait}input,select{padding:.6rem;border:1px solid #b8c3d5;border-radius:8px;width:100%;min-width:0;background:#fff;color:inherit}.toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:.65rem;align-items:end}.toolbar label{display:grid;gap:.25rem;font-size:.8rem;color:#637089}.toolbar button{width:100%}.connection-grid{display:grid;gap:.65rem}.connection-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:.5rem;align-items:end}.connection-row label{display:grid;gap:.25rem;font-size:.8rem;color:#637089}.connection-row button{white-space:nowrap}.connection-hint{margin:.35rem 0 0}.connection-models{display:flex;flex-wrap:wrap;gap:.5rem}.connection-models code{background:#eef2f8;border-radius:6px;padding:.3rem .5rem}#channels,#models,#usage{overflow-x:auto}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e8edf4;padding:.55rem;font-size:.9rem;white-space:nowrap}.muted{color:#637089}.error{color:#b42318}.ok{color:#067647}.busy{color:#b54708}@media(max-width:700px){.connection-row{grid-template-columns:1fr}.connection-row button{width:100%}}</style></head>
+<style nonce="${nonce}">*{box-sizing:border-box}body{font-family:system-ui,sans-serif;background:#f5f7fb;color:#152033;margin:0}main{max-width:1100px;margin:2rem auto;padding:0 1rem}section{background:#fff;border:1px solid #dce3ef;border-radius:8px;padding:1rem;margin:1rem 0;box-shadow:0 2px 10px #1520330d}h1{font-size:1.35rem}h2{font-size:1.05rem;margin:1.25rem 0 .7rem}h3{font-size:.95rem;margin:1rem 0 .5rem}button{border:0;border-radius:8px;padding:.6rem .9rem;background:#2458d6;color:#fff;cursor:pointer}button.secondary{background:#526078}button:disabled{opacity:.6;cursor:wait}input,select{padding:.6rem;border:1px solid #b8c3d5;border-radius:8px;width:100%;min-width:0;background:#fff;color:inherit}.toolbar{display:grid;grid-template-columns:repeat(auto-fit,minmax(12rem,1fr));gap:.65rem;align-items:end}.toolbar label{display:grid;gap:.25rem;font-size:.8rem;color:#637089}.toolbar button{width:100%}.connection-grid{display:grid;gap:.65rem}.connection-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:.5rem;align-items:end}.connection-row label{display:grid;gap:.25rem;font-size:.8rem;color:#637089}.connection-row button{white-space:nowrap}.connection-hint{margin:.35rem 0 0}.connection-models{display:flex;flex-wrap:wrap;gap:.5rem}.connection-models code{background:#eef2f8;border-radius:6px;padding:.3rem .5rem}#channels,#models,#usage,#changes{overflow-x:auto}#changeDiff{white-space:pre-wrap;overflow-wrap:anywhere;background:#f6f8fb;border:1px solid #dce3ef;border-radius:6px;padding:.75rem;min-height:3rem}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid #e8edf4;padding:.55rem;font-size:.9rem;white-space:nowrap}.muted{color:#637089}.error{color:#b42318}.ok{color:#067647}.busy{color:#b54708}@media(max-width:700px){.connection-row{grid-template-columns:1fr}.connection-row button{width:100%}}</style></head>
 <body><main><h1>CPA Channel Gateway 管理台</h1><section id="login"><p class="muted">管理密钥只用于建立内存会话，重启后自动失效。</p><input id="key" type="password" autocomplete="current-password" placeholder="CPA_MANAGEMENT_KEY"><button id="loginButton">登录</button><p id="loginError" class="error"></p></section>
-<section id="app" hidden><p><button id="refreshButton">刷新状态</button> <button id="applyButton" class="secondary" type="button" hidden>应用待重启配置</button> <button id="logoutButton" class="secondary">退出</button> <span id="summary" class="muted"></span></p><h2>客户端连接</h2><div id="connection"></div><div id="channels"></div><h2>渠道发现</h2><p class="muted">自动比较私有 env 与当前 routes。已登记但尚未重启的渠道会单独提示；API key 只用于导入，不会显示。</p><div id="discovery"></div><h2>最近 24 小时</h2><p class="muted">仅统计真实业务请求；管理台模型测活不计入。成功率按成功请求数除以全部请求数计算。</p><div id="usage"></div><h2>模型目录同步</h2><div class="toolbar"><label>渠道（留空同步生产渠道）<select id="syncChannelIds" autocomplete="off"><option value="">全部生产渠道</option></select></label><button id="syncButton" type="button">只读同步 /models</button></div><p id="syncResult" class="muted"></p><h2>新增渠道</h2><form id="addChannelForm" class="toolbar"><label>渠道 ID<input id="channelId" required pattern="[a-z][a-z0-9-]{0,31}" maxlength="32" autocomplete="off"></label><label>名称<input id="channelName" required maxlength="80"></label><label>Base URL<input id="channelUrl" required type="url" autocomplete="url"></label><label>API key<input id="channelKey" required type="password" minlength="8" autocomplete="new-password"></label><label>协议<select id="channelProtocol"><option value="responses">responses</option><option value="openai-compatible">openai-compatible</option><option value="claude">claude</option></select></label><label>优先级<input id="channelPriority" required type="number" step="1" value="0"></label><button id="addChannelButton" type="submit">新增待测试渠道</button><button id="addAndSyncButton" class="secondary" type="button">新增并同步模型</button></form><p id="channelResult"></p><h2>模型测活与路由</h2><div class="toolbar"><label>精确模型 ID<select id="model" autocomplete="off"><option value="">请选择要测试的精确模型</option></select></label><button id="testButton" type="button">测试模型</button><button id="setMainButton" type="button">设为 coding-main</button><button id="setBackupButton" class="secondary" type="button">设为 coding-backup</button><button id="toggleModelButton" class="secondary" type="button">禁用模型</button></div><p id="testHint" class="muted">模型目录会在刷新状态时自动填充。</p><p id="testResult"></p><div id="routing"></div><h2>模型目录</h2><div id="models"></div></section></main>
+<section id="app" hidden><p><button id="refreshButton">刷新状态</button> <button id="applyButton" class="secondary" type="button" hidden>应用待重启配置</button> <button id="logoutButton" class="secondary">退出</button> <span id="summary" class="muted"></span></p><h2>客户端连接</h2><div id="connection"></div><h2>Changes</h2><div id="changes"></div><div id="channels"></div><h2>渠道发现</h2><p class="muted">自动比较私有 env 与当前 routes。已登记但尚未重启的渠道会单独提示；API key 只用于导入，不会显示。</p><div id="discovery"></div><h2>最近 24 小时</h2><p class="muted">仅统计真实业务请求；管理台模型测活不计入。成功率按成功请求数除以全部请求数计算。</p><div id="usage"></div><h2>模型目录同步</h2><div class="toolbar"><label>渠道（留空同步生产渠道）<select id="syncChannelIds" autocomplete="off"><option value="">全部生产渠道</option></select></label><button id="syncButton" type="button">只读同步 /models</button></div><p id="syncResult" class="muted"></p><h2>新增渠道</h2><form id="addChannelForm" class="toolbar"><label>渠道 ID<input id="channelId" required pattern="[a-z][a-z0-9-]{0,31}" maxlength="32" autocomplete="off"></label><label>名称<input id="channelName" required maxlength="80"></label><label>Base URL<input id="channelUrl" required type="url" autocomplete="url"></label><label>API key<input id="channelKey" required type="password" minlength="8" autocomplete="new-password"></label><label>协议<select id="channelProtocol"><option value="responses">responses</option><option value="openai-compatible">openai-compatible</option><option value="claude">claude</option></select></label><label>优先级<input id="channelPriority" required type="number" step="1" value="0"></label><button id="addChannelButton" type="submit">新增待测试渠道</button><button id="addAndSyncButton" class="secondary" type="button">新增并同步模型</button></form><p id="channelResult"></p><h2>模型测活与路由</h2><div class="toolbar"><label>精确模型 ID<select id="model" autocomplete="off"><option value="">请选择要测试的精确模型</option></select></label><button id="testButton" type="button">测试模型</button><button id="setMainButton" type="button">设为 coding-main</button><button id="setBackupButton" class="secondary" type="button">设为 coding-backup</button><button id="toggleModelButton" class="secondary" type="button">禁用模型</button></div><p id="testHint" class="muted">模型目录会在刷新状态时自动填充。</p><p id="testResult"></p><div id="routing"></div><h2>模型目录</h2><div id="models"></div></section></main>
 <script nonce="${nonce}">
 let csrf='';let restartRequired=false;let modelCandidates=new Map();let gatewayKeyHideTimer=null;
 const $=id=>document.getElementById(id);
 async function call(path, options={}){const method=(options.method||'GET').toUpperCase();const headers={'content-type':'application/json',...(options.headers||{})};if(!['GET','HEAD','OPTIONS'].includes(method)&&csrf)headers['x-csrf-token']=csrf;const r=await fetch(path,{...options,mode:'same-origin',credentials:'same-origin',headers});const data=await r.json().catch(()=>({}));if(!r.ok)throw new Error(data.error?.message||'请求失败');return data}
 async function login(){try{const data=await call('/admin/api/session',{method:'POST',body:JSON.stringify({key:$('key').value})});csrf=data.csrfToken;$('login').hidden=true;$('app').hidden=false;await refresh()}catch(e){$('loginError').textContent=e.message}}
-async function refresh(){try{const [status,models,usage,discovery,connection]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage'),call('/admin/api/channel-discovery'),call('/admin/api/connection')]);restartRequired=status.restartRequired===true;const revisionText=restartRequired?'；待重启 '+(status.pendingRevision||status.configRevision||'-')+'，运行中 '+(status.loadedRevision||'未知'):'；运行配置 '+(status.loadedRevision||status.configRevision||'未知');const storageText=status.controlState?.storage==='memory-fallback'?'；健康状态持久化已退化为内存':'';const jobText=status.controlJobs?.active?'；配置任务 '+status.controlJobs.active.type+(status.controlJobs.queued?'，等待 '+status.controlJobs.queued:''):status.controlJobs?.queued?'；等待配置任务 '+status.controlJobs.queued:'';$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次'+revisionText+storageText+jobText;$('summary').className=status.controlState?.storage==='memory-fallback'?'busy':'muted';const applyButton=$('applyButton');applyButton.hidden=status.runtime?.available!==true;applyButton.disabled=!status.restartRequired||Boolean(status.runtime?.transitioning)||Boolean(status.controlJobs?.active);renderConnection(connection);$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>Base URL</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td class="'+(c.busy||c.draining?'busy':'')+'">'+channelState(c)+(c.busy?' / 当前忙碌':'')+'</td><td>'+c.modelCount+'</td><td>'+esc(healthLabel(c.health))+'</td><td>'+channelActions(c)+'</td></tr>').join('')+'</table>';$('discovery').innerHTML=discoveryHtml(discovery);$('usage').innerHTML=usageHtml(usage);$('routing').innerHTML=routingHtml(status.stableAliases||[]);$('models').innerHTML=modelsHtml(models.data);populateSyncChannelSelect(status.channels);populateModelSelect(models.data)}catch(e){$('summary').textContent=e.message}}
+async function refresh(){try{const [status,models,usage,discovery,connection]=await Promise.all([call('/admin/api/status'),call('/admin/api/models'),call('/admin/api/usage'),call('/admin/api/channel-discovery'),call('/admin/api/connection')]);const [revisions,audits]=await Promise.all([call('/admin/api/revisions?limit=20').catch(()=>({data:[]})),call('/admin/api/audit-events?limit=20').catch(()=>({data:[]}))]);restartRequired=status.restartRequired===true;const revisionText=restartRequired?'；待重启 '+(status.pendingRevision||status.configRevision||'-')+'，运行中 '+(status.loadedRevision||'未知'):'；运行配置 '+(status.loadedRevision||status.configRevision||'未知');const storageText=status.controlState?.storage==='memory-fallback'?'；健康状态持久化已退化为内存':'';const jobText=status.controlJobs?.active?'；配置任务 '+status.controlJobs.active.type+(status.controlJobs.queued?'，等待 '+status.controlJobs.queued:''):status.controlJobs?.queued?'；等待配置任务 '+status.controlJobs.queued:'';$('summary').textContent='当前预约 '+status.reservations.length+' 个；24 小时请求 '+usage.summary.total+' 次'+revisionText+storageText+jobText;$('summary').className=status.controlState?.storage==='memory-fallback'?'busy':'muted';const applyButton=$('applyButton');applyButton.hidden=status.runtime?.available!==true;applyButton.disabled=!status.restartRequired||Boolean(status.runtime?.transitioning)||Boolean(status.controlJobs?.active);renderConnection(connection);$('channels').innerHTML='<h2>渠道</h2><table><tr><th>渠道</th><th>Base URL</th><th>状态</th><th>模型数</th><th>健康</th><th>操作</th></tr>'+status.channels.map(c=>'<tr><td>'+esc(c.name)+' ('+esc(c.id)+')</td><td><code>'+esc(c.baseUrl)+'</code></td><td class="'+(c.busy||c.draining?'busy':'')+'">'+channelState(c)+(c.busy?' / 当前忙碌':'')+'</td><td>'+c.modelCount+'</td><td>'+esc(healthLabel(c.health))+'</td><td>'+channelActions(c)+'</td></tr>').join('')+'</table>';$('discovery').innerHTML=discoveryHtml(discovery);$('usage').innerHTML=usageHtml(usage);$('routing').innerHTML=routingHtml(status.stableAliases||[]);$('models').innerHTML=modelsHtml(models.data);populateSyncChannelSelect(status.channels);populateModelSelect(models.data);renderChanges(revisions.data||[],audits.data||[],status)}catch(e){$('summary').textContent=e.message}}
+function renderChanges(revisions,audits,status){const valid=revisions.filter(item=>item.valid!==false);if(!valid.length){$('changes').innerHTML='<p class="muted">暂无可用 revision 历史。</p>';return}const preferred=status.restartRequired?status.loadedRevision:(valid[1]?.revision||valid[0]?.revision);const active=Boolean(status.controlJobs?.active);const rows=revisions.map(item=>'<tr><td>'+esc(formatTimestamp(item.createdAt))+'</td><td>'+esc(operationLabel(item.operation))+'</td><td><code>'+esc(item.revision)+'</code></td><td>'+esc(item.valid===false?'损坏':affectedText(item.affected))+'</td></tr>').join('');const auditRows=audits.map(item=>'<tr><td>'+esc(formatTimestamp(item.at))+'</td><td>'+esc(operationLabel(item.operation))+'</td><td class="'+(item.result==='success'?'ok':'error')+'">'+esc(item.result==='success'?'成功':'失败')+'</td><td><code>'+esc(item.revision||'-')+'</code></td><td>'+Number(item.durationMs||0)+' ms'+(item.errorCode?' / '+esc(item.errorCode):'')+'</td></tr>').join('');const auditHtml=auditRows?'<h3>最近审计结果</h3><table><tr><th>时间</th><th>操作</th><th>结果</th><th>Revision</th><th>耗时 / 错误码</th></tr>'+auditRows+'</table>':'';$('changes').innerHTML='<p class="muted">运行中 <code>'+esc(status.loadedRevision||'-')+'</code>；待应用 <code>'+esc(status.pendingRevision||'-')+'</code>；审计 '+esc(status.audit?.storage||'memory')+' / '+Number(status.audit?.count||0)+' 条</p><div class="toolbar"><label>目标 revision<select id="revisionSelect">'+valid.map(item=>'<option value="'+esc(item.revision)+'">'+esc(formatTimestamp(item.createdAt)+' · '+operationLabel(item.operation))+'</option>').join('')+'</select></label><button id="revisionDiffButton" type="button">查看脱敏 diff</button><button id="revisionRollbackButton" class="secondary" type="button">回滚到此 revision</button></div><pre id="changeDiff" class="muted">请选择 revision 查看变化。</pre><table><tr><th>时间</th><th>操作</th><th>Revision</th><th>影响</th></tr>'+rows+'</table>'+auditHtml;const select=$('revisionSelect');if(valid.some(item=>item.revision===preferred))select.value=preferred;$('revisionDiffButton').disabled=active;$('revisionRollbackButton').disabled=active;$('revisionDiffButton').onclick=loadRevisionDiff;$('revisionRollbackButton').onclick=rollbackSelectedRevision}
+function operationLabel(value){return ({'startup-baseline':'启动基线','external-change':'外部变更','channel-create':'新增渠道','channel-import':'导入渠道','channel-update':'更新渠道','channel-delete':'删除渠道','model-update':'更新模型','alias-update':'更新别名','model-sync':'同步模型','runtime-rollback':'运行回滚'}[value]||value||'未知')}
+function affectedText(value){const channels=value?.channelIds?.length||0;const models=value?.modelIds?.length||0;return channels+' 渠道 / '+models+' 模型'}
+async function loadRevisionDiff(){const revision=$('revisionSelect').value;const output=$('changeDiff');if(!revision)return;const button=$('revisionDiffButton');button.disabled=true;output.className='muted';output.textContent='正在计算脱敏 diff…';try{const data=await call('/admin/api/revisions/'+encodeURIComponent(revision)+'/diff');output.textContent=diffSummary(data.diff)}catch(e){output.className='error';output.textContent=e.message}finally{button.disabled=false}}
+function diffSummary(diff){const lines=[];const channels=diff?.channels||{};for(const id of channels.added||[])lines.push('渠道新增：'+id);for(const id of channels.removed||[])lines.push('渠道删除：'+id);for(const item of channels.changed||[]){const fields=Object.keys(item).filter(key=>key!=='id'&&item[key]===true).map(changeFieldLabel);lines.push('渠道变更：'+item.id+(fields.length?' ['+fields.join('，')+']':''))}const models=diff?.models||{};for(const id of models.added||[])lines.push('模型新增：'+id);for(const id of models.removed||[])lines.push('模型删除：'+id);for(const item of models.changed||[])lines.push('模型变更：'+item.id+' ['+Object.keys(item).filter(key=>key!=='id'&&item[key]===true).map(changeFieldLabel).join('，')+']');for(const type of ['stable','pinned']){const aliases=diff?.aliases?.[type]||{};for(const item of aliases.added||[])lines.push('别名新增：'+item.alias+' -> '+item.target);for(const item of aliases.removed||[])lines.push('别名删除：'+item.alias);for(const item of aliases.changed||[])lines.push('别名变更：'+item.alias+'，'+item.from+' -> '+item.to)}return lines.join('\\n')||'与当前待应用配置没有结构变化。'}
+function changeFieldLabel(value){return ({nameChanged:'名称',baseUrlChanged:'Base URL',apiKeyReplaced:'API key 已替换',protocolChanged:'协议',enabledChanged:'启用状态',priorityChanged:'优先级',stagedChanged:'待测试状态',statusChanged:'模型状态',aliasesChanged:'模型别名',kindChanged:'模型类型',streamingChanged:'请求模式',canaryEligibleChanged:'测活资格'}[value]||value)}
+async function rollbackSelectedRevision(){const revision=$('revisionSelect').value;if(!revision||!confirm('确认回滚到 revision '+revision+'？运行请求会先排空。'))return;const button=$('revisionRollbackButton');const output=$('changeDiff');button.disabled=true;output.className='muted';output.textContent='正在排空请求并回滚…';try{const data=await call('/admin/api/revisions/'+encodeURIComponent(revision)+'/rollback',{method:'POST',body:JSON.stringify({confirmRevision:revision})});output.className='ok';output.textContent=data.changed?'回滚完成，运行 revision '+data.revision:'当前配置已与目标 revision 一致';await refresh()}catch(e){output.className='error';output.textContent=e.message}finally{button.disabled=false}}
 function populateSyncChannelSelect(channels){const select=$('syncChannelIds');const previous=select.value;select.replaceChildren(new Option('全部生产渠道',''));for(const channel of channels.slice().sort((left,right)=>left.id.localeCompare(right.id))){const state=channel.staged?'待测试':channel.enabled?'生产启用':'已停用';select.add(new Option(channel.id+' ['+state+']',channel.id))}if(channels.some(channel=>channel.id===previous))select.value=previous}
 function healthLabel(value){return ({healthy:'健康',unknown:'未测试',degraded:'降级',cooling:'冷却中','auth-failed':'认证失败','payment-blocked':'支付受限'}[value]||value||'未测试')}
 function populateModelSelect(groups){const select=$('model');const previous=select.value;select.replaceChildren(new Option('请选择要测试或管理的精确模型',''));const candidates=groups.flatMap(group=>group.candidates||[]).filter((candidate,index,list)=>list.findIndex(item=>item.directId===candidate.directId)===index).sort((left,right)=>left.channel.localeCompare(right.channel)||left.upstreamModel.localeCompare(right.upstreamModel));modelCandidates=new Map();const byChannel=new Map();for(const candidate of candidates){const optionGroup=byChannel.get(candidate.channel)||(()=>{const created=document.createElement('optgroup');created.label=candidate.channel;select.append(created);byChannel.set(candidate.channel,created);return created})();const states=[modelKindLabel(candidate.kind),streamingLabel(candidate.streaming)];if(candidate.staged)states.push('待测试');if(candidate.channelEnabled===false&&!candidate.staged)states.push('已停用');if(candidate.status==='stale')states.push('stale');if(candidate.status==='disabled')states.push('已禁用');if(candidate.busy)states.push('当前忙碌');if(candidate.draining)states.push('排空中');if(candidate.suppressed)states.push('配置待应用');const directId=candidate.directId||candidate.channel+'/'+candidate.upstreamModel;modelCandidates.set(directId,candidate);const option=new Option(directId+' ['+states.join('，')+']',directId);option.title=directId;optionGroup.append(option)}if(modelCandidates.has(previous))select.value=previous;updateModelButtons();$('testHint').textContent=restartRequired?'配置已更新；仍可继续调整路由，重启后再执行模型测活':candidates.length?'请选择一个精确模型；忙碌或已禁用模型不能测活；仅生成型且具备测活资格的模型可执行固定任务':'暂无模型，请先同步模型目录'}

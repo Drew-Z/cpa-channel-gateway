@@ -5,6 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { loadConfig } from '../src/config.mjs'
 import { createPrivateConfigManager } from '../src/config-manager.mjs'
+import { createConfigRevisionStore } from '../src/config-revisions.mjs'
 import { applyProviderMigration, planProviderMigration } from '../src/provider-migration.mjs'
 
 test('provider migration is a dry-run by default and preserves normalized semantics', () => {
@@ -68,7 +69,11 @@ test('provider-mode manager writes providers without putting channel secrets bac
   const providers = JSON.parse(fs.readFileSync(path.join(root, 'config', 'providers.local.json'), 'utf8'))
   assert.equal(providers.providers.find(provider => provider.id === 'backup').apiKey, 'backup-secret-key-123456')
   assert.doesNotMatch(fs.readFileSync(path.join(root, 'config', 'channels.local.env'), 'utf8'), /backup-secret/)
-  await manager.syncModels(['backup'])
+  const sync = await manager.syncModels(['backup'])
+  const syncRevision = createConfigRevisionStore({ root }).read(sync.revision)
+  assert.equal(syncRevision.manifest.operation, 'model-sync')
+  assert.equal(typeof syncRevision.snapshot.providersText, 'string')
+  assert.match(syncRevision.snapshot.providersText, /backup-secret-key-123456/)
   manager.updateChannel('backup', { staged: false, enabled: true, priority: 11 })
   assert.equal(loadConfig(root).channels.find(channel => channel.id === 'backup').enabled, true)
   manager.updateChannel('backup', { enabled: false })

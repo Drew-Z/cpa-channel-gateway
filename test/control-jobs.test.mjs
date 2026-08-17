@@ -57,3 +57,37 @@ test('rejects invalid job types and protects the queue from unbounded backlog', 
   await active
   assert.equal(await queued, 'queued')
 })
+
+test('notifies completion with safe job context and ignores audit hook failures', async () => {
+  const events = []
+  const queue = createControlJobQueue({
+    idFactory: () => 'job-1',
+    now: (() => {
+      let value = Date.parse('2026-08-17T12:00:00.000Z')
+      return () => value += 25
+    })(),
+    onFinished: async event => {
+      events.push(event)
+      throw new Error('audit sink failure')
+    }
+  })
+  const result = await queue.run('model-sync', context => {
+    assert.deepEqual(Object.keys(context).sort(), ['id', 'startedAt', 'submittedAt', 'type'])
+    return {
+      revision: '20260817T120000025Z-0123456789abcdef-01234567',
+      body: 'must not reach hook'
+    }
+  })
+  assert.equal(result.body, 'must not reach hook')
+  assert.deepEqual(events[0], {
+    id: 'job-1',
+    type: 'model-sync',
+    status: 'completed',
+    submittedAt: '2026-08-17T12:00:00.025Z',
+    startedAt: '2026-08-17T12:00:00.050Z',
+    finishedAt: '2026-08-17T12:00:00.075Z',
+    durationMs: 25,
+    revision: '20260817T120000025Z-0123456789abcdef-01234567'
+  })
+  assert.doesNotMatch(JSON.stringify(events), /must not reach hook|audit sink failure/)
+})

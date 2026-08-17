@@ -70,9 +70,11 @@ CPA 的 Codex 兼容头由 `gateway.json` 中的 `cpa.disableCodexCloaking` 控�
 
 当前管理台提供渠道/模型状态、路由管理和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。登录后“客户端连接”区域还会根据当前访问域名生成带 `/v1` 的 Base URL，并提供复制按钮；`GATEWAY_API_KEY` 默认仅显示掩码，显式点击“显示”或“复制 API key”时才通过带 CSRF 保护的已认证同源 `POST` 取回，不写入初始 HTML，显示后 30 秒自动恢复掩码。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
 
-管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名请求体为 `{ "alias", "channel", "model" }`。禁用仍被 stable/pinned alias 引用的模型会返回 `409 model_has_aliases`。请求必须带会话 CSRF token 和同源 `Origin`；新增渠道的 API key 只写入服务器，不在变更响应中返回。成功响应为 `202`，包含脱敏的 `revision` 与 `restartRequired: true`；当前进程不会静默热切换，需按部署流程重启以应用新 revision。所有变更先备份到 `runtime/config-revisions/`，验证失败自动恢复。
+管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无别名引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名请求体为 `{ "alias", "channel", "model" }`。禁用仍被 stable/pinned alias 引用的模型会返回 `409 model_has_aliases`。请求必须带会话 CSRF token 和同源 `Origin`；新增渠道的 API key 只写入服务器，不在变更响应中返回。成功响应包含脱敏的 `revision` 与 `restartRequired`。每次成功变更都在 `runtime/config-revisions/<revision>/` 保存变更后的完整快照和低敏 manifest；验证或 revision 写入失败会恢复原配置。
 
 配置写入和模型同步使用单一 FIFO 控制作业队列，`GET /admin/api/status` 的 `controlJobs` 返回当前作业、等待数量和最近低敏结果；队列满时返回 `429 control_queue_full`。停用、待测试或删除当前渠道会先进入排空状态，停止新的生产预约并等待在途租约释放；禁用模型会临时抑制当前进程的该候选。正式启动脚本中的 `POST /admin/api/runtime/apply` 会在排空后替换内部 CPA/HAProxy，执行 readiness，并在失败时恢复旧 release；成功后父 Node 路由和 `loadedRevision` 一起更新。没有运行时监督器的进程仍需重启应用。
+
+Changes 相关 API 为 `GET /admin/api/revisions`、`GET /admin/api/revisions/<revision>/diff`、`POST /admin/api/revisions/<revision>/rollback` 和 `GET /admin/api/audit-events`。diff 不返回快照、URL 或密钥值；rollback 请求体必须包含完全一致的 `{ "confirmRevision": "<revision>" }`。apply 与 rollback 共用同一 FIFO；rollback 的排空/readiness/激活失败时会恢复回滚前私有快照和旧 release。审计 JSONL 只保留 job ID、操作、结果、revision、耗时和分类错误码。
 
 `GET /admin/api/usage` 返回最近 24 小时真实业务请求的低敏聚合结果。统计口径如下：
 

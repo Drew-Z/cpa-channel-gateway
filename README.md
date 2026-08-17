@@ -14,7 +14,7 @@ HAProxy listener 均绑定到容器回环地址。
 - Node 为每个物理渠道持有一个互斥租约。渠道繁忙时会从所有模型的新请求候选中临时隐藏；没有其他空闲候选时立即返回 `429 all_candidates_busy`，不向上游排队或重复调用。
 - HAProxy 仍以 `maxconn 1` 作为最终硬约束；CPA 和网关都不会自动重放已经发往上游的生成请求。
 - 私有渠道 URL、密钥、激活配置、日志和二进制不会进入 Git。
-- 配置生成按内容寻址，支持原子激活和一次回滚。
+- 私有配置按完整快照保存带 manifest 的 revision；运行时 release 按内容寻址，支持排空、readiness 验证和事务回滚。
 - canary 使用真实小任务，不使用 `hi`、`你好` 等无意义提示词。
 - 流式与非流式请求按模型能力筛选候选；不支持时返回 `422 streaming_not_supported`，不会静默降级或重放请求。
 - 开启 `CPA_MANAGEMENT_KEY` 后，可在同一公网端口的 `/admin` 使用管理台查看渠道状态、逻辑模型候选和执行精确渠道模型测活。
@@ -112,6 +112,8 @@ npm run migrate:providers -- --apply
 
 `CPA_MANAGEMENT_KEY` 留空时 `/admin` 不开放。填写独立的 32 字符以上随机管理密钥并重启后，访问同一域名的 `/admin` 登录。管理台的会话只保存在 Node 内存中，重启后失效；模型下拉框同时用于测活和路由管理，不需要手写 ID。忙碌或已禁用模型不能测活，但仍可被选中管理；可以直接设置 `coding-main`、`coding-backup`，或禁用/恢复精确渠道模型。禁用仍被 stable/pinned alias 引用的模型会被拒绝，必须先移动别名。配置写入但尚未重启时，测活按钮会自动禁用，路由调整仍可继续批量完成。所有配置写入和模型同步都经过单一 FIFO 控制作业队列；渠道停用、待测试或删除会立即显示“排空中”，停止新预约但允许在途请求正常结束。管理台状态会显示当前作业、等待数量和低敏最近作业记录。待测试渠道会启动内网 HAProxy/CPA listener，但不会出现在公开 `/v1/models`，也不会被生产调度；只有管理员点击“设为生产”后才会加入统一模型出口。测活使用固定诗词任务、同一渠道互斥租约和相同协议路径，只保存状态摘要、transport、延迟与正文长度，不保存诗词正文。
 
+管理台的 Changes 区域展示 loaded/pending revision、有限历史、结构化脱敏 diff 和最近审计结果。Base URL 在 diff 中只显示“已变化”，API key 只显示“已替换”；快照原文不会进入 API 或 DOM。回滚必须先查看目标 revision，再二次确认；它与 runtime apply 共用同一 FIFO，排空在途请求、生成并验证 release，成功激活后才提交 loaded revision。损坏 revision、排空超时或 readiness 失败都会保留当前私有配置和运行时。审计写入 Git 忽略的 `runtime/audit-events.jsonl`，只含 job ID、操作、结果、revision、耗时和分类错误码。
+
 管理台的渠道列表会向已登录管理员显示经过校验的 Base URL，方便区分名称相近的渠道；公开模型 API、未登录响应和日志不会暴露该地址。健康状态会显示为“健康”“未测试”“降级”等中文状态。模型目录同步使用已有渠道下拉框，留空时同步生产渠道，不需要手写渠道 ID；API 仍支持脚本传入精确渠道 ID。管理台会比较私有 env 与 routes：env 中已有、routes 尚未登记的渠道会出现在“渠道发现”，可一键导入为待测试，或导入后立即只读同步 `/models`；已经写入 routes 但当前进程尚未加载的渠道会显示“等待重启”。同步失败不会回滚已导入的待测试渠道，但不会把它加入生产调度。生成新配置后，正式启动脚本还提供“应用待重启配置”：排空请求、替换内部 CPA/HAProxy、检查 readiness，并在失败时恢复旧 release；没有运行时监督器时仍需重启容器。模型目录中已从上游消失、但仍被 stable/pinned alias 引用的模型会标记为 `stale`，不会自动替换 `coding-backup`。渠道健康、冷却、candidate 配置错误和最近测活摘要写入 Git 忽略的 `runtime/control-state.json`，重启后按 release 和时效规则恢复；完整隐私与失效契约见 [控制状态持久化](docs/control-state.md)。管理台还展示滚动 24 小时真实业务请求统计，包括请求总数、成功/失败/取消数量、成功率、逻辑模型、请求入口和实际渠道模型。管理台测活不计入使用统计。统计事件写入 Git 忽略的 `runtime/usage-events.jsonl`，仅包含时间、模型路由、结果和 transport；不保存提示词、响应正文、请求头、密钥、用户标识或请求 ID。成功率按完整返回的 `2xx` 请求数除以全部请求数计算，容器重启后仍可从本地事件文件恢复。
 
 登录后的“客户端连接”区域会根据当前访问域名生成带 `/v1` 的 Base URL，并提供复制按钮；`GATEWAY_API_KEY` 默认只显示掩码，只有显式点击“显示”或“复制 API key”时才通过带 CSRF 保护的已认证同源请求取回，显示后 30 秒自动恢复掩码。连接接口始终 `no-store`，不会把完整密钥写入初始 HTML、日志或公开 API。渠道 API key、管理密钥和 Tunnel Token 永不回显。控制作业与排空契约见 [控制作业与排空](docs/control-jobs.md)。
@@ -164,13 +166,15 @@ npm run check
 npm run activate
 ```
 
-重启容器使 CPA 使用新 release。需要回退时：
+重启容器使 CPA 使用新 release。需要同时恢复私有配置和运行时时，优先在管理台 Changes 中选择目标 revision 并确认回滚。
+
+下列旧命令只切换 active/previous 运行时 release，不恢复 `config/*.local.*`，因此不能替代 Changes 回滚：
 
 ```bash
 npm run rollback
 ```
 
-回滚后同样重启容器。运行时 release 含密钥，只能保存在容器持久化目录中。
+执行旧命令后同样需要重启容器。私有 revision 和运行时 release 都可能包含密钥，只能保存在容器持久化目录中，不能提交或复制到公开日志。
 
 ## 任务型验收
 
@@ -203,6 +207,7 @@ npm run canary
 - Cloudflare Tunnel 默认关闭；Token 只存在于 `channels.local.env`，并通过子进程环境传递。cloudflared 固定版本、校验 SHA-256 且禁用自动更新。
 - CPA Management API 默认关闭；确需开启时仍只允许 localhost。
 - 不提交 `config/*.local.*`、`runtime/`、`auth/`、`logs/` 或 `bin/`。
+- `runtime/config-revisions/` 保存完整私有快照；`runtime/audit-events.jsonl` 只保存白名单低敏字段，两者都必须保持 Git 忽略。
 - 公开或发布前运行 `npm run audit:public`；该检查会扫描当前跟踪文件、完整可达 Git 历史以及本地私密值是否意外进入仓库，但不会输出私密值。
 - CPA 当前启用 Codex 的标准兼容头（由 `cpa.disableCodexCloaking=false` 控制），用于适配通常只检查 `User-Agent`/`Originator` 的上游；这不是客户端真实性证明，也不会复制 Desktop 版本。身份混淆、Claude cloaking 和系统提示词替换仍保持关闭；Responses 同协议 native 路径继续保留真实客户端实际发送的低敏请求头。
 - 启动时使用 CPA 的 `-local-model`，模型目录来自已审核的本地 routes 配置，不依赖远程模型目录服务。

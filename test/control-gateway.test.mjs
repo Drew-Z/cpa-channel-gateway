@@ -674,6 +674,162 @@ test('admin API updates model status and stable aliases through the private conf
   ])
 })
 
+test('revision history and structured diff are authenticated and audit jobs stay redacted', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const revisionId = '20260817T120000000Z-0123456789abcdef-01234567'
+  const auditEvents = []
+  const configManager = {
+    status: () => ({ revision: revisionId, loadedRevision: revisionId, pendingRevision: revisionId, restartRequired: false }),
+    routing: () => ({ stableAliases: [], pinnedAliases: [], models: [{ channel: 'free', model: 'shared-model', kind: 'generation', streaming: 'both', canaryEligible: true, status: 'active' }] }),
+    revisions: () => [{ revision: revisionId, operation: 'startup-baseline', contentDigest: 'a'.repeat(64), affected: { channelIds: [], modelIds: [] }, valid: true }],
+    revisionDiff: () => ({
+      from: { revision: revisionId },
+      to: { revision: revisionId },
+      diff: { channels: { added: [], removed: [], changed: [{ id: 'free', baseUrlChanged: true, apiKeyReplaced: true }] }, models: { added: [], removed: [], changed: [] }, aliases: { stable: { added: [], removed: [], changed: [] }, pinned: { added: [], removed: [], changed: [] } } }
+    }),
+    updateModelStatus: () => ({ channel: 'free', model: 'shared-model', status: 'active', revision: revisionId })
+  }
+  const auditStore = {
+    record: event => { auditEvents.push(event); return true },
+    status: () => ({ storage: 'memory', count: auditEvents.length }),
+    list: () => auditEvents.slice()
+  }
+  const gateway = createControlGateway(config, { configManager, auditStore })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+
+  const list = await request({ port: address.port, method: 'GET', path: '/admin/api/revisions', headers: { cookie } })
+  assert.equal(list.statusCode, 200)
+  assert.equal(JSON.parse(list.body).data[0].revision, revisionId)
+  const diff = await request({ port: address.port, method: 'GET', path: `/admin/api/revisions/${revisionId}/diff`, headers: { cookie } })
+  assert.equal(diff.statusCode, 200)
+  assert.equal(JSON.parse(diff.body).diff.channels.changed[0].apiKeyReplaced, true)
+  assert.doesNotMatch(diff.body, /upstream\.example\.test|fixture-upstream-key|fixture_gateway_key/)
+
+  const update = await request({ port: address.port, method: 'PATCH', path: '/admin/api/models', headers, body: { channel: 'free', model: 'shared-model', status: 'active' } })
+  assert.equal(update.statusCode, 202)
+  await waitFor(() => auditEvents.length === 1)
+  assert.deepEqual(auditEvents[0], {
+    jobId: auditEvents[0].jobId,
+    operation: 'model-update',
+    result: 'success',
+    revision: revisionId,
+    durationMs: auditEvents[0].durationMs
+  })
+  const audit = await request({ port: address.port, method: 'GET', path: '/admin/api/audit-events?limit=20', headers: { cookie } })
+  assert.equal(audit.statusCode, 200)
+  assert.equal(JSON.parse(audit.body).data[0].operation, 'model-update')
+  assert.doesNotMatch(JSON.stringify(auditEvents), /fixture-upstream-key|fixture_gateway_key/)
+})
+
+test('rollback requires explicit confirmation, is serialized, and restores after runtime failure', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const currentRevision = '20260817T120000000Z-0123456789abcdef-01234567'
+  const rollbackRevision = '20260817T120001000Z- fedcba9876543210-76543210'.replaceAll(' ', '')
+  let prepared = 0
+  let restored = 0
+  let shouldFail = true
+  const configManager = {
+    status: () => ({ revision: shouldFail ? currentRevision : rollbackRevision, loadedRevision: shouldFail ? currentRevision : rollbackRevision, pendingRevision: shouldFail ? currentRevision : rollbackRevision, restartRequired: false }),
+    routing: () => ({ stableAliases: [], pinnedAliases: [], models: [] }),
+    prepareRollback: targetRevision => {
+      prepared += 1
+      assert.equal(targetRevision, currentRevision)
+      return { changed: true, revision: rollbackRevision, previousManifest: { revision: currentRevision }, previousSnapshot: {} }
+    },
+    restoreRollback: () => { restored += 1 }
+  }
+  const runtimeManager = {
+    apply: async () => {
+      if (shouldFail) {
+        const error = new Error('private runtime failure')
+        error.code = 'runtime_not_ready'
+        error.statusCode = 503
+        throw error
+      }
+      return { changed: true, active: { digest: 'rollback-release' } }
+    },
+    status: () => ({ active: null, transitioning: false, available: true })
+  }
+  const gateway = createControlGateway(config, { configManager, runtimeManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+  const pathValue = `/admin/api/revisions/${currentRevision}/rollback`
+
+  const missingConfirmation = await request({ port: address.port, path: pathValue, headers, body: {} })
+  assert.equal(missingConfirmation.statusCode, 400)
+  assert.equal(prepared, 0)
+  const failed = await request({ port: address.port, path: pathValue, headers, body: { confirmRevision: currentRevision } })
+  assert.equal(failed.statusCode, 503)
+  assert.equal(restored, 1)
+
+  shouldFail = false
+  const succeeded = await request({ port: address.port, path: pathValue, headers, body: { confirmRevision: currentRevision } })
+  assert.equal(succeeded.statusCode, 202)
+  assert.equal(JSON.parse(succeeded.body).rollbackRevision, rollbackRevision)
+  assert.equal(restored, 1)
+})
+
+test('concurrent runtime apply and rollback execute through the same FIFO', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const targetRevision = '20260817T120000000Z-0123456789abcdef-01234567'
+  const rollbackRevision = '20260817T120001000Z-fedcba9876543210-76543210'
+  const order = []
+  let releaseApply
+  let applyCalls = 0
+  const runtimeManager = {
+    status: () => ({ active: null, transitioning: false, available: true }),
+    apply: async () => {
+      applyCalls += 1
+      if (applyCalls === 1) {
+        order.push('apply-start')
+        await new Promise(resolve => { releaseApply = resolve })
+        order.push('apply-end')
+      } else {
+        order.push('rollback-runtime')
+      }
+      return { changed: true, active: { digest: `release-${applyCalls}` } }
+    }
+  }
+  const configManager = {
+    status: () => ({ revision: rollbackRevision, loadedRevision: rollbackRevision, pendingRevision: rollbackRevision, restartRequired: false }),
+    routing: () => ({ stableAliases: [], pinnedAliases: [], models: [] }),
+    prepareRollback: () => {
+      order.push('rollback-prepare')
+      return { changed: true, revision: rollbackRevision, previousManifest: { revision: targetRevision }, previousSnapshot: {} }
+    },
+    restoreRollback: () => {}
+  }
+  const gateway = createControlGateway(config, { configManager, runtimeManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+
+  const apply = request({ port: address.port, path: '/admin/api/runtime/apply', headers, body: {} })
+  await waitFor(() => order.includes('apply-start'))
+  const rollback = request({ port: address.port, path: `/admin/api/revisions/${targetRevision}/rollback`, headers, body: { confirmRevision: targetRevision } })
+  await waitFor(() => gateway.controlJobs.status().queued === 1)
+  assert.deepEqual(order, ['apply-start'])
+  releaseApply()
+  assert.equal((await apply).statusCode, 200)
+  assert.equal((await rollback).statusCode, 202)
+  assert.deepEqual(order, ['apply-start', 'apply-end', 'rollback-prepare', 'rollback-runtime'])
+})
+
 test('admin models honor an explicitly empty pending catalog', async t => {
   const config = fixtureConfig(19001)
   config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
@@ -727,6 +883,12 @@ test('admin page is no-store and uses a per-response CSP nonce', async t => {
   assert.match(first.body, /客户端连接/)
   assert.match(first.body, /id="applyButton"/)
   assert.match(first.body, /\/admin\/api\/runtime\/apply/)
+  assert.match(first.body, /id="changes"/)
+  assert.match(first.body, /\/admin\/api\/revisions\?limit=20/)
+  assert.match(first.body, /\/admin\/api\/audit-events\?limit=20/)
+  assert.match(first.body, /rollbackSelectedRevision/)
+  assert.match(first.body, /confirmRevision/)
+  assert.match(first.body, /apiKeyReplaced/)
   assert.match(first.body, /复制 Base URL/)
   assert.match(first.body, /复制 API key/)
   assert.doesNotMatch(first.body, new RegExp(GATEWAY_KEY))
