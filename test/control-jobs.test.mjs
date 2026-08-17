@@ -56,6 +56,7 @@ test('rejects invalid job types and protects the queue from unbounded backlog', 
   release()
   await active
   assert.equal(await queued, 'queued')
+  assert.equal(await queue.run('revision-prune', () => 'pruned'), 'pruned')
 })
 
 test('notifies completion with safe job context and ignores audit hook failures', async () => {

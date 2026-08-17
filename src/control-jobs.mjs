@@ -13,6 +13,7 @@ const JOB_TYPES = new Set([
   'logical-model-create',
   'logical-model-update',
   'logical-model-delete',
+  'revision-prune',
   'runtime-apply',
   'runtime-rollback'
 ])

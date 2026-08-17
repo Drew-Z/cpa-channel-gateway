@@ -977,6 +977,52 @@ test('revision history and structured diff are authenticated and audit jobs stay
   assert.doesNotMatch(JSON.stringify(auditEvents), /fixture-upstream-key|fixture_gateway_key/)
 })
 
+test('revision pruning requires CSRF and exact keep confirmation and runs through the control queue', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const revisionId = '20260817T120000000Z-0123456789abcdef-01234567'
+  const auditEvents = []
+  let pruneCalls = 0
+  const revisionStorage = { count: 75, validCount: 74, invalidCount: 1, totalBytes: 4096, keep: 50, protectedCount: 1, prunableCount: 25, prunableBytes: 1024, plans: {} }
+  const configManager = {
+    status: () => ({ revision: revisionId, loadedRevision: revisionId, pendingRevision: revisionId, restartRequired: false, revisionStorage }),
+    routing: () => ({ stableAliases: [], pinnedAliases: [], models: [] }),
+    pruneRevisions: ({ keep }) => {
+      pruneCalls += 1
+      return { keep, removedCount: 25, reclaimedBytes: 1024, revision: revisionId, restartRequired: false }
+    }
+  }
+  const auditStore = {
+    record: event => { auditEvents.push(event); return true },
+    status: () => ({ storage: 'memory', count: auditEvents.length }),
+    list: () => auditEvents.slice()
+  }
+  const gateway = createControlGateway(config, { configManager, auditStore })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+  const status = await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })
+  assert.equal(JSON.parse(status.body).revisionStorage.prunableCount, 25)
+
+  const unauthenticated = await request({ port: address.port, path: '/admin/api/revisions/prune', body: { keep: 50, confirmKeep: 50 } })
+  assert.equal(unauthenticated.statusCode, 401)
+  const unconfirmed = await request({ port: address.port, path: '/admin/api/revisions/prune', headers, body: { keep: 50, confirmKeep: 20 } })
+  assert.equal(unconfirmed.statusCode, 400)
+  assert.equal(JSON.parse(unconfirmed.body).error.code, 'revision_prune_confirmation_required')
+  const pruned = await request({ port: address.port, path: '/admin/api/revisions/prune', headers, body: { keep: 50, confirmKeep: 50 } })
+  assert.equal(pruned.statusCode, 200)
+  assert.equal(JSON.parse(pruned.body).removedCount, 25)
+  assert.equal(pruneCalls, 1)
+  await waitFor(() => auditEvents.length === 1)
+  assert.equal(auditEvents[0].operation, 'revision-prune')
+  assert.equal(auditEvents[0].revision, revisionId)
+  assert.doesNotMatch(JSON.stringify(auditEvents), /fixture_management_key|fixture-upstream-key/)
+})
+
 test('rollback requires explicit confirmation, is serialized, and restores after runtime failure', async t => {
   const config = fixtureConfig(19001)
   config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
@@ -1129,6 +1175,9 @@ test('admin page serves the built app with strict static CSP and immutable asset
   assert.match(asset.body, /禁用后该模型会从公开目录和生产调度移除/)
   assert.match(asset.body, /删除前必须先移走稳定别名引用/)
   assert.match(asset.body, /现有逻辑模型 ID 不可修改/)
+  assert.match(asset.body, /整理 revision 历史/)
+  assert.match(asset.body, /删除后不能在管理台恢复/)
+  assert.match(asset.body, /\/admin\/api\/revisions\/prune/)
   assert.match(asset.body, /\/admin\/api\/stable-aliases/)
   assert.match(asset.body, /\/admin\/api\/runtime\/apply/)
   assert.match(asset.body, /\/admin\/api\/revisions/)

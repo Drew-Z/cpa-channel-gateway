@@ -74,7 +74,7 @@ CPA 的 Codex 兼容头由 `gateway.json` 中的 `cpa.disableCodexCloaking` 控�
 
 配置写入和模型同步使用单一 FIFO 控制作业队列，`GET /admin/api/status` 的 `controlJobs` 返回当前作业、等待数量和最近低敏结果；队列满时返回 `429 control_queue_full`。停用、待测试或删除当前渠道会先进入排空状态，停止新的生产预约并等待在途租约释放；禁用模型会临时抑制当前进程的该候选。正式启动脚本中的 `POST /admin/api/runtime/apply` 会在排空后替换内部 CPA/HAProxy，执行 readiness，并在失败时恢复旧 release；成功后父 Node 路由和 `loadedRevision` 一起更新。没有运行时监督器的进程仍需重启应用。
 
-Changes 相关 API 为 `GET /admin/api/revisions`、`GET /admin/api/revisions/<revision>/diff`、`POST /admin/api/revisions/<revision>/rollback` 和 `GET /admin/api/audit-events`。diff 不返回快照、URL 或密钥值；rollback 请求体必须包含完全一致的 `{ "confirmRevision": "<revision>" }`。apply 与 rollback 共用同一 FIFO；成功应用后 revision manifest 会原子记录对应的 16 位 release digest，release 清理会保护所有有效 revision 引用；rollback 的排空/readiness/激活失败时会恢复回滚前私有快照和旧 release。审计 JSONL 只保留 job ID、操作、结果、revision、耗时和分类错误码。
+Changes 相关 API 为 `GET /admin/api/revisions`、`GET /admin/api/revisions/<revision>/diff`、`POST /admin/api/revisions/<revision>/rollback`、`POST /admin/api/revisions/prune` 和 `GET /admin/api/audit-events`。diff 不返回快照、URL 或密钥值；rollback 请求体必须包含完全一致的 `{ "confirmRevision": "<revision>" }`。状态中的 `revisionStorage` 只返回数量、总字节数、时间范围和 20/50/100 份保留方案，不返回快照内容或服务器路径。prune 只接受 20、50 或 100，并要求请求体中的 `keep` 与 `confirmKeep` 完全一致；它只由管理员显式发起，不会在启动或后台自动执行。loaded/pending revision 始终受保护，其余被删除的旧快照不能从管理台恢复。apply、rollback 与 prune 共用同一 FIFO；成功应用后 revision manifest 会原子记录对应的 16 位 release digest，release 清理会保护所有有效 revision 引用；rollback 的排空/readiness/激活失败时会恢复回滚前私有快照和旧 release。审计 JSONL 只保留 job ID、操作、结果、revision、耗时和分类错误码。
 
 `GET /admin/api/usage` 返回最近 24 小时真实业务请求的低敏聚合结果。统计口径如下：
 

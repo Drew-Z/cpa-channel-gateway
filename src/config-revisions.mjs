@@ -8,6 +8,7 @@ const REVISION_ID = /^\d{8}T\d{9}Z-[a-f0-9]{16}-[a-f0-9]{8}$/
 const RELEASE_DIGEST = /^[a-f0-9]{16}$/
 const OPERATION = /^[a-z][a-z0-9-]{0,63}$/
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
+const DEFAULT_PRUNE_KEEP = 50
 
 export class ConfigRevisionError extends Error {
   constructor(code, statusCode, message) {
@@ -117,6 +118,34 @@ export function createConfigRevisionStore({
         .sort((left, right) => String(right.createdAt ?? '').localeCompare(String(left.createdAt ?? '')) || right.revision.localeCompare(left.revision))
         .slice(0, boundedLimit)
     },
+    inventory({ keep = DEFAULT_PRUNE_KEEP, protectedRevisions = [] } = {}) {
+      return publicPrunePlan(buildPrunePlan(revisionRoot, { keep, protectedRevisions }))
+    },
+    inventoryOptions({ keeps = [DEFAULT_PRUNE_KEEP], protectedRevisions = [] } = {}) {
+      const entries = revisionEntries(revisionRoot)
+      const options = [...new Set((Array.isArray(keeps) ? keeps : []).map(normalizePruneKeep))]
+      return Object.fromEntries(options.map(keep => [String(keep), publicPrunePlan(buildPrunePlan(revisionRoot, { keep, protectedRevisions, entries }))]))
+    },
+    prune({ keep = DEFAULT_PRUNE_KEEP, protectedRevisions = [] } = {}) {
+      const plan = buildPrunePlan(revisionRoot, { keep, protectedRevisions })
+      try {
+        for (const entry of plan.removable) {
+          if (path.dirname(entry.directory) !== revisionRoot) {
+            throw new ConfigRevisionError('invalid_revision_id', 400, 'Configuration revision path is invalid')
+          }
+          fs.rmSync(entry.directory, { recursive: true })
+        }
+      } catch (error) {
+        if (error instanceof ConfigRevisionError) throw error
+        throw new ConfigRevisionError('revision_prune_failed', 500, 'Configuration revision history could not be pruned')
+      }
+      return {
+        ...publicPrunePlan(plan),
+        removedCount: plan.removable.length,
+        reclaimedBytes: sumBytes(plan.removable),
+        remaining: publicPrunePlan(buildPrunePlan(revisionRoot, { keep, protectedRevisions }))
+      }
+    },
     root: revisionRoot
   }
 }
@@ -140,6 +169,84 @@ function validManifests(revisionRoot) {
 
 function compareManifests(left, right) {
   return right.createdAt.localeCompare(left.createdAt) || right.revision.localeCompare(left.revision)
+}
+
+function buildPrunePlan(revisionRoot, { keep, protectedRevisions, entries: entriesOption = null }) {
+  const retainedLimit = normalizePruneKeep(keep)
+  const protectedIds = new Set((Array.isArray(protectedRevisions) ? protectedRevisions : []).map(normalizeRevisionId))
+  const entries = entriesOption ?? revisionEntries(revisionRoot)
+  const valid = entries.filter(entry => entry.valid)
+  const retainedIds = new Set(valid.slice(0, retainedLimit).map(entry => entry.revision))
+  for (const revision of protectedIds) retainedIds.add(revision)
+  const removable = entries.filter(entry => !retainedIds.has(entry.revision))
+  return {
+    keep: retainedLimit,
+    entries,
+    valid,
+    removable,
+    protectedCount: entries.filter(entry => protectedIds.has(entry.revision)).length
+  }
+}
+
+function revisionEntries(revisionRoot) {
+  if (!fs.existsSync(revisionRoot)) return []
+  return fs.readdirSync(revisionRoot, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && REVISION_ID.test(entry.name))
+    .map(entry => {
+      const directory = revisionPath(revisionRoot, entry.name)
+      try {
+        const manifest = readRevision(revisionRoot, entry.name).manifest
+        return { revision: entry.name, directory, bytes: directoryBytes(directory), valid: true, manifest }
+      } catch {
+        return { revision: entry.name, directory, bytes: directoryBytes(directory), valid: false, manifest: null }
+      }
+    })
+    .sort((left, right) => {
+      const leftOrder = left.manifest?.createdAt ?? left.revision
+      const rightOrder = right.manifest?.createdAt ?? right.revision
+      return rightOrder.localeCompare(leftOrder) || right.revision.localeCompare(left.revision)
+    })
+}
+
+function publicPrunePlan(plan) {
+  const oldest = plan.valid.at(-1)?.manifest ?? null
+  const newest = plan.valid[0]?.manifest ?? null
+  return {
+    count: plan.entries.length,
+    validCount: plan.valid.length,
+    invalidCount: plan.entries.length - plan.valid.length,
+    totalBytes: sumBytes(plan.entries),
+    oldestAt: oldest?.createdAt ?? null,
+    newestAt: newest?.createdAt ?? null,
+    linkedReleaseCount: new Set(plan.valid.map(entry => entry.manifest.releaseDigest).filter(Boolean)).size,
+    keep: plan.keep,
+    protectedCount: plan.protectedCount,
+    prunableCount: plan.removable.length,
+    prunableBytes: sumBytes(plan.removable)
+  }
+}
+
+function directoryBytes(directory) {
+  let total = 0
+  try {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const target = path.join(directory, entry.name)
+      if (entry.isFile() || entry.isSymbolicLink()) total += fs.lstatSync(target).size
+      else if (entry.isDirectory()) total += directoryBytes(target)
+    }
+  } catch {}
+  return total
+}
+
+function sumBytes(entries) {
+  return entries.reduce((sum, entry) => sum + entry.bytes, 0)
+}
+
+function normalizePruneKeep(value) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 1000) {
+    throw new ConfigRevisionError('invalid_revision_keep', 400, 'Revision keep count must be an integer from 1 to 1000')
+  }
+  return value
 }
 
 export function readCurrentSnapshot(root) {

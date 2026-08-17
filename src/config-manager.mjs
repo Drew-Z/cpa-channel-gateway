@@ -37,11 +37,15 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
   return {
     status() {
       const pendingRevision = refreshCurrentRevision().revision
+      const protectedRevisions = [loadedRevision, pendingRevision]
+      const storageOptions = revisionStore.inventoryOptions?.({ keeps: [20, 50, 100], protectedRevisions }) ?? null
+      const revisionStorage = storageOptions?.['50'] ?? revisionStore.inventory?.({ keep: 50, protectedRevisions }) ?? null
       return {
         revision: pendingRevision,
         loadedRevision,
         pendingRevision,
-        restartRequired: pendingRevision !== loadedRevision
+        restartRequired: pendingRevision !== loadedRevision,
+        revisionStorage: revisionStorage ? { ...revisionStorage, plans: storageOptions ?? { '50': revisionStorage } } : null
       }
     },
     markApplied(releaseDigest = config.digest ?? null) {
@@ -59,6 +63,19 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
     },
     revisions(options) {
       return revisionStore.list(options)
+    },
+    revisionStorage({ keep = 50 } = {}) {
+      const pendingRevision = refreshCurrentRevision().revision
+      return revisionStore.inventory?.({ keep, protectedRevisions: [loadedRevision, pendingRevision] }) ?? null
+    },
+    pruneRevisions({ keep = 50 } = {}) {
+      const pendingRevision = refreshCurrentRevision().revision
+      if (!revisionStore.prune) throw new ConfigMutationError('revision_prune_unavailable', 409, 'Configuration revision pruning is unavailable')
+      return {
+        ...revisionStore.prune({ keep, protectedRevisions: [loadedRevision, pendingRevision] }),
+        revision: pendingRevision,
+        restartRequired: pendingRevision !== loadedRevision
+      }
     },
     revision(revision) {
       return revisionStore.read(revision).manifest

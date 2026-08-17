@@ -126,6 +126,34 @@ test('startup links the current revision to the already activated generated rele
   assert.equal(linked.snapshot.routesText, fs.readFileSync(path.join(root, 'config', 'routes.local.json'), 'utf8'))
 })
 
+test('manual revision pruning protects both loaded and pending revisions', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const loadedRevision = manager.status().loadedRevision
+  manager.createChannel({
+    id: 'history',
+    name: 'History Channel',
+    baseUrl: 'https://history.example.test/v1',
+    apiKey: 'history_secret_key_123456',
+    protocol: 'responses',
+    priority: 1
+  })
+  manager.updateChannel('history', { name: 'History Updated' })
+  manager.updateChannel('history', { priority: 2 })
+  const pendingRevision = manager.status().pendingRevision
+
+  const result = manager.pruneRevisions({ keep: 1 })
+
+  assert.equal(result.removedCount, 2)
+  assert.equal(result.restartRequired, true)
+  assert.equal(result.revision, pendingRevision)
+  const store = createConfigRevisionStore({ root })
+  assert.equal(store.read(loadedRevision).manifest.revision, loadedRevision)
+  assert.equal(store.read(pendingRevision).manifest.revision, pendingRevision)
+  assert.equal(manager.status().revisionStorage.count, 2)
+  assert.equal(loadConfig(root).channels.find(channel => channel.id === 'history').priority, 2)
+})
+
 test('stable aliases may temporarily point to a disabled channel', () => {
   const root = fixtureRoot()
   const routesPath = path.join(root, 'config', 'routes.local.json')

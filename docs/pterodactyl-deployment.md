@@ -102,6 +102,8 @@ npm run verify:deployment
 
 该检查会验证 `/healthz`、runtime supervisor、持久化 control state 以及 loaded/pending
 revision；它不会输出管理密钥、gateway key、Cookie、CSRF token、请求体、响应正文或上游原始错误。
+部署验收只读取 revision 容量摘要，绝不会触发历史整理；不要在验收过程中调用
+`POST /admin/api/revisions/prune`。
 管理台 Overview 的 runtime 区域还会显示有界的 apply 次数、最近结果、耗时、排空等待和
 异常子进程退出计数；这些指标不包含 URL、命令行、请求内容或错误正文。release 清理只
 删除未被 active/previous 指针或有效 revision manifest 引用、且超出保留尾部的目录。
@@ -149,6 +151,8 @@ npm run activate
 ```
 
 没有终端权限时，直接重启服务器；启动流程会根据最新私有配置生成并激活 release。新版本管理台的 Changes 区域会保存完整私有 revision，并可在明确确认后同时回滚私有配置和运行时；回滚会自动排空、检查 readiness，失败时恢复原配置和 release。
+
+Changes 还会显示 revision 数量和占用空间，并提供保留 20/50/100 份的手动整理。启动和后台任务不会自动删除 revision；整理必须由已登录管理员二次确认并进入 FIFO。loaded/pending revision 始终保留，其余被整理掉的旧快照不能从管理台恢复，因此执行前应先核对保留档位和预计删除数量。
 
 旧的 `npm run rollback` 只切换 active/previous release，不恢复 `config/*.local.*`。只有在管理台 rollback 不可用且操作者明确理解这一区别时才使用它，并在之后重启。`runtime/config-revisions/` 含完整私有快照，`runtime/audit-events.jsonl` 含低敏作业历史；两者都不得下载到公开工单、日志或仓库。
 

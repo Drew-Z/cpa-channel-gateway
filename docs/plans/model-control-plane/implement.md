@@ -191,7 +191,10 @@ valid revision reference, and a bounded recent tail. Runtime status exposes only
 counts, outcomes, durations, drain wait, classified error codes, and unexpected child exit counts;
 the admin Overview renders the short runtime summary. Post-closeout hardening also
 bounds in-memory admin sessions and evicts the oldest session when the single-tenant limit is
-reached.
+reached. The Changes view now exposes a low-sensitivity revision inventory and 20/50/100 retention
+plans without snapshot contents or filesystem paths. Revision pruning is explicit only: it requires
+matching `keep` and `confirmKeep`, runs through the FIFO and audit path, always protects loaded and
+pending revisions, and is never triggered by startup, background work, or deployment verification.
 
 最终门槛：`npm test`、`npm run check`、`npm run audit:public`、语法检查、桌面/移动截图、
 一次真实精确 canary、流式与非流式请求、正常 apply 和可证明的失败回滚全部通过。

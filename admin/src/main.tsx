@@ -309,7 +309,56 @@ function Routing({ state, models, csrf, setNotice, onRefresh, openDialog }: { st
 
 async function setAlias(alias: string, logicalModel: string, csrf: string, setNotice: (value: { kind: 'ok' | 'error' | 'info' } & { text: string }) => void, onRefresh: () => Promise<void>) { try { await api('/admin/api/stable-aliases', { method: 'PUT', csrf, body: JSON.stringify({ alias, logicalModel }) }); setNotice({ kind: 'ok', text: `${alias} 已固定到 ${logicalModel}` }); await onRefresh() } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } }
 
-function Changes({ state, revisions, audits, csrf, setNotice, onRefresh, openDialog }: { state: Json | null; revisions: Json[]; audits: Json[]; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void>; openDialog: (value: { title: string; body: string; action: () => Promise<void> } | null) => void }) { const [revision, setRevision] = useState(''); const [diff, setDiff] = useState<Json | null>(null); const loadDiff = async () => { if (!revision) return; try { setDiff(await api(`/admin/api/revisions/${encodeURIComponent(revision)}/diff`, { csrf })) } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } }; const rollback = () => { if (!revision) return; openDialog({ title: `回滚到 ${revision}`, body: '运行中的请求会先排空，只有新运行时 readiness 通过后才会提交。', action: async () => { try { await api(`/admin/api/revisions/${encodeURIComponent(revision)}/rollback`, { method: 'POST', csrf, body: JSON.stringify({ confirmRevision: revision }) }); setNotice({ kind: 'ok', text: '回滚作业已提交到控制队列。' }); await onRefresh() } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } } }) }; return <div className="view-stack"><section className="band"><div className="section-heading"><div><div className="eyebrow">CONFIGURATION HISTORY</div><h2>变更与回滚</h2></div><span className="muted">当前 {state?.loadedRevision ?? '—'} · 待应用 {state?.pendingRevision ?? '—'}</span></div><div className="revision-toolbar"><select value={revision} onChange={event => setRevision(event.target.value)}><option value="">选择目标 revision</option>{revisions.filter(item => item.valid !== false).map(item => <option key={item.revision} value={item.revision}>{formatDate(item.createdAt)} · {operationLabel(item.operation)}</option>)}</select><button className="button" disabled={!revision} onClick={() => void loadDiff}><Search size={16} />查看脱敏 diff</button><button className="button subtle" disabled={!revision || Boolean(state?.controlJobs?.active)} onClick={rollback}><RotateCcw size={16} />回滚</button></div>{diff && <pre className="diff-output">{formatDiff(diff.diff)}</pre>}<div className="table-scroll"><table><thead><tr><th>时间</th><th>操作</th><th>Revision</th><th>影响</th></tr></thead><tbody>{revisions.map(item => <tr key={item.revision}><td>{formatDate(item.createdAt)}</td><td>{operationLabel(item.operation)}</td><td><code>{item.revision}</code></td><td>{item.valid === false ? <span className="state-tag danger">损坏</span> : `${item.affected?.channelIds?.length ?? 0} 渠道 · ${item.affected?.modelIds?.length ?? 0} 模型`}</td></tr>)}</tbody></table></div></section><section className="band"><div className="section-heading"><div><div className="eyebrow">AUDIT TRAIL</div><h2>最近审计</h2></div><span className="muted">{audits.length} 条</span></div><div className="table-scroll"><table><thead><tr><th>时间</th><th>操作</th><th>结果</th><th>Revision</th><th>耗时</th></tr></thead><tbody>{audits.map(item => <tr key={`${item.jobId}-${item.at}`}><td>{formatDate(item.at)}</td><td>{operationLabel(item.operation)}</td><td><span className={`state-tag ${item.result === 'success' ? 'success' : 'danger'}`}>{item.result === 'success' ? '成功' : '失败'}</span></td><td><code>{item.revision ?? '—'}</code></td><td>{item.durationMs ?? 0} ms {item.errorCode ? `· ${item.errorCode}` : ''}</td></tr>)}</tbody></table></div></section></div> }
+function Changes({ state, revisions, audits, csrf, setNotice, onRefresh, openDialog }: { state: Json | null; revisions: Json[]; audits: Json[]; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void>; openDialog: (value: { title: string; body: string; action: () => Promise<void> } | null) => void }) {
+  const [revision, setRevision] = useState('')
+  const [diff, setDiff] = useState<Json | null>(null)
+  const [keep, setKeep] = useState(50)
+  const storage = state?.revisionStorage
+  const prunePlan = storage?.plans?.[String(keep)] ?? storage
+  const loadDiff = async () => {
+    if (!revision) return
+    try {
+      setDiff(await api(`/admin/api/revisions/${encodeURIComponent(revision)}/diff`, { csrf }))
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorMessage(error) })
+    }
+  }
+  const rollback = () => {
+    if (!revision) return
+    openDialog({
+      title: `回滚到 ${revision}`,
+      body: '运行中的请求会先排空，只有新运行时 readiness 通过后才会提交。',
+      action: async () => {
+        try {
+          await api(`/admin/api/revisions/${encodeURIComponent(revision)}/rollback`, { method: 'POST', csrf, body: JSON.stringify({ confirmRevision: revision }) })
+          setNotice({ kind: 'ok', text: '回滚作业已提交到控制队列。' })
+          await onRefresh()
+        } catch (error) {
+          setNotice({ kind: 'error', text: errorMessage(error) })
+        }
+      }
+    })
+  }
+  const prune = () => {
+    if (!prunePlan?.prunableCount) return
+    openDialog({
+      title: `整理 revision 历史，保留 ${keep} 条`,
+      body: `预计删除 ${prunePlan.prunableCount} 个旧或损坏 revision，释放约 ${formatBytes(prunePlan.prunableBytes)}。loaded 与 pending revision 始终保留；删除后不能在管理台恢复。`,
+      action: async () => {
+        try {
+          const result = await api('/admin/api/revisions/prune', { method: 'POST', csrf, body: JSON.stringify({ keep, confirmKeep: keep }) })
+          setRevision('')
+          setDiff(null)
+          setNotice({ kind: 'ok', text: `已删除 ${result.removedCount} 个 revision，释放 ${formatBytes(result.reclaimedBytes)}` })
+          await onRefresh()
+        } catch (error) {
+          setNotice({ kind: 'error', text: errorMessage(error) })
+        }
+      }
+    })
+  }
+  return <div className="view-stack"><section className="band"><div className="section-heading revision-heading"><div><div className="eyebrow">CONFIGURATION HISTORY</div><h2>变更与回滚</h2></div><span className="muted">当前 {state?.loadedRevision ?? '—'} · 待应用 {state?.pendingRevision ?? '—'}</span></div><div className="revision-storage-row"><div><strong>私有历史存储</strong><small>{storage ? `${storage.count} 个 revision · ${formatBytes(storage.totalBytes)} · ${storage.invalidCount} 个损坏` : '容量信息不可用'}</small></div><div className="inline-actions"><label>保留<select value={keep} onChange={event => setKeep(Number(event.target.value))}><option value={20}>20 条</option><option value={50}>50 条</option><option value={100}>100 条</option></select></label><span className="muted">预计可整理 {prunePlan?.prunableCount ?? 0} 条 · {formatBytes(prunePlan?.prunableBytes ?? 0)}</span><button className="button subtle" disabled={!prunePlan?.prunableCount || Boolean(state?.controlJobs?.active)} onClick={prune}><Trash2 size={16} />整理历史</button></div></div><div className="revision-toolbar"><select value={revision} onChange={event => setRevision(event.target.value)}><option value="">选择目标 revision</option>{revisions.filter(item => item.valid !== false).map(item => <option key={item.revision} value={item.revision}>{formatDate(item.createdAt)} · {operationLabel(item.operation)}</option>)}</select><button className="button" disabled={!revision} onClick={() => void loadDiff}><Search size={16} />查看脱敏 diff</button><button className="button subtle" disabled={!revision || Boolean(state?.controlJobs?.active)} onClick={rollback}><RotateCcw size={16} />回滚</button></div>{diff && <pre className="diff-output">{formatDiff(diff.diff)}</pre>}<div className="table-scroll"><table><thead><tr><th>时间</th><th>操作</th><th>Revision</th><th>影响</th></tr></thead><tbody>{revisions.map(item => <tr key={item.revision}><td>{formatDate(item.createdAt)}</td><td>{operationLabel(item.operation)}</td><td><code>{item.revision}</code></td><td>{item.valid === false ? <span className="state-tag danger">损坏</span> : `${item.affected?.channelIds?.length ?? 0} 渠道 · ${item.affected?.modelIds?.length ?? 0} 模型`}</td></tr>)}</tbody></table></div></section><section className="band"><div className="section-heading"><div><div className="eyebrow">AUDIT TRAIL</div><h2>最近审计</h2></div><span className="muted">{audits.length} 条</span></div><div className="table-scroll"><table><thead><tr><th>时间</th><th>操作</th><th>结果</th><th>Revision</th><th>耗时</th></tr></thead><tbody>{audits.map(item => <tr key={`${item.jobId}-${item.at}`}><td>{formatDate(item.at)}</td><td>{operationLabel(item.operation)}</td><td><span className={`state-tag ${item.result === 'success' ? 'success' : 'danger'}`}>{item.result === 'success' ? '成功' : '失败'}</span></td><td><code>{item.revision ?? '—'}</code></td><td>{item.durationMs ?? 0} ms {item.errorCode ? `· ${item.errorCode}` : ''}</td></tr>)}</tbody></table></div></section></div>
+}
 
 function StateTag({ channel }: { channel: Json }) { const label = channel.draining ? '排空中' : channel.suppressed ? '配置待应用' : channel.staged ? '待测试' : channel.status === 'disabled' || channel.channelEnabled === false || channel.enabled === false ? '已停用' : channel.busy ? '忙碌' : channel.status === 'stale' ? '已下线' : '生产启用'; const tone = channel.draining || channel.busy ? 'warning' : channel.status === 'disabled' || channel.enabled === false ? 'neutral' : channel.staged ? 'info' : 'success'; return <span className={`state-tag ${tone}`}>{channel.draining && <Activity size={13} />}{label}</span> }
 function HealthTag({ value }: { value?: string }) { const labels: Record<string, string> = { healthy: '健康', cooling: '冷却中', auth_failed: '认证失败', payment_blocked: '支付受限', degraded: '降级', untested: '未测试' }; const tone = value === 'healthy' ? 'success' : value === 'cooling' ? 'warning' : value ? 'danger' : 'neutral'; return <span className={`state-tag ${tone}`}>{labels[value ?? ''] ?? value ?? '未知'}</span> }
@@ -323,7 +372,8 @@ function kindLabel(value?: string) { return ({ generation: '生成', embedding: 
 function streamingLabel(value?: string) { return ({ both: '流式 / 非流式', 'stream-only': '仅流式', 'non-stream-only': '仅非流式' } as Record<string, string>)[value ?? ''] ?? '流式 / 非流式' }
 function evidenceText(value?: Json) { if (!value?.sampleCount) return '暂无样本'; const rate = value.successRate == null ? '—' : `${(value.successRate * 100).toFixed(1)}%`; const latency = value.ewmaLatencyMs == null ? '—' : `${Math.round(value.ewmaLatencyMs)} ms`; return `${value.sampleCount} 次 · 成功率 ${rate} · EWMA ${latency}` }
 function reasonText(values?: string[]) { const labels: Record<string, string> = { priority: '优先级', 'better-success-rate': '成功率更高', 'lower-ewma-latency': '延迟更低', 'channel-cooling': '渠道冷却', 'channel-auth-failed': '认证失败', 'channel-payment-blocked': '支付受限', 'channel-busy': '渠道忙碌', 'channel-draining': '渠道排空', 'candidate-misconfigured': '配置错误', 'circuit-open': '候选熔断', 'half-open-busy': '半开忙碌', 'configuration-pending-restart': '等待应用', 'candidate-ready': '可调度' }; return values?.map(value => labels[value] ?? value).join('、') || '—' }
-function operationLabel(value?: string) { return ({ 'startup-baseline': '启动基线', 'external-change': '外部变更', 'channel-create': '新增渠道', 'channel-import': '导入渠道', 'channel-update': '更新渠道', 'channel-delete': '删除渠道', 'model-update': '更新模型', 'alias-update': '更新别名', 'logical-model-create': '新增逻辑模型', 'logical-model-update': '更新逻辑模型', 'logical-model-delete': '删除逻辑模型', 'model-sync': '同步模型', 'runtime-rollback': '运行回滚' } as Record<string, string>)[value ?? ''] ?? value ?? '未知' }
+function operationLabel(value?: string) { return ({ 'startup-baseline': '启动基线', 'external-change': '外部变更', 'channel-create': '新增渠道', 'channel-import': '导入渠道', 'channel-update': '更新渠道', 'channel-delete': '删除渠道', 'model-update': '更新模型', 'alias-update': '更新别名', 'logical-model-create': '新增逻辑模型', 'logical-model-update': '更新逻辑模型', 'logical-model-delete': '删除逻辑模型', 'revision-prune': '整理 revision', 'model-sync': '同步模型', 'runtime-rollback': '运行回滚' } as Record<string, string>)[value ?? ''] ?? value ?? '未知' }
+function formatBytes(value?: number) { const bytes = Number(value ?? 0); if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'; if (bytes < 1024) return `${Math.round(bytes)} B`; if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`; return `${(bytes / (1024 * 1024)).toFixed(1)} MiB` }
 function formatDiff(value: unknown) { if (!value || typeof value !== 'object') return '没有结构变化。'; const lines: string[] = []; const walk = (node: any, prefix = '') => { if (Array.isArray(node)) node.forEach(item => walk(item, prefix)); else if (node && typeof node === 'object') Object.entries(node).forEach(([key, item]) => { if (Array.isArray(item) && item.length) lines.push(`${prefix}${key}: ${item.map(value => typeof value === 'object' ? JSON.stringify(value) : value).join('、')}`); else if (item && typeof item === 'object') walk(item, `${prefix}${key} / `) }); }; walk(value); return lines.join('\n') || '没有结构变化。' }
 
 export default App

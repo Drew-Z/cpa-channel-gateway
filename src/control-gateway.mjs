@@ -256,6 +256,18 @@ export function createControlGateway(config, {
       sendJson(response, 200, { data: configManager.revisions({ limit: Number.isSafeInteger(limit) ? limit : 50 }) })
       return
     }
+    if (url.pathname === '/admin/api/revisions/prune' && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      if (!configManager.pruneRevisions) throw publicError('revision_prune_unavailable', 409, 'Configuration revision pruning is unavailable')
+      const body = await readJsonBody(request, requestBodyLimit())
+      const keep = Number(body.keep)
+      if (![20, 50, 100].includes(keep) || body.confirmKeep !== keep) {
+        throw publicError('revision_prune_confirmation_required', 400, 'Revision pruning requires an allowed keep count and exact confirmation')
+      }
+      sendJson(response, 200, await controlJobs.run('revision-prune', () => configManager.pruneRevisions({ keep })))
+      return
+    }
     if (url.pathname === '/admin/api/audit-events' && request.method === 'GET') {
       const limit = Number(url.searchParams.get('limit') ?? 50)
       sendJson(response, 200, { data: auditStore.list({ limit: Number.isSafeInteger(limit) ? limit : 50 }) })
@@ -600,6 +612,7 @@ export function createControlGateway(config, {
       loadedRevision: configStatus?.loadedRevision ?? null,
       pendingRevision: configStatus?.pendingRevision ?? configStatus?.revision ?? null,
       restartRequired: configStatus?.restartRequired ?? false,
+      revisionStorage: configStatus?.revisionStorage ?? null,
       stableAliases: routing.stableAliases,
       pinnedAliases: routing.pinnedAliases,
       logicalModels: routing.logicalModels ?? [],

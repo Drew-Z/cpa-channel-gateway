@@ -2,7 +2,7 @@
 
 所有会写入私有渠道配置或同步模型目录的管理操作都经过同一个内存 FIFO
 控制作业队列。队列覆盖渠道新增/导入/编辑/删除、模型状态、稳定别名、模型同步、
-runtime apply 和 revision rollback；
+runtime apply、revision rollback 和 revision prune；
 同一时刻最多执行一个作业，后续请求等待前一个作业结束。队列满时返回
 `429 control_queue_full`，不会偷偷丢弃或并发执行配置写入。
 
@@ -38,3 +38,13 @@ CPA/HAProxy 子进程，等待新进程 readiness，然后切换父 Node 路由�
 `runtime-rollback` revision，随后复用 runtime apply 的排空、生成、readiness、reload 和
 activate 流程。成功后才更新 loaded revision；任何运行时错误都会恢复回滚前私有快照，
 而 runtime manager 负责恢复旧 release。损坏 revision 在写入私有配置前即被拒绝。
+
+## Revision pruning
+
+`GET /admin/api/status` 中的 `revisionStorage` 返回 revision 总数、有效/损坏数量、总字节数、
+时间范围和保留 20/50/100 份时的预计可删除数量与字节数。它不会返回快照内容或服务器路径。
+
+`POST /admin/api/revisions/prune` 只接受 20、50 或 100，并要求 `keep` 与 `confirmKeep`
+完全一致，同时通过同源和 CSRF 检查。整理作业进入同一 FIFO；最新的有效 revision 尾部、
+当前 loaded revision 和 pending revision 始终受保护，其余过旧或损坏的 revision 会被删除，
+删除后不能从管理台恢复。整理只允许管理员显式发起，不在启动、部署验收或后台任务中自动执行。

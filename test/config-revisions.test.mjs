@@ -67,6 +67,49 @@ test('links a validated revision to an existing runtime release without exposing
   assert.throws(() => store.linkRelease(revision.revision, 'fedcba9876543210'), error => error instanceof ConfigRevisionError && error.code === 'release_not_found')
 })
 
+test('inventories and explicitly prunes old revisions while retaining the recent tail and protected revisions', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-revision-prune-'))
+  let clock = Date.parse('2026-08-17T12:00:00.000Z')
+  let id = 0
+  const store = createConfigRevisionStore({ root, now: () => clock++, idFactory: () => `revision-${++id}` })
+  const revisions = []
+  for (let index = 0; index < 5; index += 1) {
+    revisions.push(store.create({
+      parentRevision: revisions.at(-1)?.revision ?? null,
+      operation: index === 0 ? 'baseline' : 'channel-update',
+      snapshot: { envText: `PRIVATE_VALUE=fixture-secret-${index}\n`, routesText: JSON.stringify({ index }), providersText: null }
+    }))
+  }
+  const releaseDigest = 'abcdef0123456789'
+  const releaseDir = path.join(root, 'runtime', 'releases', releaseDigest)
+  fs.mkdirSync(releaseDir, { recursive: true })
+  fs.writeFileSync(path.join(releaseDir, 'manifest.json'), '{}\n')
+  store.linkRelease(revisions[2].revision, releaseDigest)
+  fs.appendFileSync(path.join(store.root, revisions[1].revision, 'routes.local.json'), 'tampered')
+
+  const inventory = store.inventory({ keep: 2, protectedRevisions: [revisions[0].revision] })
+
+  assert.equal(inventory.count, 5)
+  assert.equal(inventory.validCount, 4)
+  assert.equal(inventory.invalidCount, 1)
+  assert.equal(inventory.protectedCount, 1)
+  assert.equal(inventory.prunableCount, 2)
+  assert.ok(inventory.totalBytes > inventory.prunableBytes && inventory.prunableBytes > 0)
+  assert.equal(JSON.stringify(inventory).includes('fixture-secret'), false)
+
+  const result = store.prune({ keep: 2, protectedRevisions: [revisions[0].revision] })
+
+  assert.equal(result.removedCount, 2)
+  assert.equal(result.reclaimedBytes, inventory.prunableBytes)
+  assert.equal(result.remaining.count, 3)
+  assert.equal(store.read(revisions[0].revision).manifest.revision, revisions[0].revision)
+  assert.equal(store.read(revisions[3].revision).manifest.revision, revisions[3].revision)
+  assert.equal(store.read(revisions[4].revision).manifest.revision, revisions[4].revision)
+  assert.throws(() => store.read(revisions[1].revision), error => error instanceof ConfigRevisionError && error.code === 'revision_not_found')
+  assert.throws(() => store.read(revisions[2].revision), error => error instanceof ConfigRevisionError && error.code === 'revision_not_found')
+  assert.deepEqual(revisionReleaseDigests(root), [])
+})
+
 test('produces structured diffs without returning provider URLs or keys', () => {
   const before = {
     envText: 'GATEWAY_API_KEY=gateway-secret\nCHANNEL_MAIN_NAME=Main\nCHANNEL_MAIN_BASE_URL=https://old.example.test/v1\nCHANNEL_MAIN_API_KEY=old-secret\nCHANNEL_MAIN_PROTOCOL=responses\nCHANNEL_MAIN_ENABLED=true\n',
