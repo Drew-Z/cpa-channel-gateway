@@ -231,6 +231,7 @@ npm run canary
 
 ```bash
 npm test
+npm run check:admin-dist
 npm run check
 npm run audit:public
 node --check index.js

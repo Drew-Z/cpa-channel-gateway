@@ -22,6 +22,7 @@ jobs:
       - run: npm ci
       - run: npm run audit:public
       - run: npm test
+      - run: npm run check:admin-dist
       - run: node --check index.js
       - run: node --check scripts/gateway.mjs
       - run: node --check scripts/install-runtime.mjs

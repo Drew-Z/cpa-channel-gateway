@@ -28,6 +28,7 @@
 npm ci
 npm run build:admin
 npm test
+npm run check:admin-dist
 ```
 
 翼龙面板的主文件仍保持 `index.js`，不会单独启动 Vite 开发服务器。`AUTO_UPDATE=1` 拉取新提交并重启后，静态管理台和 Node API 会同时更新。
