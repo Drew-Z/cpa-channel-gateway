@@ -8,6 +8,7 @@ import { loadConfig } from '../src/config.mjs'
 import { createControlGateway } from '../src/control-gateway.mjs'
 import { createRuntimeChildren } from '../src/runtime-children.mjs'
 import { createRuntimeManager } from '../src/runtime-manager.mjs'
+import { PTERODACTYL_STARTUP_MARKER } from '../src/startup-preparation.mjs'
 import { childOutcome, terminateChildren, waitForHttpOk } from '../src/supervisor.mjs'
 
 const root = path.resolve(process.env.GATEWAY_ROOT || path.dirname(path.dirname(fileURLToPath(import.meta.url))))
@@ -128,6 +129,7 @@ async function start(rootDir) {
     }
 
     console.log(JSON.stringify({ ready: true, port: publicPort, release: generated.digest, cloudflareTunnel: generated.cloudflareTunnel.enabled }))
+    console.log(PTERODACTYL_STARTUP_MARKER)
 
     const outcome = await Promise.race([...outcomes, runtimeFailure, signalOutcome])
     if (outcome.type !== 'signal') throw childFailure(outcome)

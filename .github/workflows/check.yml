@@ -24,5 +24,7 @@ jobs:
       - run: npm test
       - run: npm run check:admin-dist
       - run: node --check index.js
+      - run: node --check startup.js
       - run: node --check scripts/gateway.mjs
       - run: node --check scripts/install-runtime.mjs
+      - run: node --check src/startup-preparation.mjs

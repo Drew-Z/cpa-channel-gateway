@@ -11,6 +11,7 @@
     "build:admin": "vite build --config admin/vite.config.ts",
     "check:admin-dist": "node scripts/check-admin-dist.mjs",
     "prestart": "npm run build:admin",
+    "start:pterodactyl": "node startup.js",
     "check": "node scripts/gateway.mjs validate",
     "audit:public": "node scripts/public-audit.mjs",
     "generate": "node scripts/gateway.mjs generate",

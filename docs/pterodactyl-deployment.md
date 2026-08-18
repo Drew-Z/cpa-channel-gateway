@@ -17,7 +17,7 @@
 | Git Access Token | 留空 |
 | Additional Node Packages | 留空 |
 | Uninstall Node Packages | 留空 |
-| Main File | `index.js` |
+| Main File | `startup.js` |
 | Additional Arguments | 留空 |
 
 仓库公开后不需要 GitHub 凭据。不要把渠道 API key 填入 Git Username、Git Access Token、Additional Arguments 或可公开的面板描述。
@@ -31,7 +31,9 @@ npm test
 npm run check:admin-dist
 ```
 
-翼龙面板的主文件仍保持 `index.js`，不会单独启动 Vite 开发服务器。`AUTO_UPDATE=1` 拉取新提交并重启后，静态管理台和 Node API 会同时更新。
+翼龙面板的主文件使用 `startup.js`，不会单独启动 Vite 开发服务器。通用 Node egg 使用分号串联自动更新、依赖安装和主进程，默认不会传播前两步的失败；`startup.js` 会以 `git pull --ff-only` 和 `npm install` 重新执行严格门禁，任何一步失败都会阻止旧版本继续启动。`AUTO_UPDATE=1` 拉取新提交并重启后，静态管理台和 Node API 会同时更新。
+
+网关完成内部 runtime、公开端口和可选 Tunnel readiness 后，才会输出通用 Node egg 的启动完成标记。面板显示 `Starting` 时先检查 `/healthz` 和进程 uptime；如果 `/healthz` 已 ready 但旧部署仍停在 `Starting`，更新代码并把 Main File 改为 `startup.js` 后再执行一次重启，不要连续重启正在提供服务的进程。
 
 已验证镜像是翼龙的 `Nodejs 22`（Debian 13、非 root 用户）。面板可以切换镜像，但当前运行时安装器还要求 Linux `x64`/`arm64`、Node.js 22 以上、Debian APT 源以及 `apt-get`、`dpkg-deb`、`tar`、`make` 和 C 编译工具链；不满足这些条件的镜像不能视为兼容。
 
