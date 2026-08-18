@@ -20,6 +20,13 @@ const VIEWS: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: 'changes', label: '变更', icon: FileClock },
 ]
 
+function removePasswordFromAddress() {
+  const url = new URL(window.location.href)
+  if (!url.searchParams.has('password')) return
+  url.searchParams.delete('password')
+  window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`)
+}
+
 function App() {
   const [csrf, setCsrf] = useState('')
   const [loggedIn, setLoggedIn] = useState(false)
@@ -73,6 +80,7 @@ function App() {
     event.preventDefault()
     setLoginError('')
     const key = String(new FormData(event.currentTarget).get('password') ?? '')
+    removePasswordFromAddress()
     try {
       const data = await api('/admin/api/session', { method: 'POST', body: JSON.stringify({ key }) })
       setCsrf(data.csrfToken ?? '')
