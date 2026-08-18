@@ -99,12 +99,12 @@ export function buildModelCatalog(config) {
       if (stagedCandidate) return { requestedModel: modelId, kind: 'staged-direct', logicalModelId: stagedCandidate.upstreamModel, candidates: [stagedCandidate] }
       return null
     },
-    listPublicModels() {
-      const ids = new Set([
-        ...logicalModels.keys(),
-        ...routeAliases.keys(),
-        ...exactAliases.keys()
-      ])
+    listPublicModels({ allowedChannels = null } = {}) {
+      const allowed = allowedChannels instanceof Set ? allowedChannels : null
+      const ids = new Set()
+      for (const [id, candidates] of logicalModels) if (!allowed || candidates.some(candidate => allowed.has(candidate.channelId))) ids.add(id)
+      for (const [id, route] of routeAliases) if (!allowed || route.candidates.some(candidate => allowed.has(candidate.channelId))) ids.add(id)
+      for (const [id, candidate] of exactAliases) if (!allowed || allowed.has(candidate.channelId)) ids.add(id)
       return [...ids].sort((left, right) => left.localeCompare(right)).map(id => ({
         id,
         object: 'model',

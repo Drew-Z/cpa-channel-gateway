@@ -15,7 +15,14 @@ const JOB_TYPES = new Set([
   'logical-model-delete',
   'revision-prune',
   'runtime-apply',
-  'runtime-rollback'
+  'runtime-rollback',
+  'client-group-create',
+  'client-group-update',
+  'client-group-delete',
+  'client-create',
+  'client-update',
+  'client-delete',
+  'client-rotate'
 ])
 
 export class ControlJobError extends Error {

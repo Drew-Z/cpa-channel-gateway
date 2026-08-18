@@ -7,6 +7,7 @@ import { parseEnv, serializeEnv } from './env.mjs'
 import { fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from './model-sync.mjs'
 import { isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
 import { collectLegacyChannelEntries, providerEnvPrefix, stripLegacyChannelEnv } from './providers.mjs'
+import { createClientKey, normalizeClientAccess, publicClientAccess } from './client-access.mjs'
 
 const CHANNEL_ID = /^[a-z][a-z0-9-]{0,31}$/
 const MODEL_ID = /^[^\s/][^\r\n]{0,254}$/
@@ -29,6 +30,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
   const envPath = config.paths.envPath
   const root = path.dirname(path.dirname(routesPath))
   const providersPath = config.paths.providersPath ?? path.join(path.dirname(routesPath), 'providers.local.json')
+  const clientsPath = config.paths.clientsPath ?? path.join(path.dirname(routesPath), 'clients.local.json')
   const revisionStore = revisionStoreOption ?? createConfigRevisionStore({ root })
   let pendingManifest = initialRevision()
   let loadedRevision = pendingManifest.revision
@@ -175,6 +177,104 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
           }
         }))
       }
+    },
+    access() {
+      const snapshot = revisionStore.snapshotCurrent()
+      const document = snapshot.clientsText === null ? null : JSON.parse(snapshot.clientsText)
+      return publicClientAccess(document)
+    },
+    createClient(input = {}) {
+      const generated = createClientKey()
+      const result = mutate('client-create', ({ clients }) => {
+        const document = normalizeClientDocument(clients, config.channels.map(channel => channel.id))
+        const id = normalizeClientId(input.id)
+        const group = normalizeClientId(input.group)
+        if (document.clients.some(item => item.id === id)) throw new ConfigMutationError('client_exists', 409, `Client already exists: ${id}`)
+        if (!document.groups.some(item => item.id === group)) throw new ConfigMutationError('client_group_not_found', 404, `Unknown client group: ${group}`)
+        document.clients.push({ id, group, keyHash: generated.keyHash, keyHint: generated.keyHint, enabled: input.enabled !== false })
+        clients.value = document
+        return { id, group, enabled: input.enabled !== false, key: generated.key }
+      }, result => ({ clientIds: [result.id], groupIds: [result.group] }), { createClients: true })
+      return result
+    },
+    rotateClient(idValue) {
+      const generated = createClientKey()
+      return mutate('client-rotate', ({ clients }) => {
+        const document = normalizeClientDocument(clients, config.channels.map(channel => channel.id))
+        const id = normalizeClientId(idValue)
+        const client = document.clients.find(item => item.id === id)
+        if (!client) throw new ConfigMutationError('client_not_found', 404, `Unknown client: ${id}`)
+        client.keyHash = generated.keyHash
+        client.keyHint = generated.keyHint
+        clients.value = document
+        return { id, group: client.group, enabled: client.enabled !== false, key: generated.key }
+      }, result => ({ clientIds: [result.id] }), { createClients: true })
+    },
+    updateClient(idValue, input = {}) {
+      return mutate('client-update', ({ clients }) => {
+        const document = normalizeClientDocument(clients, config.channels.map(channel => channel.id))
+        const id = normalizeClientId(idValue)
+        const client = document.clients.find(item => item.id === id)
+        if (!client) throw new ConfigMutationError('client_not_found', 404, `Unknown client: ${id}`)
+        if (input.group !== undefined) {
+          const group = normalizeClientId(input.group)
+          if (!document.groups.some(item => item.id === group)) throw new ConfigMutationError('client_group_not_found', 404, `Unknown client group: ${group}`)
+          client.group = group
+        }
+        if (input.enabled !== undefined) {
+          if (typeof input.enabled !== 'boolean') throw new ConfigMutationError('invalid_client_enabled', 400, 'Client enabled must be a boolean')
+          client.enabled = input.enabled
+        }
+        clients.value = document
+        return { id, group: client.group, enabled: client.enabled !== false, keyHint: client.keyHint ?? null }
+      }, result => ({ clientIds: [result.id], groupIds: [result.group] }), { createClients: true })
+    },
+    deleteClient(idValue) {
+      return mutate('client-delete', ({ clients }) => {
+        const document = normalizeClientDocument(clients, config.channels.map(channel => channel.id))
+        const id = normalizeClientId(idValue)
+        const index = document.clients.findIndex(item => item.id === id)
+        if (index < 0) throw new ConfigMutationError('client_not_found', 404, `Unknown client: ${id}`)
+        const [deleted] = document.clients.splice(index, 1)
+        clients.value = document
+        return { id, group: deleted.group, deleted: true }
+      }, result => ({ clientIds: [result.id], groupIds: [result.group] }), { createClients: true })
+    },
+    createClientGroup(input = {}) {
+      return mutate('client-group-create', ({ clients }) => {
+        const document = normalizeClientDocument(clients, config.channels.map(channel => channel.id), { allowMissing: true })
+        const id = normalizeClientId(input.id)
+        if (document.groups.some(item => item.id === id)) throw new ConfigMutationError('client_group_exists', 409, `Client group already exists: ${id}`)
+        const group = normalizeGroupInput(input, config.channels.map(channel => channel.id))
+        if (group.id !== id) throw new ConfigMutationError('invalid_client_group_id', 400, 'Client group id does not match request')
+        document.groups.push(group)
+        clients.value = document
+        return { ...group }
+      }, result => ({ groupIds: [result.id], channelIds: result.channels }), { createClients: true })
+    },
+    updateClientGroup(idValue, input = {}) {
+      return mutate('client-group-update', ({ clients }) => {
+        const document = normalizeClientDocument(clients, config.channels.map(channel => channel.id))
+        const id = normalizeClientId(idValue)
+        const group = document.groups.find(item => item.id === id)
+        if (!group) throw new ConfigMutationError('client_group_not_found', 404, `Unknown client group: ${id}`)
+        const next = normalizeGroupInput({ ...group, ...input, id }, config.channels.map(channel => channel.id))
+        Object.assign(group, next)
+        clients.value = document
+        return { ...group }
+      }, result => ({ groupIds: [result.id], channelIds: result.channels }), { createClients: true })
+    },
+    deleteClientGroup(idValue) {
+      return mutate('client-group-delete', ({ clients }) => {
+        const document = normalizeClientDocument(clients, config.channels.map(channel => channel.id))
+        const id = normalizeClientId(idValue)
+        if (document.clients.some(item => item.group === id)) throw new ConfigMutationError('client_group_has_clients', 409, 'Move clients before deleting the group')
+        const index = document.groups.findIndex(item => item.id === id)
+        if (index < 0) throw new ConfigMutationError('client_group_not_found', 404, `Unknown client group: ${id}`)
+        document.groups.splice(index, 1)
+        clients.value = document
+        return { id, deleted: true }
+      }, result => ({ groupIds: [result.id] }), { createClients: true })
     },
     migrateRoutesSchema() {
       return mutate('routes-schema-migrate', ({ routes }) => {
@@ -562,10 +662,100 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
       } finally {
         modelSyncActive = false
       }
+    },
+    applyCanaryAudit(report, { stableAliases = {} } = {}) {
+      if (!report || !Array.isArray(report.results)) throw new ConfigMutationError('invalid_canary_audit', 400, 'Canary audit results are required')
+      return mutate('canary-audit', ({ routes, env, providers }) => {
+        const byChannel = new Map()
+        for (const item of report.results) {
+          const channelId = normalizeChannelId(item.channel)
+          const modelId = normalizeModelId(item.model)
+          const channel = (routes.channels ?? []).find(entry => entry.id === channelId)
+          const model = channel?.models?.find(entry => entry.upstream === modelId)
+          if (!channel || !model) continue
+          const entry = { ...item, channelId, modelId, ok: item.ok === true }
+          const values = byChannel.get(channelId) ?? []
+          values.push(entry)
+          byChannel.set(channelId, values)
+        }
+        const changedModels = []
+        const changedChannels = []
+        for (const [channelId, entries] of byChannel) {
+          const channel = (routes.channels ?? []).find(item => item.id === channelId)
+          if (!channel) continue
+          const successful = entries.filter(item => item.ok)
+          const hasSuccess = successful.length > 0
+          const definiteFailures = entries.filter(item => !item.ok && item.error !== 'timeout' && item.error !== 'transport_error')
+          const failedModels = hasSuccess ? entries.filter(item => !item.ok) : definiteFailures
+          for (const item of failedModels) {
+            const model = channel.models.find(entry => entry.upstream === item.modelId)
+            if (model && model.status !== 'disabled') {
+              model.status = 'disabled'
+              changedModels.push(`${channelId}/${item.modelId}`)
+            }
+          }
+          const shouldProduce = hasSuccess
+          const shouldDisableChannel = !hasSuccess
+          if (shouldProduce) {
+            if (channel.staged !== false || channel.enabled === false) changedChannels.push(channelId)
+            channel.staged = false
+            if (providers) {
+              const provider = providers.providers?.find(item => String(item.id).toLowerCase() === channelId)
+              if (provider) provider.enabled = true
+              delete channel.enabled
+            } else {
+              channel.enabled = true
+              env[`${providerEnvPrefix(channelId)}_ENABLED`] = 'true'
+            }
+          } else if (shouldDisableChannel) {
+            if (channel.enabled !== false || channel.staged) changedChannels.push(channelId)
+            channel.staged = false
+            channel.enabled = false
+            if (providers) {
+              const provider = providers.providers?.find(item => String(item.id).toLowerCase() === channelId)
+              if (provider) provider.enabled = false
+              delete channel.enabled
+            } else {
+              env[`${providerEnvPrefix(channelId)}_ENABLED`] = 'false'
+            }
+          }
+        }
+        const aliasResults = []
+        for (const [alias, targetValue] of Object.entries(stableAliases)) {
+          const target = targetValue && typeof targetValue === 'object' ? targetValue : {}
+          const channelId = normalizeChannelId(target.channel)
+          const modelId = normalizeModelId(target.model)
+          const channel = (routes.channels ?? []).find(item => item.id === channelId)
+          const model = channel?.models?.find(item => item.upstream === modelId)
+          const result = byChannel.get(channelId)?.find(item => item.modelId === modelId && item.ok)
+          if (!channel || !model || !result) throw new ConfigMutationError('canary_alias_target_unverified', 409, `Stable alias target was not verified: ${channelId}/${modelId}`)
+          if (model.status === 'disabled') model.status = 'active'
+          routes.stableAliases ??= []
+          const current = routes.stableAliases.find(item => item.alias === alias)
+          if (current) {
+            delete current.logicalModel
+            current.channel = channelId
+            current.model = modelId
+          } else {
+            routes.stableAliases.push({ alias, channel: channelId, model: modelId })
+          }
+          aliasResults.push({ alias, channel: channelId, model: modelId })
+        }
+        return {
+          tested: report.results.length,
+          successful: report.results.filter(item => item.ok).length,
+          changedChannels: [...new Set(changedChannels)].sort(),
+          disabledModels: [...new Set(changedModels)].sort(),
+          aliases: aliasResults
+        }
+      }, result => ({
+        channelIds: result.changedChannels,
+        modelIds: result.disabledModels
+      }))
     }
   }
 
-  function mutate(operation, change, affected) {
+  function mutate(operation, change, affected, { createClients = false } = {}) {
     if (modelSyncActive) throw new ConfigMutationError('model_sync_in_progress', 409, 'Configuration changes are paused while model synchronization is in progress')
     const parentManifest = refreshCurrentRevision()
     const originalSnapshot = revisionStore.snapshotCurrent()
@@ -573,11 +763,18 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
     const env = parseEnv(originalSnapshot.envText)
     const routes = JSON.parse(originalSnapshot.routesText)
     const providers = providerMode ? JSON.parse(originalSnapshot.providersText) : null
-    const result = change({ routes, env, providers })
+    const clientState = {
+      value: originalSnapshot.clientsText === null
+        ? { schemaVersion: 1, groups: [], clients: [] }
+        : JSON.parse(originalSnapshot.clientsText),
+      existed: originalSnapshot.clientsText !== null
+    }
+    const result = change({ routes, env, providers, clients: clientState })
     const nextEnv = serializeEnv(providerMode ? stripLegacyChannelEnv(env) : env)
     const nextRoutes = JSON.stringify(routes, null, 2) + '\n'
     const nextProviders = providerMode ? JSON.stringify(providers, null, 2) + '\n' : null
-    const nextSnapshot = { envText: nextEnv, routesText: nextRoutes, providersText: nextProviders }
+    const nextClients = clientState.existed || createClients ? JSON.stringify(clientState.value, null, 2) + '\n' : null
+    const nextSnapshot = { envText: nextEnv, routesText: nextRoutes, providersText: nextProviders, clientsText: nextClients }
     if (digestSnapshot(nextSnapshot) === parentManifest.contentDigest) {
       return { ...result, revision: parentManifest.revision, restartRequired: parentManifest.revision !== loadedRevision }
     }
@@ -628,6 +825,11 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
       if (fs.existsSync(providersPath)) fs.rmSync(providersPath)
     } else {
       atomicWrite(providersPath, snapshot.providersText)
+    }
+    if (snapshot.clientsText === null) {
+      if (fs.existsSync(clientsPath)) fs.rmSync(clientsPath)
+    } else {
+      atomicWrite(clientsPath, snapshot.clientsText)
     }
     atomicWrite(envPath, snapshot.envText)
     atomicWrite(routesPath, snapshot.routesText)
@@ -690,6 +892,35 @@ function normalizeChannelId(value) {
   const id = String(value ?? '').trim().toLowerCase()
   if (!CHANNEL_ID.test(id)) throw new ConfigMutationError('invalid_channel_id', 400, 'Channel id must match [a-z][a-z0-9-]{0,31}')
   return id
+}
+
+function normalizeClientId(value) {
+  const id = String(value ?? '').trim().toLowerCase()
+  if (!/^[a-z][a-z0-9-]{0,63}$/.test(id)) throw new ConfigMutationError('invalid_client_id', 400, 'Client id must match [a-z][a-z0-9-]{0,63}')
+  return id
+}
+
+function normalizeClientDocument(state, channelIds, { allowMissing = false } = {}) {
+  const value = state?.value ?? state
+  if (allowMissing && value === null) return { schemaVersion: 1, groups: [], clients: [] }
+  try {
+    return normalizeClientAccess(value ?? { schemaVersion: 1, groups: [], clients: [] }, channelIds)
+  } catch (error) {
+    throw new ConfigMutationError('invalid_client_access', 400, error instanceof Error ? error.message : 'Client access configuration is invalid')
+  }
+}
+
+function normalizeGroupInput(input, channelIds) {
+  if (!input || Array.isArray(input) || typeof input !== 'object') throw new ConfigMutationError('invalid_client_group', 400, 'Client group body must be an object')
+  const id = normalizeClientId(input.id)
+  if (!Array.isArray(input.channels) || !input.channels.length) throw new ConfigMutationError('invalid_client_group_channels', 400, 'Client group must contain at least one channel')
+  const known = new Set(channelIds.map(value => String(value).toLowerCase()))
+  const channels = [...new Set(input.channels.map(value => String(value).trim().toLowerCase()))]
+  if (channels.some(channel => !/^[a-z][a-z0-9-]{0,31}$/.test(channel) || (known.size && !known.has(channel)))) {
+    throw new ConfigMutationError('unknown_client_group_channel', 404, 'Client group references an unknown channel')
+  }
+  if (input.enabled !== undefined && typeof input.enabled !== 'boolean') throw new ConfigMutationError('invalid_client_group_enabled', 400, 'Client group enabled must be a boolean')
+  return { id, channels, enabled: input.enabled !== false }
 }
 
 function normalizeModelId(value) {
@@ -784,6 +1015,16 @@ function affectedFromDiff(diff) {
       ...(diff.logicalModels?.added ?? []),
       ...(diff.logicalModels?.removed ?? []),
       ...(diff.logicalModels?.changed ?? []).map(item => item.id)
+    ],
+    clientIds: [
+      ...(diff.clients?.clients?.added ?? []),
+      ...(diff.clients?.clients?.removed ?? []),
+      ...(diff.clients?.clients?.changed ?? []).map(item => item.id)
+    ],
+    groupIds: [
+      ...(diff.clients?.groups?.added ?? []),
+      ...(diff.clients?.groups?.removed ?? []),
+      ...(diff.clients?.groups?.changed ?? []).map(item => item.id)
     ]
   }
 }

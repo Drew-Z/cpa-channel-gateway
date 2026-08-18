@@ -10,7 +10,8 @@ test('stores complete private snapshots with a validated low-sensitivity manifes
   const snapshot = {
     envText: 'GATEWAY_API_KEY=fixture-secret\n',
     routesText: '{"schemaVersion":1,"channels":[]}\n',
-    providersText: '{"schemaVersion":1,"providers":[]}\n'
+    providersText: '{"schemaVersion":1,"providers":[]}\n',
+    clientsText: null
   }
   const store = createConfigRevisionStore({
     root,

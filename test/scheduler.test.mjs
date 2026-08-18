@@ -357,6 +357,19 @@ test('non-generation models remain auditable but are absent from public routing'
   assert.throws(() => scheduler.reserve('alpha/text-embedding-3-small'), error => error.code === 'model_not_found')
 })
 
+test('client channel groups filter public models and logical candidates', () => {
+  const scheduler = createModelScheduler(fixtureConfig())
+  const allowed = new Set(['beta'])
+  const ids = scheduler.catalog.listPublicModels({ allowedChannels: allowed }).map(item => item.id)
+  assert.ok(ids.includes('shared-model'))
+  assert.ok(ids.includes('beta/shared-model'))
+  assert.ok(!ids.includes('alpha/shared-model'))
+  const selection = scheduler.reserve('shared-model', { allowedChannels: allowed })
+  assert.equal(selection.candidate.channelId, 'beta')
+  selection.release()
+  assert.throws(() => scheduler.reserve('alpha/other-model', { allowedChannels: allowed }), error => error.code === 'model_not_found' && error.statusCode === 404)
+})
+
 function fixtureConfig() {
   const alpha = channel('alpha', 100, [
     model('alpha', 'shared-model', 100),

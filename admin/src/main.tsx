@@ -4,18 +4,19 @@ import {
   Activity, AlertTriangle, ArrowDown, ArrowUp, Check, CheckCircle2, ChevronRight,
   Clipboard, CloudCog, Copy, Database, Eye, EyeOff, FileClock, Gauge, KeyRound,
   Layers3, LogIn, LogOut, Menu, Play, RefreshCw, RotateCcw, Save, Search, Server,
-  Settings2, ShieldCheck, SlidersHorizontal, Trash2, X, XCircle, Zap,
+  Settings2, ShieldCheck, SlidersHorizontal, Trash2, UsersRound, X, XCircle, Zap,
 } from 'lucide-react'
 import './styles.css'
 
 type Json = Record<string, any>
-type View = 'overview' | 'channels' | 'models' | 'routing' | 'changes'
+type View = 'overview' | 'channels' | 'models' | 'routing' | 'access' | 'changes'
 
 const VIEWS: Array<{ id: View; label: string; icon: typeof Activity }> = [
   { id: 'overview', label: '概览', icon: Gauge },
   { id: 'channels', label: '渠道', icon: Server },
   { id: 'models', label: '模型', icon: Layers3 },
   { id: 'routing', label: '路由', icon: SlidersHorizontal },
+  { id: 'access', label: '客户端', icon: UsersRound },
   { id: 'changes', label: '变更', icon: FileClock },
 ]
 
@@ -31,6 +32,7 @@ function App() {
   const [usage, setUsage] = useState<Json | null>(null)
   const [discovery, setDiscovery] = useState<Json | null>(null)
   const [connection, setConnection] = useState<Json | null>(null)
+  const [access, setAccess] = useState<Json | null>(null)
   const [revisions, setRevisions] = useState<Json[]>([])
   const [audits, setAudits] = useState<Json[]>([])
   const [mobileNav, setMobileNav] = useState(false)
@@ -40,12 +42,13 @@ function App() {
     if (!loggedIn) return
     setBusy(true)
     try {
-      const [nextState, nextModels, nextUsage, nextDiscovery, nextConnection, nextRevisions, nextAudits] = await Promise.all([
+      const [nextState, nextModels, nextUsage, nextDiscovery, nextConnection, nextAccess, nextRevisions, nextAudits] = await Promise.all([
         api('/admin/api/status', { csrf }),
         api('/admin/api/models', { csrf }),
         api('/admin/api/usage', { csrf }),
         api('/admin/api/channel-discovery', { csrf }),
         api('/admin/api/connection', { csrf }),
+        api('/admin/api/access', { csrf }),
         api('/admin/api/revisions?limit=20', { csrf }),
         api('/admin/api/audit-events?limit=20', { csrf }),
       ])
@@ -54,6 +57,7 @@ function App() {
       setUsage(nextUsage)
       setDiscovery(nextDiscovery)
       setConnection(nextConnection)
+      setAccess(nextAccess)
       setRevisions(nextRevisions.data ?? [])
       setAudits(nextAudits.data ?? [])
     } catch (error) {
@@ -107,6 +111,7 @@ function App() {
           {view === 'channels' && <Channels state={state} discovery={discovery} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
           {view === 'models' && <Models models={models} state={state} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
           {view === 'routing' && <Routing state={state} models={models} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
+          {view === 'access' && <Access access={access} channels={state?.channels ?? []} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
           {view === 'changes' && <Changes state={state} revisions={revisions} audits={audits} csrf={csrf} setNotice={setNotice} onRefresh={refresh} openDialog={setDialog} />}
         </main>
       </div>
@@ -135,6 +140,7 @@ function Connection({ connection, csrf, setNotice }: { connection: Json | null; 
   useEffect(() => () => { if (timer.current) window.clearTimeout(timer.current) }, [])
   const reveal = async () => { try { const data = await api('/admin/api/connection/reveal', { method: 'POST', csrf }); const value = data.apiKey ?? ''; setKey(value); setRevealed(true); if (timer.current) window.clearTimeout(timer.current); timer.current = window.setTimeout(() => { setRevealed(false); setKey('') }, 30_000); return value; } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }); return '' } }
   const copy = async (value: string, message: string) => { try { await navigator.clipboard.writeText(value); setNotice({ kind: 'ok', text: message }) } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } }
+  if (connection?.mode === 'clients') return <div className="connection-grid"><div className="connection-field"><label>Base URL（含 /v1）<input readOnly value={connection?.baseUrl ?? '—'} /></label><button className="icon-button bordered" title="复制 Base URL" onClick={() => connection?.baseUrl && void copy(connection.baseUrl, 'Base URL 已复制')}><Copy size={16} /></button></div><div className="connection-meta"><span>认证模式</span><code>客户端 key + 渠道分组</code><span className="muted">在“客户端”视图创建或轮换 key，明文仅显示一次。</span></div></div>
   const apiKey = revealed ? key : connection?.apiKeyMasked ?? '••••••••'
   return <div className="connection-grid"><div className="connection-field"><label>Base URL（含 /v1）<input readOnly value={connection?.baseUrl ?? '—'} /></label><button className="icon-button bordered" title="复制 Base URL" onClick={() => connection?.baseUrl && void copy(connection.baseUrl, 'Base URL 已复制')}><Copy size={16} /></button></div><div className="connection-field"><label>GATEWAY_API_KEY<input readOnly type={revealed ? 'text' : 'password'} value={apiKey} /></label><button className="icon-button bordered" title={revealed ? '隐藏 API key' : '显示 API key'} onClick={() => revealed ? (setRevealed(false), setKey('')) : void reveal()}>{revealed ? <EyeOff size={16} /> : <Eye size={16} />}</button><button className="icon-button bordered" title="复制 API key" onClick={() => void (async () => { const value = revealed ? key : await reveal(); if (value) await copy(value, 'API key 已复制') })()}><Clipboard size={16} /></button></div><div className="connection-meta"><span>稳定模型</span><code>coding-main</code><code>coding-backup</code><span className="muted">显示后 30 秒自动掩码</span></div></div>
 }
@@ -308,6 +314,62 @@ function Routing({ state, models, csrf, setNotice, onRefresh, openDialog }: { st
 }
 
 async function setAlias(alias: string, logicalModel: string, csrf: string, setNotice: (value: { kind: 'ok' | 'error' | 'info' } & { text: string }) => void, onRefresh: () => Promise<void>) { try { await api('/admin/api/stable-aliases', { method: 'PUT', csrf, body: JSON.stringify({ alias, logicalModel }) }); setNotice({ kind: 'ok', text: `${alias} 已固定到 ${logicalModel}` }); await onRefresh() } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) } }
+
+function Access({ access, channels, csrf, setNotice, onRefresh, openDialog }: { access: Json | null; channels: Json[]; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void>; openDialog: (value: { title: string; body: string; action: () => Promise<void> } | null) => void }) {
+  const groups = access?.groups ?? []
+  const clients = access?.clients ?? []
+  const [editingGroup, setEditingGroup] = useState('')
+  const [groupId, setGroupId] = useState('')
+  const [groupChannels, setGroupChannels] = useState<string[]>([])
+  const [clientId, setClientId] = useState('')
+  const [clientGroup, setClientGroup] = useState('')
+  const [issued, setIssued] = useState<{ id: string; key: string } | null>(null)
+  const mutate = async (path: string, method: string, body: Json | null, message: string) => {
+    try {
+      const result = await api(path, { method, csrf, ...(body ? { body: JSON.stringify(body) } : {}) })
+      setNotice({ kind: 'ok', text: `${message}${result.revision ? ` · ${result.revision}` : ''}` })
+      await onRefresh()
+      return result
+    } catch (error) {
+      setNotice({ kind: 'error', text: errorMessage(error) })
+      return null
+    }
+  }
+  const resetGroup = () => { setEditingGroup(''); setGroupId(''); setGroupChannels([]) }
+  const saveGroup = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!groupId || !groupChannels.length) return
+    const result = await mutate(editingGroup ? `/admin/api/access/groups/${encodeURIComponent(editingGroup)}` : '/admin/api/access/groups', editingGroup ? 'PATCH' : 'POST', { id: groupId, channels: groupChannels, enabled: true }, editingGroup ? '客户端分组已更新' : '客户端分组已创建')
+    if (result) resetGroup()
+  }
+  const editGroup = (group: Json) => { setEditingGroup(group.id); setGroupId(group.id); setGroupChannels([...(group.channels ?? [])]) }
+  const toggleChannel = (id: string) => setGroupChannels(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id])
+  const createClient = async (event: FormEvent) => {
+    event.preventDefault()
+    const result = await mutate('/admin/api/access/clients', 'POST', { id: clientId, group: clientGroup, enabled: true }, '客户端已创建，立即保存下方 key')
+    if (result?.key) {
+      setIssued({ id: result.id, key: result.key })
+      setClientId('')
+    }
+  }
+  const rotate = (client: Json) => openDialog({
+    title: `轮换 ${client.id} 的 key`,
+    body: '旧 key 会在应用配置后失效；新 key 明文只显示一次。',
+    action: async () => {
+      const result = await mutate(`/admin/api/access/clients/${encodeURIComponent(client.id)}/rotate`, 'POST', null, '客户端 key 已轮换')
+      if (result?.key) setIssued({ id: result.id, key: result.key })
+    }
+  })
+  const copyIssued = async () => {
+    if (!issued) return
+    try { await navigator.clipboard.writeText(issued.key); setNotice({ kind: 'ok', text: `${issued.id} 的 API key 已复制` }) } catch (error) { setNotice({ kind: 'error', text: errorMessage(error) }) }
+  }
+  return <div className="view-stack">
+    {issued && <section className="band"><div className="section-heading"><div><div className="eyebrow">ONE-TIME SECRET</div><h2>新客户端 key</h2></div><button className="icon-button" title="关闭" onClick={() => setIssued(null)}><X size={16} /></button></div><div className="connection-field"><label>{issued.id}<input readOnly value={issued.key} /></label><button className="icon-button bordered" title="复制 API key" onClick={() => void copyIssued()}><Clipboard size={16} /></button></div><p className="inline-warning"><AlertTriangle size={16} />离开或关闭后无法再次查看，只能轮换。</p></section>}
+    <section className="band"><div className="section-heading"><div><div className="eyebrow">CHANNEL GROUPS</div><h2>互斥渠道分组</h2></div><span className="muted">启用分组之间不能共享渠道</span></div><div className="table-scroll"><table><thead><tr><th>分组</th><th>渠道</th><th>状态</th><th>操作</th></tr></thead><tbody>{groups.map((group: Json) => <tr key={group.id}><td><strong>{group.id}</strong></td><td>{group.channels.map((channel: string) => <code key={channel}>{channel} </code>)}</td><td><span className={`state-tag ${group.enabled ? 'success' : 'neutral'}`}>{group.enabled ? '启用' : '停用'}</span></td><td><div className="inline-actions"><button className="button tiny" onClick={() => editGroup(group)}><Settings2 size={14} />编辑</button><button className="button tiny subtle" onClick={() => void mutate(`/admin/api/access/groups/${encodeURIComponent(group.id)}`, 'PATCH', { enabled: !group.enabled }, group.enabled ? '分组已停用' : '分组已启用')}>{group.enabled ? <X size={14} /> : <Check size={14} />}{group.enabled ? '停用' : '启用'}</button><button className="icon-button danger" title="删除分组" onClick={() => openDialog({ title: `删除分组 ${group.id}`, body: '分组仍有关联客户端时服务器会拒绝删除。', action: async () => { await mutate(`/admin/api/access/groups/${encodeURIComponent(group.id)}`, 'DELETE', null, '分组已删除') } })}><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div><form className="form-grid" onSubmit={saveGroup}><label>分组 ID<input required readOnly={Boolean(editingGroup)} value={groupId} onChange={event => setGroupId(event.target.value)} pattern="[a-z][a-z0-9-]{0,63}" /></label><fieldset><legend>分配渠道</legend><div className="checkbox-grid">{channels.map(channel => <label className="checkbox" key={channel.id}><input type="checkbox" checked={groupChannels.includes(channel.id)} onChange={() => toggleChannel(channel.id)} />{channel.id}</label>)}</div></fieldset><div className="form-actions"><button className="button primary" type="submit" disabled={!groupChannels.length}><Save size={16} />{editingGroup ? '保存分组' : '新增分组'}</button>{editingGroup && <button className="button subtle" type="button" onClick={resetGroup}>取消</button>}</div></form></section>
+    <section className="band"><div className="section-heading"><div><div className="eyebrow">CLIENT KEYS</div><h2>客户端 key</h2></div><span className="muted">只保存哈希与末尾提示</span></div><div className="table-scroll"><table><thead><tr><th>客户端</th><th>分组</th><th>Key 提示</th><th>状态</th><th>操作</th></tr></thead><tbody>{clients.map((client: Json) => <tr key={client.id}><td><strong>{client.id}</strong></td><td><code>{client.group}</code></td><td><code>{client.keyHint ? `••••${client.keyHint}` : '—'}</code></td><td><span className={`state-tag ${client.enabled ? 'success' : 'neutral'}`}>{client.enabled ? '启用' : '停用'}</span></td><td><div className="inline-actions"><button className="button tiny" onClick={() => rotate(client)}><RefreshCw size={14} />轮换</button><button className="button tiny subtle" onClick={() => void mutate(`/admin/api/access/clients/${encodeURIComponent(client.id)}`, 'PATCH', { enabled: !client.enabled }, client.enabled ? '客户端已停用' : '客户端已启用')}>{client.enabled ? <X size={14} /> : <Check size={14} />}{client.enabled ? '停用' : '启用'}</button><button className="icon-button danger" title="删除客户端" onClick={() => openDialog({ title: `删除客户端 ${client.id}`, body: '删除后该客户端 key 将无法恢复。', action: async () => { await mutate(`/admin/api/access/clients/${encodeURIComponent(client.id)}`, 'DELETE', null, '客户端已删除') } })}><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div><form className="form-grid" onSubmit={createClient}><label>客户端 ID<input required value={clientId} onChange={event => setClientId(event.target.value)} pattern="[a-z][a-z0-9-]{0,63}" /></label><label>渠道分组<select required value={clientGroup} onChange={event => setClientGroup(event.target.value)}><option value="">选择分组</option>{groups.map((group: Json) => <option key={group.id} value={group.id}>{group.id}</option>)}</select></label><div className="form-actions"><button className="button primary" type="submit" disabled={!groups.length}><KeyRound size={16} />新增 key</button></div></form></section>
+  </div>
+}
 
 function Changes({ state, revisions, audits, csrf, setNotice, onRefresh, openDialog }: { state: Json | null; revisions: Json[]; audits: Json[]; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onRefresh: () => Promise<void>; openDialog: (value: { title: string; body: string; action: () => Promise<void> } | null) => void }) {
   const [revision, setRevision] = useState('')

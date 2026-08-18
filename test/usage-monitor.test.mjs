@@ -166,3 +166,12 @@ test('usage monitor enforces a byte budget with atomic compaction', () => {
   assert.ok(restored.summary.total < 20)
   assert.ok(restored.summary.total > 0)
 })
+
+test('usage monitor attributes low-sensitivity client and group ids', () => {
+  const monitor = createUsageMonitor({ paths: {} }, { now: () => 1_000 })
+  monitor.record({ requestedModel: 'coding-main', channelId: 'free2', upstreamModel: 'model-a', clientId: 'doc-agent', groupId: 'enterprise', outcome: 'success', transport: 'adapted' })
+  const snapshot = monitor.snapshot({ hours: 24 })
+  assert.equal(snapshot.clients[0].id, 'doc-agent')
+  assert.equal(snapshot.groups[0].id, 'enterprise')
+  assert.equal(snapshot.clients[0].success, 1)
+})

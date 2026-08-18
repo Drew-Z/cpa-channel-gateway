@@ -24,7 +24,8 @@ export function generateRelease(root) {
     channels: channels.map(channel => ({ id: channel.id, enabled: channel.enabled, staged: channel.staged, runtimeEnabled: channel.runtimeEnabled, listener: channel.listener, modelCount: channel.models.length })),
     files: ['cpa/config.yaml', 'haproxy/haproxy.cfg']
   }
-  const digest = crypto.createHash('sha256').update(cpa).update('\0').update(haproxy).digest('hex').slice(0, 16)
+  const access = JSON.stringify(loaded.clientAccess ?? null)
+  const digest = crypto.createHash('sha256').update(cpa).update('\0').update(haproxy).update('\0').update(access).digest('hex').slice(0, 16)
   const releaseDir = path.join(root, 'runtime', 'releases', digest)
   fs.mkdirSync(path.join(releaseDir, 'cpa'), { recursive: true })
   fs.mkdirSync(path.join(releaseDir, 'haproxy'), { recursive: true })

@@ -24,6 +24,8 @@
     "migrate:routes": "node scripts/migrate-routes.mjs",
     "sync:models": "node scripts/sync-models.mjs",
     "canary": "node scripts/canary.mjs",
+    "audit:channel-models": "node scripts/audit-channel-models.mjs",
+    "apply:channel-audit": "node scripts/apply-channel-audit.mjs",
     "verify:deployment": "node scripts/verify-deployment.mjs",
     "install:runtime": "node scripts/install-runtime.mjs",
     "start": "node scripts/gateway.mjs start",

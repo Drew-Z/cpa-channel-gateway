@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { readEnvFile } from './env.mjs'
+import { normalizeClientAccess } from './client-access.mjs'
 import { MODEL_KINDS, STREAMING_MODES, isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
 import { isChannelEnvKey } from './providers.mjs'
 
@@ -15,10 +16,12 @@ export function loadConfig(root, { allowExamples = false, allowEmptyEnabledChann
   const routesPath = chooseLocal(root, 'routes.local.json', 'routes.example.json', allowExamples)
   const envPath = chooseLocal(root, 'channels.local.env', 'channels.example.env', allowExamples)
   const providersPath = chooseOptionalLocal(root, 'providers.local.json')
+  const clientsPath = chooseOptionalLocal(root, 'clients.local.json')
   const routes = readJson(routesPath)
   const env = readEnvFile(envPath)
   const providers = providersPath ? readJson(providersPath) : null
-  return validateAndNormalize({ gateway, routes, env, providers, paths: { routesPath, envPath, providersPath }, allowEmptyEnabledChannels })
+  const clients = clientsPath ? readJson(clientsPath) : null
+  return validateAndNormalize({ gateway, routes, env, providers, clients, paths: { routesPath, envPath, providersPath, clientsPath }, allowEmptyEnabledChannels })
 }
 
 function chooseLocal(root, localName, exampleName, allowExamples) {
@@ -37,7 +40,7 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'))
 }
 
-export function validateAndNormalize({ gateway, routes, env, providers = null, paths = {}, allowEmptyEnabledChannels = false }) {
+export function validateAndNormalize({ gateway, routes, env, providers = null, clients = null, paths = {}, allowEmptyEnabledChannels = false }) {
   const errors = []
   if (gateway.schemaVersion !== 1) errors.push('gateway.json schemaVersion must be 1')
   if (![1, 2].includes(routes.schemaVersion)) errors.push('routes schemaVersion must be 1 or 2')
@@ -181,6 +184,14 @@ export function validateAndNormalize({ gateway, routes, env, providers = null, p
   }
 
   validateGateway(gateway, errors)
+  let clientAccess = null
+  if (clients !== null) {
+    try {
+      clientAccess = normalizeClientAccess(clients, channels.map(channel => channel.id))
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : 'clients.local.json is invalid')
+    }
+  }
   if (errors.length) throw new Error(`Configuration validation failed:\n- ${errors.join('\n- ')}`)
   return {
     gateway,
@@ -189,6 +200,8 @@ export function validateAndNormalize({ gateway, routes, env, providers = null, p
     paths,
     providerMode,
     providers,
+    clients,
+    clientAccess,
     gatewayKey,
     managementKey,
     channels,

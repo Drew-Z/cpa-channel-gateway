@@ -434,6 +434,48 @@ test('discovers env-only channels and imports them as staged without exposing th
   assert.ok(manager.discoverChannels().pendingRestart.some(channel => channel.id === 'new'))
 })
 
+test('client groups and one-time keys are private, revisioned, and rotatable', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const group = manager.createClientGroup({ id: 'enterprise', channels: ['sample'] })
+  assert.equal(group.id, 'enterprise')
+  const created = manager.createClient({ id: 'doc-agent', group: 'enterprise' })
+  assert.match(created.key, /^cpa_[A-Za-z0-9_-]+$/)
+  const clientsPath = path.join(root, 'config', 'clients.local.json')
+  const privateText = fs.readFileSync(clientsPath, 'utf8')
+  assert.equal(privateText.includes(created.key), false)
+  assert.equal(JSON.stringify(manager.revisions()).includes(created.key), false)
+  assert.deepEqual(manager.access().clients, [{ id: 'doc-agent', group: 'enterprise', enabled: true, keyHint: created.key.slice(-6) }])
+
+  const rotated = manager.rotateClient('doc-agent')
+  assert.notEqual(rotated.key, created.key)
+  assert.equal(fs.readFileSync(clientsPath, 'utf8').includes(rotated.key), false)
+  assert.equal(manager.updateClient('doc-agent', { enabled: false }).enabled, false)
+  assert.throws(() => manager.deleteClientGroup('enterprise'), /Move clients/)
+  assert.equal(manager.deleteClient('doc-agent').deleted, true)
+  assert.equal(manager.deleteClientGroup('enterprise').deleted, true)
+})
+
+test('applies a canary audit without promoting an unverified channel', () => {
+  const root = fixtureRoot()
+  fs.appendFileSync(path.join(root, 'config', 'channels.local.env'), '\nCHANNEL_STAGED_NAME=Staged\nCHANNEL_STAGED_BASE_URL=https://staged.example.test/v1\nCHANNEL_STAGED_API_KEY=staged_secret_key_123456\nCHANNEL_STAGED_PROTOCOL=responses\nCHANNEL_STAGED_ENABLED=false\n')
+  const routesPath = path.join(root, 'config', 'routes.local.json')
+  const routes = JSON.parse(fs.readFileSync(routesPath, 'utf8'))
+  routes.channels.push({ id: 'staged', enabled: false, staged: true, models: [{ upstream: 'model-b', aliases: ['staged/model-b'] }] })
+  fs.writeFileSync(routesPath, JSON.stringify(routes, null, 2))
+  const manager = createPrivateConfigManager(loadConfig(root, { allowEmptyEnabledChannels: true }))
+  const result = manager.applyCanaryAudit({ results: [
+    { channel: 'sample', model: 'model-a', ok: false, error: 'empty_content' },
+    { channel: 'staged', model: 'model-b', ok: true }
+  ] }, { stableAliases: { 'coding-main': { channel: 'staged', model: 'model-b' } } })
+  assert.equal(result.successful, 1)
+  const loaded = loadConfig(root)
+  assert.equal(loaded.channels.find(channel => channel.id === 'sample').enabled, false)
+  assert.equal(loaded.channels.find(channel => channel.id === 'staged').enabled, true)
+  assert.deepEqual(loaded.stableAliases, [{ alias: 'coding-main', channel: 'staged', model: 'model-b', approvalRef: undefined }])
+  assert.equal(loaded.channels.find(channel => channel.id === 'sample').models[0].status, 'disabled')
+})
+
 function fixtureRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-config-manager-'))
   fs.mkdirSync(path.join(root, 'config'))

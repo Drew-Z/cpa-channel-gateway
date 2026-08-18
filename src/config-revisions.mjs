@@ -46,7 +46,7 @@ export function createConfigRevisionStore({
         contentDigest,
         releaseDigest,
         validation,
-        files: { providers: normalizedSnapshot.providersText !== null }
+        files: { providers: normalizedSnapshot.providersText !== null, clients: normalizedSnapshot.clientsText !== null }
       })
       if (manifest.parentRevision) readRevision(revisionRoot, manifest.parentRevision)
       const finalDir = revisionPath(revisionRoot, revision)
@@ -254,17 +254,33 @@ export function readCurrentSnapshot(root) {
   const envPath = path.join(configDir, 'channels.local.env')
   const routesPath = path.join(configDir, 'routes.local.json')
   const providersPath = path.join(configDir, 'providers.local.json')
+  const clientsPath = path.join(configDir, 'clients.local.json')
   if (!fs.existsSync(envPath) || !fs.existsSync(routesPath)) {
     throw new ConfigRevisionError('private_config_missing', 400, 'Private configuration is incomplete')
   }
   return normalizeSnapshot({
     envText: fs.readFileSync(envPath, 'utf8'),
     routesText: fs.readFileSync(routesPath, 'utf8'),
-    providersText: fs.existsSync(providersPath) ? fs.readFileSync(providersPath, 'utf8') : null
+    providersText: fs.existsSync(providersPath) ? fs.readFileSync(providersPath, 'utf8') : null,
+    clientsText: fs.existsSync(clientsPath) ? fs.readFileSync(clientsPath, 'utf8') : null
   })
 }
 
 export function digestSnapshot(snapshot) {
+  const normalized = normalizeSnapshot(snapshot)
+  return crypto.createHash('sha256')
+    .update('channels.local.env\0')
+    .update(normalized.envText)
+    .update('\0routes.local.json\0')
+    .update(normalized.routesText)
+    .update('\0providers.local.json\0')
+    .update(normalized.providersText ?? '')
+    .update('\0clients.local.json\0')
+    .update(normalized.clientsText ?? '')
+    .digest('hex')
+}
+
+function digestSnapshotLegacy(snapshot) {
   const normalized = normalizeSnapshot(snapshot)
   return crypto.createHash('sha256')
     .update('channels.local.env\0')
@@ -306,7 +322,8 @@ export function diffSnapshots(beforeSnapshot, afterSnapshot) {
   const models = diffModels(beforeRoutes, afterRoutes)
   const logicalModels = diffLogicalModels(beforeRoutes, afterRoutes)
   const aliases = diffAliases(beforeRoutes, afterRoutes)
-  return { channels, models, logicalModels, aliases }
+  const clients = diffClientAccess(before.clientsText, after.clientsText)
+  return { channels, models, logicalModels, aliases, clients }
 }
 
 function readRevision(revisionRoot, revisionValue) {
@@ -316,16 +333,22 @@ function readRevision(revisionRoot, revisionValue) {
   let manifest
   let snapshot
   try {
-    manifest = normalizeManifest(JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8')))
+    const rawManifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json'), 'utf8'))
+    manifest = normalizeManifest(rawManifest)
     if (manifest.revision !== revision) throw new Error('Revision id mismatch')
     snapshot = normalizeSnapshot({
       envText: fs.readFileSync(path.join(directory, 'channels.local.env'), 'utf8'),
       routesText: fs.readFileSync(path.join(directory, 'routes.local.json'), 'utf8'),
       providersText: manifest.files.providers
         ? fs.readFileSync(path.join(directory, 'providers.local.json'), 'utf8')
+        : null,
+      clientsText: manifest.files.clients
+        ? fs.readFileSync(path.join(directory, 'clients.local.json'), 'utf8')
         : null
     })
-    if (digestSnapshot(snapshot) !== manifest.contentDigest) throw new Error('Revision digest mismatch')
+    const currentDigest = digestSnapshot(snapshot)
+    const legacyDigest = rawManifest.files?.clients === undefined ? digestSnapshotLegacy(snapshot) : null
+    if (currentDigest !== manifest.contentDigest && legacyDigest !== manifest.contentDigest) throw new Error('Revision digest mismatch')
   } catch (error) {
     if (error instanceof ConfigRevisionError) throw error
     throw new ConfigRevisionError('revision_invalid', 409, 'Configuration revision is invalid')
@@ -341,10 +364,14 @@ function normalizeSnapshot(value) {
   if (value.providersText !== null && value.providersText !== undefined && typeof value.providersText !== 'string') {
     throw new ConfigRevisionError('invalid_revision_snapshot', 400, 'Provider snapshot must be text or null')
   }
+  if (value.clientsText !== null && value.clientsText !== undefined && typeof value.clientsText !== 'string') {
+    throw new ConfigRevisionError('invalid_revision_snapshot', 400, 'Client access snapshot must be text or null')
+  }
   return {
     envText: value.envText,
     routesText: value.routesText,
-    providersText: value.providersText ?? null
+    providersText: value.providersText ?? null,
+    clientsText: value.clientsText ?? null
   }
 }
 
@@ -427,6 +454,51 @@ function diffAliases(beforeRoutes, afterRoutes) {
     stable: diffAliasList(beforeRoutes.stableAliases, afterRoutes.stableAliases),
     pinned: diffAliasList(beforeRoutes.pinnedAliases, afterRoutes.pinnedAliases)
   }
+}
+
+function diffClientAccess(beforeText, afterText) {
+  const before = parseJsonObject(beforeText)
+  const after = parseJsonObject(afterText)
+  const beforeGroups = new Map((Array.isArray(before.groups) ? before.groups : []).map(item => [String(item?.id ?? ''), {
+    channels: [...new Set((item?.channels ?? []).map(value => String(value)))].sort(),
+    enabled: item?.enabled !== false
+  }]))
+  const afterGroups = new Map((Array.isArray(after.groups) ? after.groups : []).map(item => [String(item?.id ?? ''), {
+    channels: [...new Set((item?.channels ?? []).map(value => String(value)))].sort(),
+    enabled: item?.enabled !== false
+  }]))
+  const beforeClients = new Map((Array.isArray(before.clients) ? before.clients : []).map(item => [String(item?.id ?? ''), {
+    group: String(item?.group ?? ''), enabled: item?.enabled !== false, keyHash: String(item?.keyHash ?? '')
+  }]))
+  const afterClients = new Map((Array.isArray(after.clients) ? after.clients : []).map(item => [String(item?.id ?? ''), {
+    group: String(item?.group ?? ''), enabled: item?.enabled !== false, keyHash: String(item?.keyHash ?? '')
+  }]))
+  return {
+    groups: diffAccessMap(beforeGroups, afterGroups, (left, right) => ({
+      channelsChanged: JSON.stringify(left.channels) !== JSON.stringify(right.channels),
+      enabledChanged: left.enabled !== right.enabled
+    })),
+    clients: diffAccessMap(beforeClients, afterClients, (left, right) => ({
+      groupChanged: left.group !== right.group,
+      enabledChanged: left.enabled !== right.enabled,
+      keyRotated: left.keyHash !== right.keyHash
+    }))
+  }
+}
+
+function diffAccessMap(before, after, compare) {
+  const added = []
+  const removed = []
+  const changed = []
+  for (const id of [...new Set([...before.keys(), ...after.keys()])].sort()) {
+    if (!before.has(id)) added.push(id)
+    else if (!after.has(id)) removed.push(id)
+    else {
+      const fields = compare(before.get(id), after.get(id))
+      if (Object.values(fields).some(Boolean)) changed.push({ id, ...fields })
+    }
+  }
+  return { added, removed, changed }
 }
 
 function diffLogicalModels(beforeRoutes, afterRoutes) {
@@ -514,7 +586,8 @@ function normalizeManifest(value) {
     files: {
       env: 'channels.local.env',
       routes: 'routes.local.json',
-      providers: value.files?.providers === true
+      providers: value.files?.providers === true,
+      clients: value.files?.clients === true
     }
   }
 }
@@ -524,7 +597,9 @@ function normalizeAffected(value) {
   return {
     channelIds: normalizeList(input.channelIds, CHANNEL_ID, 100),
     modelIds: normalizeList(input.modelIds, /^[^\r\n\0]{1,512}$/, 500),
-    logicalModelIds: normalizeList(input.logicalModelIds, /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}$/, 200)
+    logicalModelIds: normalizeList(input.logicalModelIds, /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}$/, 200),
+    clientIds: normalizeList(input.clientIds, /^[a-z][a-z0-9-]{0,63}$/, 200),
+    groupIds: normalizeList(input.groupIds, /^[a-z][a-z0-9-]{0,63}$/, 200)
   }
 }
 
@@ -542,6 +617,7 @@ function writeSnapshot(directory, snapshot) {
   fs.writeFileSync(path.join(directory, 'channels.local.env'), snapshot.envText, { mode: 0o600 })
   fs.writeFileSync(path.join(directory, 'routes.local.json'), snapshot.routesText, { mode: 0o600 })
   if (snapshot.providersText !== null) fs.writeFileSync(path.join(directory, 'providers.local.json'), snapshot.providersText, { mode: 0o600 })
+  if (snapshot.clientsText !== null) fs.writeFileSync(path.join(directory, 'clients.local.json'), snapshot.clientsText, { mode: 0o600 })
 }
 
 function publicManifest(manifest) {

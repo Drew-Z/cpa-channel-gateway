@@ -73,10 +73,15 @@ export function createModelScheduler(config, {
     const resolved = catalog.resolve(modelId)
     if (!resolved) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${modelId}`)
     clearExpiredCooldowns()
+    const allowedChannels = metadata.allowedChannels instanceof Set ? metadata.allowedChannels : null
+    const accessCandidates = allowedChannels
+      ? resolved.candidates.filter(candidate => allowedChannels.has(candidate.channelId))
+      : resolved.candidates
+    if (!accessCandidates.length) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${modelId}`)
     const requestedStreaming = metadata.streaming
     const modeCandidates = requestedStreaming
-      ? resolved.candidates.filter(candidate => supportsStreaming(candidate.model, requestedStreaming))
-      : resolved.candidates
+      ? accessCandidates.filter(candidate => supportsStreaming(candidate.model, requestedStreaming))
+      : accessCandidates
     if (!modeCandidates.length && requestedStreaming) {
       throw new GatewayRoutingError('streaming_not_supported', 422, `No candidate supports ${requestedStreaming} requests for model: ${modelId}`, {
         requestedStreaming,

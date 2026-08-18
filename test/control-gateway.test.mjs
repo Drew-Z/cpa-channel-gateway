@@ -6,6 +6,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { createControlGateway } from '../src/control-gateway.mjs'
 import { createControlState } from '../src/control-state.mjs'
+import { hashClientKey } from '../src/client-access.mjs'
 
 test('native Responses forwarding preserves reviewed client headers and replaces secrets', async t => {
   let captured
@@ -965,6 +966,47 @@ test('admin API updates model status and stable aliases through the private conf
   ])
 })
 
+test('admin client access API manages groups and one-time keys without returning hashes', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const calls = []
+  const configManager = {
+    status: () => ({ revision: 'revision-a', loadedRevision: 'revision-a', pendingRevision: 'revision-a', restartRequired: false }),
+    routing: () => ({ stableAliases: [], pinnedAliases: [], logicalModels: [], models: [] }),
+    access: () => ({ enabled: true, groups: [{ id: 'enterprise', channels: ['free'], enabled: true }], clients: [{ id: 'doc-agent', group: 'enterprise', enabled: true, keyHint: 'abc123' }] }),
+    createClientGroup: body => { calls.push(['group-create', body]); return { id: body.id, channels: body.channels, enabled: true, revision: 'revision-b' } },
+    updateClientGroup: (id, body) => { calls.push(['group-update', id, body]); return { id, ...body, revision: 'revision-c' } },
+    deleteClientGroup: id => { calls.push(['group-delete', id]); return { id, deleted: true, revision: 'revision-d' } },
+    createClient: body => { calls.push(['client-create', body]); return { id: body.id, group: body.group, key: 'cpa_one_time_secret', revision: 'revision-e' } },
+    rotateClient: id => { calls.push(['client-rotate', id]); return { id, key: 'cpa_rotated_one_time_secret', revision: 'revision-f' } },
+    updateClient: (id, body) => { calls.push(['client-update', id, body]); return { id, ...body, revision: 'revision-g' } },
+    deleteClient: id => { calls.push(['client-delete', id]); return { id, deleted: true, revision: 'revision-h' } }
+  }
+  const gateway = createControlGateway(config, { configManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+  const access = await request({ port: address.port, method: 'GET', path: '/admin/api/access', headers: { cookie } })
+  assert.equal(access.statusCode, 200)
+  assert.equal(JSON.parse(access.body).clients[0].keyHash, undefined)
+  const group = await request({ port: address.port, path: '/admin/api/access/groups', headers, body: { id: 'daily', channels: ['free'] } })
+  assert.equal(group.statusCode, 202)
+  const client = await request({ port: address.port, path: '/admin/api/access/clients', headers, body: { id: 'daily-agent', group: 'daily' } })
+  assert.equal(client.statusCode, 201)
+  assert.match(JSON.parse(client.body).key, /^cpa_/)
+  const rotated = await request({ port: address.port, path: '/admin/api/access/clients/daily-agent/rotate', headers, body: {} })
+  assert.equal(rotated.statusCode, 200)
+  assert.match(JSON.parse(rotated.body).key, /^cpa_/)
+  assert.deepEqual(calls.slice(0, 3), [
+    ['group-create', { id: 'daily', channels: ['free'] }],
+    ['client-create', { id: 'daily-agent', group: 'daily' }],
+    ['client-rotate', 'daily-agent']
+  ])
+})
+
 test('revision history and structured diff are authenticated and audit jobs stay redacted', async t => {
   const config = fixtureConfig(19001)
   config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
@@ -1306,6 +1348,36 @@ test('bounds active admin sessions and evicts the oldest login', async t => {
   assert.equal(oldest.statusCode, 401)
   assert.equal(JSON.parse(oldest.body).error.code, 'admin_unauthorized')
   assert.equal(newest.statusCode, 200)
+})
+
+test('client keys replace the public gateway key and filter the model catalog by channel group', async t => {
+  const config = fixtureConfig(19001)
+  const clientKey = 'cpa_fixture_client_key_that_is_long_enough'
+  config.channels.push({
+    ...config.channels[0],
+    id: 'daily',
+    name: 'Daily',
+    listener: 19002,
+    models: [{ ...config.channels[0].models[0], aliases: ['daily/shared-model'] }]
+  })
+  config.clientAccess = {
+    schemaVersion: 1,
+    groups: [{ id: 'daily-group', channels: ['daily'], enabled: true }],
+    clients: [{ id: 'ai-daily', group: 'daily-group', keyHash: hashClientKey(clientKey), enabled: true }]
+  }
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const legacy = await request({ port: address.port, method: 'GET', path: '/v1/models', headers: { authorization: `Bearer ${GATEWAY_KEY}` } })
+  assert.equal(legacy.statusCode, 401)
+  const response = await request({ port: address.port, method: 'GET', path: '/v1/models', headers: { authorization: `Bearer ${clientKey}` } })
+  assert.equal(response.statusCode, 200)
+  const ids = JSON.parse(response.body).data.map(item => item.id)
+  assert.ok(ids.includes('shared-model'))
+  assert.ok(ids.includes('daily/shared-model'))
+  assert.ok(!ids.includes('free/shared-model'))
+  assert.ok(!ids.includes('coding-main'))
 })
 
 const GATEWAY_KEY = 'fixture_gateway_key_that_is_long_enough_123456'

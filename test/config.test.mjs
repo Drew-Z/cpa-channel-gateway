@@ -198,6 +198,28 @@ test('requires a private token only when Cloudflare Tunnel is enabled', () => {
   assert.throws(() => loadConfig(missingRoot), /CLOUDFLARE_TUNNEL_TOKEN is missing/)
 })
 
+test('validates private client groups and includes them in release identity', () => {
+  const root = fixtureRoot()
+  const baseline = generateRelease(root).digest
+  fs.writeFileSync(path.join(root, 'config', 'clients.local.json'), JSON.stringify({
+    schemaVersion: 1,
+    groups: [
+      { id: 'enterprise', channels: ['chat'], enabled: true },
+      { id: 'daily', channels: ['responses'], enabled: true }
+    ],
+    clients: [{ id: 'doc-agent', group: 'enterprise', enabled: true, keyHash: 'a'.repeat(64), keyHint: 'sample' }]
+  }, null, 2))
+  const loaded = loadConfig(root)
+  assert.equal(loaded.clientAccess.clients[0].id, 'doc-agent')
+  assert.notEqual(generateRelease(root).digest, baseline)
+
+  const clientsPath = path.join(root, 'config', 'clients.local.json')
+  const invalid = JSON.parse(fs.readFileSync(clientsPath, 'utf8'))
+  invalid.groups[1].channels = ['chat']
+  fs.writeFileSync(clientsPath, JSON.stringify(invalid))
+  assert.throws(() => loadConfig(root), /overlap on channel chat/)
+})
+
 function fixtureRoot() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-fixture-'))
   fs.mkdirSync(path.join(root, 'config'))

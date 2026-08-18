@@ -202,6 +202,20 @@ npm run canary
 
 默认任务是生成一首四句七言绝句。`CANARY_PROTOCOL` 接受 `responses`、`openai-compatible`（或等价的 `chat`）和 `claude`。脚本只记录 HTTP 状态、模型名和正文长度，不输出正文、密钥、上游地址或完整错误。canary 也是正式请求，必须取得与生产请求相同的渠道租约，并由操作者明确执行；项目不创建周期性模型探测。
 
+对本地所有已发现生成模型做一次逐渠道串行验收时使用：
+
+```bash
+npm run audit:channel-models
+```
+
+该命令直连每个渠道的真实 Base URL，使用固定诗词任务、`max_tokens/max_output_tokens=256` 和 30 秒单请求上限；输出写入 Git 忽略的 `runtime/model-audits/`，只包含渠道、模型、协议、HTTP 状态、耗时、正文长度和错误分类。429 只按 `Retry-After` 冷却后继续下一个模型，不重试同一个生成请求。验收结果不会自动改写生产配置；确认结果后可显式应用：
+
+```bash
+npm run apply:channel-audit -- runtime/model-audits/audit-<timestamp>.json channel/model channel/model
+```
+
+两个可选的 `channel/model` 参数分别用于更新 `coding-main` 与 `coding-backup`，只有审计成功的目标才会被接受。应用会生成私有 revision；成功渠道进入生产，成功渠道中的失败模型禁用，整渠道超时则停用渠道但保留模型目录以便后续复核。应用后需要通过管理台“应用待重启配置”或重启容器。
+
 ## 运维策略
 
 - `401/403`：立即禁用渠道并检查凭据，不重试同渠道。
@@ -211,6 +225,22 @@ npm run canary
 - timeout/5xx：第一阶段不自动重试。确认幂等和错误分类后，才评估最多一次跨渠道回退。
 - 同渠道存在真实流量时不执行 canary。
 - AI Daily 只能使用获批的 pinned alias，不允许跟随 `coding-main` 动态漂移。
+- 需要把不同客户端隔离到互不重叠的渠道集合时，在私有 `config/clients.local.json` 中配置分组和客户端。管理台“客户端”视图支持创建/轮换/停用/删除 key 与分配渠道；明文 key 只在创建或轮换响应中显示一次，文件和 revision 只保存哈希与末尾提示。例如：
+
+  ```json
+  {
+    "schemaVersion": 1,
+    "groups": [
+      { "id": "enterprise-doc", "channels": ["free3", "free4"], "enabled": true },
+      { "id": "ai-daily", "channels": ["free7"], "enabled": true }
+    ],
+    "clients": [
+      { "id": "enterprise-doc-agent", "group": "enterprise-doc", "keyHash": "<sha256>", "enabled": true }
+    ]
+  }
+  ```
+
+  启用分组之间不能共享物理渠道；每个客户端的 `/v1/models`、逻辑模型候选、并发锁和故障回退都只在所属分组内生效。存在 `clients.local.json` 后，`GATEWAY_API_KEY` 仅供网关访问内部 CPA，不再是公网万能 key；删除该文件并重启即可回到兼容的单 key 模式。
 
 ## 安全
 

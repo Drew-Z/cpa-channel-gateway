@@ -10,6 +10,7 @@ import { createControlJobQueue } from './control-jobs.mjs'
 import { isCanaryEligible } from './model-metadata.mjs'
 import { createModelScheduler, GatewayRoutingError } from './scheduler.mjs'
 import { createUsageMonitor } from './usage-monitor.mjs'
+import { resolveClient } from './client-access.mjs'
 
 const API_PATHS = new Set(['/v1/responses', '/v1/chat/completions', '/v1/messages'])
 const HOP_BY_HOP = new Set([
@@ -96,12 +97,13 @@ export function createControlGateway(config, {
       await handleAdminRequest(request, response, url)
       return
     }
-    if (!isAuthorized(request, config.gatewayKey)) {
+    const access = authorizeGatewayRequest(request, config)
+    if (!access) {
       sendJson(response, 401, { error: { code: 'invalid_api_key', message: 'Invalid API key' } }, { 'www-authenticate': 'Bearer' })
       return
     }
     if (request.method === 'GET' && url.pathname === '/v1/models') {
-      sendJson(response, 200, { object: 'list', data: scheduler.catalog.listPublicModels() })
+      sendJson(response, 200, { object: 'list', data: scheduler.catalog.listPublicModels({ allowedChannels: access.allowedChannels }) })
       return
     }
     if (request.method !== 'POST' || !API_PATHS.has(url.pathname)) {
@@ -117,7 +119,10 @@ export function createControlGateway(config, {
       selection = scheduler.reserve(requestedModel, {
         requestId: request.headers['x-request-id'],
         source: 'production',
-        streaming: body.stream === true ? 'stream' : 'non-stream'
+        streaming: body.stream === true ? 'stream' : 'non-stream',
+        allowedChannels: access.allowedChannels,
+        clientId: access.clientId,
+        groupId: access.groupId
       })
     } catch (error) {
       if (error instanceof GatewayRoutingError && ['all_candidates_busy', 'no_eligible_candidates', 'streaming_not_supported'].includes(error.code)) {
@@ -126,6 +131,8 @@ export function createControlGateway(config, {
           requestedModel,
           logicalModelId: resolved?.logicalModelId,
           upstreamModel: resolved?.candidates[0]?.upstreamModel,
+          clientId: access.clientId,
+          groupId: access.groupId,
           outcome: 'failure',
           transport: 'unassigned'
         })
@@ -141,7 +148,7 @@ export function createControlGateway(config, {
         ? selection.candidate.upstreamModel
         : selection.candidate.directAlias
     }
-    await proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel })
+    await proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel, access })
   }
 
   async function handleAdminRequest(request, response, url) {
@@ -185,6 +192,60 @@ export function createControlGateway(config, {
     if (url.pathname === '/admin/api/connection/reveal' && request.method === 'POST') {
       requireAdminMutation(request, session)
       sendJson(response, 200, adminConnection(request, true))
+      return
+    }
+    if (url.pathname === '/admin/api/access' && request.method === 'GET') {
+      requireConfigManager()
+      sendJson(response, 200, configManager.access?.() ?? { enabled: Boolean(config.clientAccess), groups: [], clients: [] })
+      return
+    }
+    if (url.pathname === '/admin/api/access/groups' && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      const body = await readJsonBody(request, requestBodyLimit())
+      sendJson(response, 202, await controlJobs.run('client-group-create', () => configManager.createClientGroup(body)))
+      return
+    }
+    const clientGroupRoute = /^\/admin\/api\/access\/groups\/([^/]+)$/.exec(url.pathname)
+    if (clientGroupRoute && request.method === 'PATCH') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      const body = await readJsonBody(request, requestBodyLimit())
+      sendJson(response, 202, await controlJobs.run('client-group-update', () => configManager.updateClientGroup(decodePathSegment(clientGroupRoute[1]), body)))
+      return
+    }
+    if (clientGroupRoute && request.method === 'DELETE') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      sendJson(response, 202, await controlJobs.run('client-group-delete', () => configManager.deleteClientGroup(decodePathSegment(clientGroupRoute[1]))))
+      return
+    }
+    if (url.pathname === '/admin/api/access/clients' && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      const body = await readJsonBody(request, requestBodyLimit())
+      sendJson(response, 201, await controlJobs.run('client-create', () => configManager.createClient(body)))
+      return
+    }
+    const clientRotateRoute = /^\/admin\/api\/access\/clients\/([^/]+)\/rotate$/.exec(url.pathname)
+    if (clientRotateRoute && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      sendJson(response, 200, await controlJobs.run('client-rotate', () => configManager.rotateClient(decodePathSegment(clientRotateRoute[1]))))
+      return
+    }
+    const clientRoute = /^\/admin\/api\/access\/clients\/([^/]+)$/.exec(url.pathname)
+    if (clientRoute && request.method === 'PATCH') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      const body = await readJsonBody(request, requestBodyLimit())
+      sendJson(response, 202, await controlJobs.run('client-update', () => configManager.updateClient(decodePathSegment(clientRoute[1]), body)))
+      return
+    }
+    if (clientRoute && request.method === 'DELETE') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      sendJson(response, 202, await controlJobs.run('client-delete', () => configManager.deleteClient(decodePathSegment(clientRoute[1]))))
       return
     }
     if (url.pathname === '/admin/api/channel-discovery' && request.method === 'GET') {
@@ -616,6 +677,7 @@ export function createControlGateway(config, {
       stableAliases: routing.stableAliases,
       pinnedAliases: routing.pinnedAliases,
       logicalModels: routing.logicalModels ?? [],
+      access: configManager?.access?.() ?? { enabled: Boolean(config.clientAccess), groups: [], clients: [] },
       reservations: snapshot.reservations,
       controlJobs: controlJobs.status(),
       runtime: runtimeManager?.status?.() ?? { active: null, transitioning: false, available: false },
@@ -644,8 +706,16 @@ export function createControlGateway(config, {
   }
 
   function adminConnection(request, reveal) {
+    if (config.clientAccess) {
+      return {
+        baseUrl: `${connectionOrigin(request)}/v1`,
+        mode: 'clients',
+        apiKeyMasked: null
+      }
+    }
     return {
       baseUrl: `${connectionOrigin(request)}/v1`,
+      mode: 'legacy',
       apiKeyMasked: maskSecret(config.gatewayKey),
       ...(reveal ? { apiKey: config.gatewayKey } : {})
     }
@@ -782,7 +852,7 @@ export function createControlGateway(config, {
     return null
   }
 
-  function proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel }) {
+  function proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel, access }) {
     return new Promise(resolve => {
       const payload = Buffer.from(JSON.stringify(outboundBody))
       const startedAt = monotonicNow()
@@ -818,6 +888,8 @@ export function createControlGateway(config, {
           channelId: selection.candidate.channelId,
           logicalModelId: selection.resolved.logicalModelId,
           upstreamModel: selection.candidate.upstreamModel,
+          clientId: access?.clientId,
+          groupId: access?.groupId,
           outcome,
           transport
         })
@@ -1055,12 +1127,20 @@ function maskSecret(value) {
   return `${secret.slice(0, 4)}${'*'.repeat(Math.max(8, secret.length - 8))}${secret.slice(-4)}`
 }
 
-function isAuthorized(request, expected) {
+function authorizeGatewayRequest(request, config) {
+  const provided = providedApiKey(request)
+  if (typeof provided !== 'string') return null
+  if (config.clientAccess) return resolveClient(config.clientAccess, provided)
+  return safeEqual(provided, config.gatewayKey)
+    ? { clientId: null, groupId: null, allowedChannels: null }
+    : null
+}
+
+function providedApiKey(request) {
   const authorization = request.headers.authorization ?? ''
   const bearer = /^Bearer\s+(.+)$/i.exec(authorization)?.[1]
   const provided = bearer ?? request.headers['x-api-key']
-  if (typeof provided !== 'string') return false
-  return safeEqual(provided, expected)
+  return typeof provided === 'string' ? provided : null
 }
 
 function safeEqual(leftValue, rightValue) {

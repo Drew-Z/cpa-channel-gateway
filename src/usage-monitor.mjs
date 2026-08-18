@@ -125,19 +125,21 @@ function normalizeEvent(input, at) {
   if (!requestedModel || !OUTCOMES.has(outcome) || !TRANSPORTS.has(transport)) return null
   const upstreamModel = boundedText(input.upstreamModel, 255)
   return {
-    v: 2,
+    v: 3,
     at,
     requestedModel,
     channelId: boundedText(input.channelId, 32),
     logicalModelId: boundedText(input.logicalModelId, 255) ?? upstreamModel,
     upstreamModel,
+    clientId: boundedText(input.clientId, 64),
+    groupId: boundedText(input.groupId, 64),
     outcome,
     transport
   }
 }
 
 function normalizePersistedEvent(value) {
-  if (!value || ![1, 2].includes(value.v) || !Number.isSafeInteger(value.at) || value.at < 0) return null
+  if (!value || ![1, 2, 3].includes(value.v) || !Number.isSafeInteger(value.at) || value.at < 0) return null
   return normalizeEvent(value, value.at)
 }
 
@@ -154,12 +156,16 @@ function buildSnapshot(events, { hours, from, to, storage }) {
   const logicalModels = new Map()
   const physicalModels = new Map()
   const channels = new Map()
+  const clients = new Map()
+  const groups = new Map()
 
   for (const event of events) {
     addOutcome(overall, event)
     addOutcome(getStats(models, event.requestedModel), event)
     if (event.logicalModelId) addOutcome(getStats(logicalModels, event.logicalModelId), event)
     if (event.channelId) addOutcome(getStats(channels, event.channelId), event)
+    if (event.clientId) addOutcome(getStats(clients, event.clientId), event)
+    if (event.groupId) addOutcome(getStats(groups, event.groupId), event)
     if (event.channelId && event.upstreamModel) {
       addOutcome(getStats(physicalModels, `${event.channelId}/${event.upstreamModel}`), event)
     }
@@ -174,7 +180,9 @@ function buildSnapshot(events, { hours, from, to, storage }) {
     models: finalizeMap(models),
     logicalModels: finalizeMap(logicalModels),
     physicalModels: finalizeMap(physicalModels),
-    channels: finalizeMap(channels)
+    channels: finalizeMap(channels),
+    clients: finalizeMap(clients),
+    groups: finalizeMap(groups)
   }
 }
 
