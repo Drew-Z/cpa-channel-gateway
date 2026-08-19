@@ -16,7 +16,12 @@ test('native Responses forwarding preserves reviewed client headers and replaces
       headers: request.headers,
       body: await jsonBody(request)
     }
-    response.writeHead(200, { 'content-type': 'text/event-stream', connection: 'close' })
+    response.writeHead(200, {
+      'content-type': 'text/event-stream',
+      connection: 'close',
+      'retry-after': '7',
+      'set-cookie': 'cpa_admin=upstream-value; Path=/admin; Secure; HttpOnly'
+    })
     response.write('data: {"type":"response.output_text.delta","delta":"秋"}\n\n')
     response.end('data: [DONE]\n\n')
   })
@@ -35,6 +40,7 @@ test('native Responses forwarding preserves reviewed client headers and replaces
       cookie: 'private-cookie=must-not-leak',
       'x-forwarded-for': '203.0.113.10',
       'cf-ray': 'private-edge-value',
+      'x-request-id': 'private phrase not safe',
       'user-agent': 'real-client/1.0',
       'openai-beta': 'responses=v1'
     },
@@ -51,6 +57,9 @@ test('native Responses forwarding preserves reviewed client headers and replaces
   assert.equal(captured.headers.cookie, undefined)
   assert.equal(captured.headers['x-forwarded-for'], undefined)
   assert.equal(captured.headers['cf-ray'], undefined)
+  assert.match(captured.headers['x-request-id'], /^[a-f0-9-]{36}$/)
+  assert.equal(result.headers['set-cookie'], undefined)
+  assert.equal(result.headers['retry-after'], '7')
 })
 
 test('records a 2xx outcome only after the complete upstream response ends', async t => {
@@ -1291,6 +1300,40 @@ test('rate limits repeated failed admin logins', async t => {
   assert.equal(limited.statusCode, 429)
   assert.equal(JSON.parse(limited.body).error.code, 'admin_login_rate_limited')
   assert.ok(Number(limited.headers['retry-after']) > 0)
+})
+
+test('isolates Cloudflare Tunnel login limits by validated connecting IP', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  config.cloudflareTunnel = { enabled: true }
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const rejected = await request({
+      port: address.port,
+      path: '/admin/api/session',
+      headers: { 'cf-connecting-ip': '203.0.113.10' },
+      body: { key: 'wrong-management-key' }
+    })
+    assert.equal(rejected.statusCode, 401)
+  }
+  const blockedSource = await request({
+    port: address.port,
+    path: '/admin/api/session',
+    headers: { 'cf-connecting-ip': '203.0.113.10' },
+    body: { key: config.managementKey }
+  })
+  const differentSource = await request({
+    port: address.port,
+    path: '/admin/api/session',
+    headers: { 'cf-connecting-ip': '2001:db8::20' },
+    body: { key: config.managementKey }
+  })
+
+  assert.equal(blockedSource.statusCode, 429)
+  assert.equal(differentSource.statusCode, 200)
 })
 
 test('bounds failed login sources without blocking a valid management key', async t => {

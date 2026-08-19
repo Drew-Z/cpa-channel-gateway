@@ -3,8 +3,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import { createPrivateConfigManager } from '../src/config-manager.mjs'
+import { ConfigMutationError, createPrivateConfigManager } from '../src/config-manager.mjs'
 import { createConfigRevisionStore } from '../src/config-revisions.mjs'
+import { beginConfigTransaction, writeConfigSnapshot } from '../src/config-transactions.mjs'
 import { loadConfig } from '../src/config.mjs'
 
 test('channel mutations are private, revisioned, validated, and restart-required', () => {
@@ -264,10 +265,23 @@ test('admin model synchronization is read-only upstream, revisioned, and marks d
   const root = fixtureRoot()
   const config = loadConfig(root)
   const calls = []
+  const leases = []
+  let leaseActive = false
   const manager = createPrivateConfigManager(config, {
     fetchImpl: async (url, options) => {
+      assert.equal(leaseActive, true)
       calls.push({ url: url.toString(), headers: options.headers })
       return { ok: true, status: 200, json: async () => ({ data: [{ id: 'model-a' }, { id: 'model-b' }] }) }
+    },
+    withChannelLease: async (channel, operation) => {
+      assert.equal(leaseActive, false)
+      leaseActive = true
+      leases.push(channel.id)
+      try {
+        return await operation()
+      } finally {
+        leaseActive = false
+      }
     }
   })
   const result = await manager.syncModels(['sample'])
@@ -281,10 +295,33 @@ test('admin model synchronization is read-only upstream, revisioned, and marks d
   assert.equal(revision.snapshot.envText.includes('sample_secret_key_123456'), true)
   assert.equal(calls[0].url, 'https://sample.example.test/v1/models')
   assert.equal(calls[0].headers.Authorization, 'Bearer sample_secret_key_123456')
+  assert.deepEqual(leases, ['sample'])
+  assert.equal(leaseActive, false)
   assert.equal(loadConfig(root).channels[0].models.some(model => model.upstream === 'model-b'), true)
   const unchanged = await manager.syncModels(['sample'])
   assert.equal(unchanged.changed, false)
   assert.equal(unchanged.restartRequired, true)
+  assert.deepEqual(leases, ['sample', 'sample'])
+})
+
+test('admin model synchronization does not call upstream when the channel lease is busy', async () => {
+  const root = fixtureRoot()
+  let fetchCount = 0
+  const manager = createPrivateConfigManager(loadConfig(root), {
+    fetchImpl: async () => {
+      fetchCount += 1
+      throw new Error('upstream must not be called')
+    },
+    withChannelLease: async channel => {
+      throw new ConfigMutationError('model_sync_channel_busy', 409, `Channel is busy: ${channel.id}`)
+    }
+  })
+
+  await assert.rejects(
+    manager.syncModels(['sample']),
+    error => error.code === 'model_sync_channel_busy' && error.statusCode === 409
+  )
+  assert.equal(fetchCount, 0)
 })
 
 test('an external valid file change is recorded as a linked revision', () => {
@@ -301,6 +338,50 @@ test('an external valid file change is recorded as a linked revision', () => {
   assert.equal(revision.operation, 'external-change')
   assert.equal(revision.parentRevision, baseline)
   assert.equal(status.restartRequired, true)
+})
+
+test('loadConfig restores the previous complete snapshot after an interrupted write', () => {
+  const root = fixtureRoot()
+  const store = createConfigRevisionStore({ root })
+  const before = store.snapshotCurrent()
+  beginConfigTransaction(root, before)
+  writeConfigSnapshot(root, {
+    ...before,
+    envText: 'INTERRUPTED=true\n',
+    routesText: '{not-valid-json\n'
+  })
+
+  const loaded = loadConfig(root)
+  assert.equal(loaded.channels[0].id, 'sample')
+  assert.equal(fs.readFileSync(path.join(root, 'config', 'channels.local.env'), 'utf8'), before.envText)
+  assert.equal(fs.readFileSync(path.join(root, 'config', 'routes.local.json'), 'utf8'), before.routesText)
+  assert.equal(fs.existsSync(path.join(root, 'runtime', 'config-transaction')), false)
+})
+
+test('a new mutation recovers an interrupted transaction before taking its own snapshot', () => {
+  const root = fixtureRoot()
+  const initial = loadConfig(root)
+  const before = createConfigRevisionStore({ root }).snapshotCurrent()
+  beginConfigTransaction(root, before)
+  writeConfigSnapshot(root, {
+    ...before,
+    envText: 'INTERRUPTED=true\n',
+    routesText: '{not-valid-json\n'
+  })
+
+  const manager = createPrivateConfigManager(initial)
+  const created = manager.createChannel({
+    id: 'recovered',
+    name: 'Recovered',
+    baseUrl: 'https://recovered.example.test/v1',
+    apiKey: 'recovered_secret_key_123456',
+    protocol: 'responses',
+    priority: 1
+  })
+
+  assert.equal(created.id, 'recovered')
+  assert.equal(loadConfig(root).channels.some(channel => channel.id === 'recovered'), true)
+  assert.equal(fs.existsSync(path.join(root, 'runtime', 'config-transaction')), false)
 })
 
 test('restores private files when the revision manifest cannot be committed', () => {

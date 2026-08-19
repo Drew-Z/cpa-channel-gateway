@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
+import { isIP } from 'node:net'
 import { performance } from 'node:perf_hooks'
 import { sendAdminAsset, sendAdminIndex } from './admin-assets.mjs'
 import { createAuditEventStore } from './audit-events.mjs'
@@ -39,13 +40,15 @@ export function createControlGateway(config, {
     onStateChange: state => controlState.replaceSchedulerState(state)
   }),
   usageMonitor = createUsageMonitor(config),
-  configManager = createPrivateConfigManager(config),
+  configManager = createPrivateConfigManager(config, {
+    withChannelLease: (channel, operation) => withSchedulerChannelLease(scheduler, channel, operation)
+  }),
   runtimeManager = null,
   auditStore: auditStoreOption = null,
   monotonicNow = () => performance.now(),
   adminSessionLimit = ADMIN_SESSION_LIMIT,
   adminLoginSourceLimit = ADMIN_LOGIN_SOURCE_LIMIT,
-  adminClientKey = request => request.socket.remoteAddress ?? 'unknown'
+  adminClientKey = request => resolveAdminClientKey(request, config.cloudflareTunnel?.enabled === true)
 } = {}) {
   const sessions = new Map()
   const sessionLimit = Number.isSafeInteger(adminSessionLimit) && adminSessionLimit > 0
@@ -117,7 +120,7 @@ export function createControlGateway(config, {
     let selection
     try {
       selection = scheduler.reserve(requestedModel, {
-        requestId: request.headers['x-request-id'],
+        requestId: normalizeRequestId(request.headers['x-request-id']),
         source: 'production',
         streaming: body.stream === true ? 'stream' : 'non-stream',
         allowedChannels: access.allowedChannels,
@@ -626,7 +629,7 @@ export function createControlGateway(config, {
         port: target.port,
         path: target.path,
         method: 'POST',
-        headers: forwardHeaders(incomingHeaders, payload.length, target.authorization)
+        headers: forwardHeaders(incomingHeaders, payload.length, target.authorization, selection.reservation.requestId)
       }, upstreamResponse => {
         const chunks = []
         let size = 0
@@ -870,7 +873,7 @@ export function createControlGateway(config, {
             path: `${url.pathname}${url.search}`,
             authorization: `Bearer ${config.gatewayKey}`
           }
-      const headers = forwardHeaders(request.headers, payload.length, target.authorization)
+      const headers = forwardHeaders(request.headers, payload.length, target.authorization, selection.reservation.requestId)
       let completed = false
       let clientClosed = false
       let upstreamRequest
@@ -1063,7 +1066,22 @@ function readJsonBody(request, limit) {
   })
 }
 
-function forwardHeaders(incoming, contentLength, authorization) {
+async function withSchedulerChannelLease(scheduler, channel, operation) {
+  const lease = scheduler.reservations.tryAcquire(channel.id, {
+    source: 'model-sync',
+    requestedModel: 'model-catalog'
+  })
+  if (!lease) {
+    throw new ConfigMutationError('model_sync_channel_busy', 409, `Channel is busy: ${channel.id}`)
+  }
+  try {
+    return await operation()
+  } finally {
+    lease.release()
+  }
+}
+
+function forwardHeaders(incoming, contentLength, authorization, requestId) {
   const connectionTokens = String(incoming.connection ?? '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
   const blocked = new Set([
     ...HOP_BY_HOP,
@@ -1076,7 +1094,8 @@ function forwardHeaders(incoming, contentLength, authorization) {
     'content-encoding',
     'content-md5',
     'digest',
-    'cookie'
+    'cookie',
+    'x-request-id'
   ])
   const headers = {}
   for (const [name, value] of Object.entries(incoming)) {
@@ -1087,13 +1106,36 @@ function forwardHeaders(incoming, contentLength, authorization) {
   headers.authorization = authorization
   headers['content-length'] = String(contentLength)
   headers['content-type'] = headers['content-type'] ?? 'application/json'
+  headers['x-request-id'] = normalizeRequestId(requestId)
   return headers
 }
 
 function filteredResponseHeaders(incoming) {
   const connectionTokens = String(incoming.connection ?? '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
-  const blocked = new Set([...HOP_BY_HOP, ...connectionTokens])
+  const blocked = new Set([...HOP_BY_HOP, ...connectionTokens, 'set-cookie', 'set-cookie2'])
   return Object.fromEntries(Object.entries(incoming).filter(([name, value]) => value !== undefined && !blocked.has(name.toLowerCase())))
+}
+
+function normalizeRequestId(value) {
+  const candidate = typeof value === 'string' ? value.trim() : ''
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(candidate) ? candidate : crypto.randomUUID()
+}
+
+function resolveAdminClientKey(request, tunnelEnabled) {
+  const peer = String(request.socket.remoteAddress ?? '').trim().toLowerCase()
+  if (tunnelEnabled && isLoopbackAddress(peer)) {
+    const forwarded = typeof request.headers['cf-connecting-ip'] === 'string'
+      ? request.headers['cf-connecting-ip'].trim().toLowerCase()
+      : ''
+    if (isIP(forwarded)) return forwarded
+  }
+  return peer || 'unknown'
+}
+
+function isLoopbackAddress(value) {
+  if (value === '::1') return true
+  const ipv4 = value.startsWith('::ffff:') ? value.slice('::ffff:'.length) : value
+  return isIP(ipv4) === 4 && ipv4.startsWith('127.')
 }
 
 function appendPath(basePath, suffix) {

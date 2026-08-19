@@ -1,8 +1,8 @@
-import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { loadConfig } from './config.mjs'
 import { createConfigRevisionStore, diffSnapshots, digestSnapshot } from './config-revisions.mjs'
+import { beginConfigTransaction, commitConfigTransaction, recoverConfigTransaction, rollbackConfigTransaction, writeConfigSnapshot } from './config-transactions.mjs'
 import { parseEnv, serializeEnv } from './env.mjs'
 import { fetchChannelModels, selectChannelsForSync, synchronizeRouteModels } from './model-sync.mjs'
 import { isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
@@ -24,7 +24,11 @@ export class ConfigMutationError extends Error {
   }
 }
 
-export function createPrivateConfigManager(config, { fetchImpl = fetch, revisionStore: revisionStoreOption = null } = {}) {
+export function createPrivateConfigManager(config, {
+  fetchImpl = fetch,
+  revisionStore: revisionStoreOption = null,
+  withChannelLease = async (_channel, operation) => operation()
+} = {}) {
   if (!config.paths?.routesPath || !config.paths?.envPath) return null
   const routesPath = config.paths.routesPath
   const envPath = config.paths.envPath
@@ -107,10 +111,12 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
       const diff = diffSnapshots(currentSnapshot, target.snapshot)
       let phase = 'write'
       let manifest
+      let transaction
       try {
+        transaction = beginConfigTransaction(root, currentSnapshot)
         writeCurrentSnapshot(target.snapshot)
         phase = 'validate'
-        loadConfig(root, { allowEmptyEnabledChannels: true })
+        loadConfig(root, { allowEmptyEnabledChannels: true, recoverTransactions: false })
         phase = 'revision'
         manifest = revisionStore.create({
           parentRevision: parentManifest.revision,
@@ -118,8 +124,9 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
           affected: affectedFromDiff(diff),
           snapshot: target.snapshot
         })
+        commitConfigTransaction(transaction)
       } catch (error) {
-        restoreAfterFailure(currentSnapshot)
+        restoreAfterFailure(transaction)
         throw mutationFailure(error, phase)
       }
       pendingManifest = manifest
@@ -133,9 +140,18 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
     },
     restoreRollback(transaction) {
       if (!transaction?.changed) return
-      writeCurrentSnapshot(transaction.previousSnapshot)
-      loadConfig(root, { allowEmptyEnabledChannels: true })
-      pendingManifest = transaction.previousManifest
+      const currentSnapshot = revisionStore.snapshotCurrent()
+      let restoreTransaction
+      try {
+        restoreTransaction = beginConfigTransaction(root, currentSnapshot)
+        writeCurrentSnapshot(transaction.previousSnapshot)
+        loadConfig(root, { allowEmptyEnabledChannels: true, recoverTransactions: false })
+        commitConfigTransaction(restoreTransaction)
+        pendingManifest = transaction.previousManifest
+      } catch (error) {
+        restoreAfterFailure(restoreTransaction)
+        throw mutationFailure(error, 'write')
+      }
     },
     routing() {
       const current = loadConfig(root, { allowEmptyEnabledChannels: true })
@@ -617,8 +633,12 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
         if (!selected.length) throw new ConfigMutationError('no_sync_channels', 400, 'No channels are available for model synchronization')
         const discoveries = new Map()
         try {
-          for (const channel of selected) discoveries.set(channel.id, await fetchChannelModels(channel, { fetchImpl }))
+          for (const channel of selected) {
+            const models = await withChannelLease(channel, () => fetchChannelModels(channel, { fetchImpl }))
+            discoveries.set(channel.id, models)
+          }
         } catch (error) {
+          if (error instanceof ConfigMutationError) throw error
           throw new ConfigMutationError('model_sync_failed', 502, error instanceof Error ? error.message : 'Model synchronization failed')
         }
         const { routes, summaries } = synchronizeRouteModels(current.routes, discoveries)
@@ -634,10 +654,12 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
         }
         let manifest
         let phase = 'write'
+        let transaction
         try {
+          transaction = beginConfigTransaction(root, originalSnapshot)
           writeCurrentSnapshot(nextSnapshot)
           phase = 'validate'
-          loadConfig(root, { allowEmptyEnabledChannels: true })
+          loadConfig(root, { allowEmptyEnabledChannels: true, recoverTransactions: false })
           phase = 'revision'
           manifest = revisionStore.create({
             parentRevision: parentManifest.revision,
@@ -648,8 +670,9 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
             },
             snapshot: nextSnapshot
           })
+          commitConfigTransaction(transaction)
         } catch (error) {
-          restoreAfterFailure(originalSnapshot)
+          restoreAfterFailure(transaction)
           throw mutationFailure(error, phase)
         }
         pendingManifest = manifest
@@ -780,10 +803,12 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
     }
     let manifest
     let phase = 'write'
+    let transaction
     try {
+      transaction = beginConfigTransaction(root, originalSnapshot)
       writeCurrentSnapshot(nextSnapshot)
       phase = 'validate'
-      loadConfig(root)
+      loadConfig(root, { recoverTransactions: false })
       phase = 'revision'
       manifest = revisionStore.create({
         parentRevision: parentManifest.revision,
@@ -791,8 +816,9 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
         affected: affected(result),
         snapshot: nextSnapshot
       })
+      commitConfigTransaction(transaction)
     } catch (error) {
-      restoreAfterFailure(originalSnapshot)
+      restoreAfterFailure(transaction)
       throw mutationFailure(error, phase)
     }
     pendingManifest = manifest
@@ -800,6 +826,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
   }
 
   function initialRevision() {
+    recoverConfigTransaction(root)
     const snapshot = revisionStore.snapshotCurrent()
     const existing = revisionStore.findByDigest(digestSnapshot(snapshot))
     const manifest = existing ?? revisionStore.create({ operation: 'startup-baseline', snapshot })
@@ -808,6 +835,7 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
   }
 
   function refreshCurrentRevision() {
+    recoverConfigTransaction(root)
     const snapshot = revisionStore.snapshotCurrent()
     const contentDigest = digestSnapshot(snapshot)
     if (contentDigest === pendingManifest.contentDigest) return pendingManifest
@@ -821,23 +849,13 @@ export function createPrivateConfigManager(config, { fetchImpl = fetch, revision
   }
 
   function writeCurrentSnapshot(snapshot) {
-    if (snapshot.providersText === null) {
-      if (fs.existsSync(providersPath)) fs.rmSync(providersPath)
-    } else {
-      atomicWrite(providersPath, snapshot.providersText)
-    }
-    if (snapshot.clientsText === null) {
-      if (fs.existsSync(clientsPath)) fs.rmSync(clientsPath)
-    } else {
-      atomicWrite(clientsPath, snapshot.clientsText)
-    }
-    atomicWrite(envPath, snapshot.envText)
-    atomicWrite(routesPath, snapshot.routesText)
+    writeConfigSnapshot(root, snapshot)
   }
 
-  function restoreAfterFailure(snapshot) {
+  function restoreAfterFailure(transaction) {
+    if (!transaction) return
     try {
-      writeCurrentSnapshot(snapshot)
+      rollbackConfigTransaction(transaction)
     } catch {
       throw new ConfigMutationError('configuration_restore_failed', 500, 'Private configuration could not be restored')
     }
@@ -1049,10 +1067,4 @@ function mutationFailure(error, phase) {
     return new ConfigMutationError('configuration_revision_failed', 500, 'Configuration revision could not be written')
   }
   return new ConfigMutationError('configuration_write_failed', 500, 'Private configuration could not be written')
-}
-
-function atomicWrite(filePath, content) {
-  const temporary = `${filePath}.tmp-${process.pid}-${crypto.randomUUID()}`
-  fs.writeFileSync(temporary, content, { mode: 0o600 })
-  fs.renameSync(temporary, filePath)
 }

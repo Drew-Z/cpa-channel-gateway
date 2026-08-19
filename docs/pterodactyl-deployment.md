@@ -31,7 +31,7 @@ npm test
 npm run check:admin-dist
 ```
 
-翼龙面板的主文件使用 `startup.js`，不会单独启动 Vite 开发服务器。通用 Node egg 使用分号串联自动更新、依赖安装和主进程，默认不会传播前两步的失败；`startup.js` 会以 `git pull --ff-only` 和 `npm install` 重新执行严格门禁，任何一步失败都会阻止旧版本继续启动。`AUTO_UPDATE=1` 拉取新提交并重启后，静态管理台和 Node API 会同时更新。
+翼龙面板的主文件使用 `startup.js`，不会单独启动 Vite 开发服务器。通用 Node egg 使用分号串联自动更新、依赖安装和主进程，默认不会传播前置步骤的失败；`startup.js` 会以 `git pull --ff-only` 重新执行严格更新门禁，失败时阻止旧版本继续启动。生产 Node 进程不依赖第三方 npm 包，管理台构建产物也随 Git 发布，因此项目启动器不再重复执行 `npm install`。若所用 egg 在调用主文件前固定安装依赖，该外层步骤仍可能受 npm registry 影响，需要在面板模板中单独关闭或调整。`AUTO_UPDATE=1` 拉取新提交并重启后，静态管理台和 Node API 会同时更新。
 
 网关完成内部 runtime、公开端口和可选 Tunnel readiness 后，才会输出通用 Node egg 的启动完成标记。面板显示 `Starting` 时先检查 `/healthz` 和进程 uptime；如果 `/healthz` 已 ready 但旧部署仍停在 `Starting`，更新代码并把 Main File 改为 `startup.js` 后再执行一次重启，不要连续重启正在提供服务的进程。
 

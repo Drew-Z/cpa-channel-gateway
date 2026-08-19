@@ -11,9 +11,6 @@ export async function preparePterodactylStart({
   if (env.AUTO_UPDATE === '1') {
     await runCommand('git', ['pull', '--ff-only'], { cwd: root, env })
   }
-
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  await runCommand(npm, ['install', '--no-audit', '--no-fund'], { cwd: root, env })
 }
 
 function run(command, args, options) {

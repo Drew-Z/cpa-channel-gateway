@@ -2,6 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { readEnvFile } from './env.mjs'
 import { normalizeClientAccess } from './client-access.mjs'
+import { recoverConfigTransaction } from './config-transactions.mjs'
 import { MODEL_KINDS, STREAMING_MODES, isGenerationModel, normalizeModelKind, normalizeStreamingMode } from './model-metadata.mjs'
 import { isChannelEnvKey } from './providers.mjs'
 
@@ -11,7 +12,12 @@ const ALIAS = /^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$/
 const LOGICAL_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,254}$/
 const ENV_NAME = /^[A-Z][A-Z0-9_]*$/
 
-export function loadConfig(root, { allowExamples = false, allowEmptyEnabledChannels = false } = {}) {
+export function loadConfig(root, {
+  allowExamples = false,
+  allowEmptyEnabledChannels = false,
+  recoverTransactions = true
+} = {}) {
+  if (recoverTransactions) recoverConfigTransaction(root)
   const gateway = readJson(path.join(root, 'config', 'gateway.json'))
   const routesPath = chooseLocal(root, 'routes.local.json', 'routes.example.json', allowExamples)
   const envPath = chooseLocal(root, 'channels.local.env', 'channels.example.env', allowExamples)

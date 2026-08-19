@@ -20,6 +20,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm audit --registry=https://registry.npmjs.org --omit=dev --audit-level=high
       - run: npm run audit:public
       - run: npm test
       - run: npm run check:admin-dist

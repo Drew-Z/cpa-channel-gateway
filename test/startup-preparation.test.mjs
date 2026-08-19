@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { PTERODACTYL_STARTUP_MARKER, preparePterodactylStart } from '../src/startup-preparation.mjs'
 
-test('strictly updates and installs before starting when auto update is enabled', async () => {
+test('strictly updates before starting without requiring the npm registry', async () => {
   const calls = []
 
   await preparePterodactylStart({
@@ -11,13 +11,12 @@ test('strictly updates and installs before starting when auto update is enabled'
     runCommand: async (command, args, options) => calls.push({ command, args, options })
   })
 
-  assert.equal(calls.length, 2)
+  assert.equal(calls.length, 1)
   assert.deepEqual(calls[0].args, ['pull', '--ff-only'])
-  assert.deepEqual(calls[1].args, ['install', '--no-audit', '--no-fund'])
   assert.equal(calls[0].options.cwd, '/fixture')
 })
 
-test('does not install dependencies after an update failure', async () => {
+test('does not continue startup preparation after an update failure', async () => {
   const calls = []
 
   await assert.rejects(
@@ -36,7 +35,7 @@ test('does not install dependencies after an update failure', async () => {
   assert.deepEqual(calls[0].args, ['pull', '--ff-only'])
 })
 
-test('skips the update but still verifies dependency installation when auto update is disabled', async () => {
+test('does not require network preparation when auto update is disabled', async () => {
   const calls = []
 
   await preparePterodactylStart({
@@ -45,7 +44,6 @@ test('skips the update but still verifies dependency installation when auto upda
     runCommand: async (command, args) => calls.push({ command, args })
   })
 
-  assert.equal(calls.length, 1)
-  assert.deepEqual(calls[0].args, ['install', '--no-audit', '--no-fund'])
+  assert.equal(calls.length, 0)
   assert.equal(PTERODACTYL_STARTUP_MARKER, 'change this text 1')
 })

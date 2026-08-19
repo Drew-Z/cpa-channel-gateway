@@ -115,13 +115,13 @@ npm run migrate:routes -- --apply
 
 ### 管理台
 
-管理台是同一 Node 进程提供的 React/Vite 静态应用。生产部署使用仓库内的 `admin/dist/` 构建产物，不增加服务、数据库或公网端口；面板主文件使用 `startup.js`，对通用 Node egg 未传播的 `git pull` 和 `npm install` 失败执行严格门禁，再加载 `index.js`。修改 `admin/src/` 后先执行 `npm run build:admin`，并把更新后的 `admin/dist/` 一并提交，翼龙 `AUTO_UPDATE=1` 重启后即可加载新界面。
+管理台是同一 Node 进程提供的 React/Vite 静态应用。生产部署使用仓库内的 `admin/dist/` 构建产物，不增加服务、数据库或公网端口；面板主文件使用 `startup.js`，对通用 Node egg 未传播的 `git pull` 失败执行严格门禁，再加载不依赖第三方 npm 包的生产 Node 进程。项目自己的启动器不会重复访问 npm registry；依赖安装、管理台构建和测试由 CI 完成。若面板 egg 在执行主文件前固定运行 `npm install`，仍需在面板模板层单独关闭。修改 `admin/src/` 后先执行 `npm run build:admin`，并把更新后的 `admin/dist/` 一并提交，翼龙 `AUTO_UPDATE=1` 重启后即可加载新界面。
 
-管理台会区分当前进程已加载 revision 与磁盘待重启 revision；变更未重启时会禁用测活，避免旧进程误报。失败登录按来源地址短时限速，来源桶最多保留 1024 个且不会因容量耗尽阻断正确管理密钥；过期会话会被主动清理。逻辑模型编辑器只从现有精确模型目录添加候选，支持候选启用状态和整数优先级；不同 upstream ID 不会被自动模糊合并。
+管理台会区分当前进程已加载 revision 与磁盘待重启 revision；变更未重启时会禁用测活，避免旧进程误报。失败登录按来源地址短时限速；Cloudflare Tunnel 只有在本地回环连接上才会信任合法的 `CF-Connecting-IP`，来源桶最多保留 1024 个且不会因容量耗尽阻断正确管理密钥。过期会话会被主动清理。逻辑模型编辑器只从现有精确模型目录添加候选，支持候选启用状态和整数优先级；不同 upstream ID 不会被自动模糊合并。
 
-`CPA_MANAGEMENT_KEY` 留空时 `/admin` 不开放。填写独立的 32 字符以上随机管理密钥并重启后，访问同一域名的 `/admin` 登录。管理密钥只通过登录表单提交；登录时会删除地址中意外出现的 `password` 查询参数，避免它继续留在当前浏览器历史项中。管理台的会话只保存在 Node 内存中，重启后失效；同时有效的会话最多保留 64 个，超出时淘汰最早建立的会话。现有渠道可以直接编辑名称、Base URL、协议和优先级，也可以只写替换 API key；旧密钥永不读取或回显，留空表示保持不变。模型下拉框同时用于测活和路由管理，不需要手写精确 ID。忙碌或已禁用模型不能测活，但仍可被选中管理；可以把 `coding-main`、`coding-backup` 指向精确模型或显式逻辑组，也可以禁用/恢复精确渠道模型。模型禁用、稳定别名移动和逻辑模型删除都需要二次确认；已有逻辑模型 ID 不支持伪装成重命名的编辑。禁用仍被 stable/pinned alias 或启用逻辑候选引用的模型会被拒绝，必须先移动引用。配置写入但尚未重启时，测活按钮会自动禁用，路由调整仍可继续批量完成。所有配置写入和模型同步都经过单一 FIFO 控制作业队列；渠道停用、待测试或删除会立即显示“排空中”，停止新预约但允许在途请求正常结束。管理台状态会显示当前作业、等待数量和低敏最近作业记录。待测试渠道会启动内网 HAProxy/CPA listener，但不会出现在公开 `/v1/models`，也不会被生产调度；只有管理员点击“设为生产”后才会加入统一模型出口。测活使用固定诗词任务、同一渠道互斥租约和相同协议路径，只保存状态摘要、transport、延迟与正文长度，不保存诗词正文。
+`CPA_MANAGEMENT_KEY` 留空时 `/admin` 不开放。填写独立的 32 字符以上随机管理密钥并重启后，访问同一域名的 `/admin` 登录。管理密钥只通过登录表单提交；登录时会删除地址中意外出现的 `password` 查询参数，避免它继续留在当前浏览器历史项中。管理台的会话只保存在 Node 内存中，重启后失效；同时有效的会话最多保留 64 个，超出时淘汰最早建立的会话。现有渠道可以直接编辑名称、Base URL、协议和优先级，也可以只写替换 API key；旧密钥永不读取或回显，留空表示保持不变。模型下拉框同时用于测活和路由管理，不需要手写精确 ID。忙碌或已禁用模型不能测活，但仍可被选中管理；可以把 `coding-main`、`coding-backup` 指向精确模型或显式逻辑组，也可以禁用/恢复精确渠道模型。模型禁用、稳定别名移动和逻辑模型删除都需要二次确认；已有逻辑模型 ID 不支持伪装成重命名的编辑。禁用仍被 stable/pinned alias 或启用逻辑候选引用的模型会被拒绝，必须先移动引用。配置写入但尚未重启时，测活按钮会自动禁用，路由调整仍可继续批量完成。所有配置写入和模型同步都经过单一 FIFO 控制作业队列；目录同步、业务请求和诗词测活共享同一个物理渠道互斥租约，渠道忙碌时同步不会访问上游。渠道停用、待测试或删除会立即显示“排空中”，停止新预约但允许在途请求正常结束。管理台状态会显示当前作业、等待数量和低敏最近作业记录。待测试渠道会启动内网 HAProxy/CPA listener，但不会出现在公开 `/v1/models`，也不会被生产调度；只有管理员点击“设为生产”后才会加入统一模型出口。测活使用固定诗词任务、同一渠道互斥租约和相同协议路径，只保存状态摘要、transport、延迟与正文长度，不保存诗词正文。
 
-管理台的 Changes 区域展示 loaded/pending revision、有限历史、结构化脱敏 diff 和最近审计结果。Base URL 在 diff 中只显示“已变化”，API key 只显示“已替换”；快照原文不会进入 API 或 DOM。回滚必须先查看目标 revision，再二次确认；它与 runtime apply 共用同一 FIFO，排空在途请求、生成并验证 release，成功激活后才提交 loaded revision。损坏 revision、排空超时或 readiness 失败都会保留当前私有配置和运行时。审计写入 Git 忽略的 `runtime/audit-events.jsonl`，只含 job ID、操作、结果、revision、耗时和分类错误码。
+管理台的 Changes 区域展示 loaded/pending revision、有限历史、结构化脱敏 diff 和最近审计结果。每次跨文件写入前会在 Git 忽略的 `runtime/config-transaction/` 保存完整旧快照；若进程在写入中途退出，下次加载会先自动恢复。Base URL 在 diff 中只显示“已变化”，API key 只显示“已替换”；快照原文不会进入 API 或 DOM。回滚必须先查看目标 revision，再二次确认；它与 runtime apply 共用同一 FIFO，排空在途请求、生成并验证 release，成功激活后才提交 loaded revision。损坏 revision、排空超时或 readiness 失败都会保留当前私有配置和运行时。审计写入 Git 忽略的 `runtime/audit-events.jsonl`，只含 job ID、操作、结果、revision、耗时和分类错误码。
 
 Changes 还会显示 revision 历史占用量、有效/损坏数量以及保留 20/50/100 份时的预计可整理数量和空间，但不会暴露快照内容或服务器路径。历史整理只能由管理员手动发起，不会在启动或后台自动执行；请求必须同时提交相同的 `keep` 与 `confirmKeep`，并经过 CSRF、二次确认、FIFO 和低敏审计。当前 loaded/pending revision 始终受保护；其余被删除的旧快照不能从管理台恢复。
 
@@ -248,12 +248,13 @@ npm run apply:channel-audit -- runtime/model-audits/audit-<timestamp>.json chann
 - Cloudflare Tunnel 默认关闭；Token 只存在于 `channels.local.env`，并通过子进程环境传递。cloudflared 固定版本、校验 SHA-256 且禁用自动更新。
 - CPA Management API 默认关闭；确需开启时仍只允许 localhost。
 - 不提交 `config/*.local.*`、`runtime/`、`auth/`、`logs/` 或 `bin/`。
-- `runtime/config-revisions/` 保存完整私有快照及其已应用 release digest；`runtime/audit-events.jsonl` 只保存白名单低敏字段，两者都必须保持 Git 忽略。
+- `runtime/config-revisions/` 保存完整私有快照及其已应用 release digest；`runtime/config-transaction/` 只在跨文件写入期间保存崩溃恢复快照；`runtime/audit-events.jsonl` 只保存白名单低敏字段，这些路径都必须保持 Git 忽略。
 - 公开或发布前运行 `npm run audit:public`；该检查会扫描当前跟踪文件、完整可达 Git 历史以及本地私密值是否意外进入仓库，但不会输出私密值。
 - CPA 当前启用 Codex 的标准兼容头（由 `cpa.disableCodexCloaking=false` 控制），用于适配通常只检查 `User-Agent`/`Originator` 的上游；这不是客户端真实性证明，也不会复制 Desktop 版本。身份混淆、Claude cloaking 和系统提示词替换仍保持关闭；Responses 同协议 native 路径继续保留真实客户端实际发送的低敏请求头。
 - 启动时使用 CPA 的 `-local-model`，模型目录来自已审核的本地 routes 配置，不依赖远程模型目录服务。
 - HAProxy 验证上游 TLS 证书并固定 HTTP/1.1，避免单连接多路复用绕过单并发约束。
 - Responses 客户端与 Responses 渠道同协议时，Node 直接保留实际请求语义和经过审查的非敏感端到端请求头；模型、认证、目标地址及传输相关字段由网关替换。其他协议组合标记为 CPA `adapted` 路径。
+- 客户端 `x-request-id` 只允许不超过 128 字符的安全标识；其他值会被内部 UUID 替换。上游 `Set-Cookie` 不会转发到网关域名。
 - 上游基路径由 CPA 的协议专用本地 URL 保留；Claude 会归一化末尾 `/v1`，避免生成 `/v1/v1/messages`。
 - 仓库不包含真实渠道名称以外的 URL、密钥、原始错误和响应正文。
 
