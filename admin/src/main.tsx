@@ -129,7 +129,7 @@ function App() {
 }
 
 function LoginPage({ error, onSubmit }: { error: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <main className="login-shell"><form className="login-panel" onSubmit={onSubmit}><div className="brand centered"><div className="brand-mark"><KeyRound size={19} /></div><div><strong>CPA Channel Gateway</strong><span>管理台登录</span></div></div><label>管理密钥<input autoFocus autoComplete="current-password" name="password" required type="password" /></label><button className="button primary full" type="submit"><LogIn size={17} />登录</button>{error && <p className="form-error" role="alert">{error}</p>}<p className="muted login-note">会话仅保存在网关内存中，重启后需要重新登录。</p></form></main>
+  return <main className="login-shell"><form className="login-panel" onSubmit={onSubmit}><div className="brand centered"><div className="brand-mark"><KeyRound size={19} /></div><div><strong>CPA Channel Gateway</strong><span>管理台登录</span></div></div><label>管理密钥<input autoComplete="current-password" name="password" required type="password" /></label><button className="button primary full" type="submit"><LogIn size={17} />登录</button>{error && <p className="form-error" role="alert">{error}</p>}<p className="muted login-note">会话仅保存在网关内存中，重启后需要重新登录。</p></form></main>
 }
 
 function Overview({ state, usage, connection, csrf, setNotice, onApply }: { state: Json | null; usage: Json | null; connection: Json | null; csrf: string; setNotice: (value: { kind: 'ok' | 'error' | 'info'; text: string } | null) => void; onApply: () => void }) {

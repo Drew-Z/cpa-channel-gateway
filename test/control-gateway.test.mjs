@@ -1251,6 +1251,7 @@ test('admin page serves the built app with strict static CSP and immutable asset
   assert.match(asset.headers['content-security-policy'], /default-src 'none'/)
   assert.match(asset.body, /客户端连接/)
   assert.match(asset.body, /current-password/)
+  assert.doesNotMatch(asset.body, /autoFocus:!0,autoComplete:"current-password"/)
   assert.match(asset.body, /FormData/)
   assert.match(asset.body, /编辑渠道/)
   assert.match(asset.body, /替换 API key/)
