@@ -40,7 +40,20 @@ export function createRuntimeManager({
           appliedGenerated = previous
         }
       })
-      if (!result.changed) controlGateway.markConfigApplied(next.digest)
+      if (!result.changed) {
+        try {
+          // A private-config revision can change only the outer Node router
+          // (for example, adding an embedding model) while producing identical
+          // CPA and HAProxy files. Reload that catalog even when the child
+          // release digest is unchanged.
+          controlGateway.reloadConfig(next, { markApplied: false })
+          controlGateway.markConfigApplied(next.digest)
+          appliedGenerated = next
+        } catch (error) {
+          controlGateway.reloadConfig(previous, { markApplied: false })
+          throw error
+        }
+      }
       return result
     }
   }

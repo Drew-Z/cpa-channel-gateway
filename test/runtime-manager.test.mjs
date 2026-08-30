@@ -37,7 +37,7 @@ test('commits a changed release only after drain and readiness replacement', asy
   ])
 })
 
-test('marks an unchanged generated revision without restarting the runtime', async () => {
+test('reloads an unchanged generated revision without restarting the runtime', async () => {
   const events = []
   const gateway = fixtureGateway(events)
   const manager = createRuntimeManager({
@@ -55,7 +55,41 @@ test('marks an unchanged generated revision without restarting the runtime', asy
   const result = await manager.apply()
 
   assert.equal(result.changed, false)
-  assert.deepEqual(events, ['generate', 'replace:release-a', 'mark-applied:release-a'])
+  assert.deepEqual(events, [
+    'generate',
+    'replace:release-a',
+    'reload:release-a:false',
+    'mark-applied:release-a'
+  ])
+})
+
+test('restores the prior outer routing config when an unchanged revision cannot be marked applied', async () => {
+  const events = []
+  const gateway = fixtureGateway(events)
+  gateway.markConfigApplied = releaseDigest => {
+    events.push(`mark-applied:${releaseDigest}`)
+    throw new Error('simulated revision link failure')
+  }
+  const manager = createRuntimeManager({
+    rootDir: '/gateway',
+    initialGenerated: generated('release-a', 120, 'previous'),
+    runtimeChildren: fixtureRuntime(events, async next => {
+      events.push(`replace:${next.digest}`)
+      return { changed: false, active: { digest: 'release-a' }, transitioning: false }
+    }),
+    getControlGateway: () => gateway,
+    generateReleaseImpl: () => { events.push('generate'); return generated('release-a', 120, 'next') },
+    activateReleaseImpl: () => { throw new Error('unchanged releases must not activate') }
+  })
+
+  await assert.rejects(manager.apply(), /simulated revision link failure/)
+  assert.deepEqual(events, [
+    'generate',
+    'replace:release-a',
+    'reload:release-a:false:next',
+    'mark-applied:release-a',
+    'reload:release-a:false:previous'
+  ])
 })
 
 test('restores the previous config and active release when commit fails', async () => {
@@ -123,8 +157,8 @@ test('does not reload or activate when draining times out', async () => {
   assert.deepEqual(events, ['generate', 'replace:release-b', 'drain', 'idle:120000', 'resume'])
 })
 
-function generated(digest, timeoutSeconds = 120) {
-  return { digest, gateway: { queue: { timeoutSeconds } } }
+function generated(digest, timeoutSeconds = 120, marker = null) {
+  return { digest, marker, gateway: { queue: { timeoutSeconds } } }
 }
 
 function fixtureRuntime(events, replace) {
@@ -144,7 +178,7 @@ function fixtureGateway(events, { waitError = null } = {}) {
       },
       resumeAll: () => events.push('resume')
     },
-    reloadConfig: (release, options) => events.push(`reload:${release.digest}:${options.markApplied}`),
+    reloadConfig: (release, options) => events.push(`reload:${release.digest}:${options.markApplied}${release.marker ? `:${release.marker}` : ''}`),
     markConfigApplied: releaseDigest => events.push(`mark-applied:${releaseDigest}`)
   }
 }
