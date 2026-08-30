@@ -505,6 +505,34 @@ export function createPrivateConfigManager(config, {
         return { channel: channelId, model: modelId, status }
       }, result => ({ channelIds: [result.channel], modelIds: [`${result.channel}/${result.model}`] }))
     },
+    createModel(input) {
+      return mutate('model-create', ({ routes }) => {
+        if (!input || Array.isArray(input) || typeof input !== 'object') {
+          throw new ConfigMutationError('invalid_model', 400, 'Model body must be an object')
+        }
+        const channelId = normalizeChannelId(input.channel)
+        const modelId = normalizeModelId(input.model)
+        const kind = normalizeModelKind(input.kind, modelId)
+        const protocol = normalizeProtocol(input.protocol)
+        const channel = (routes.channels ?? []).find(item => item.id === channelId)
+        if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${channelId}`)
+        channel.models ??= []
+        if (channel.models.some(model => model.upstream === modelId)) {
+          throw new ConfigMutationError('model_exists', 409, `Model already exists: ${channelId}/${modelId}`)
+        }
+        const model = {
+          upstream: modelId,
+          aliases: [`${channelId}/${modelId}`],
+          protocol,
+          kind,
+          streaming: normalizeStreamingMode(input.streaming),
+          canaryEligible: isGenerationModel({ kind }),
+          status: 'active'
+        }
+        channel.models.push(model)
+        return { channel: channelId, model: modelId, protocol, kind, status: model.status }
+      }, result => ({ channelIds: [result.channel], modelIds: [`${result.channel}/${result.model}`] }))
+    },
     updateModelProtocol(channelValue, modelValue, protocolValue) {
       return mutate('model-protocol-update', ({ routes }) => {
         const channelId = normalizeChannelId(channelValue)

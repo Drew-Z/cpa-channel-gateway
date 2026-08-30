@@ -343,6 +343,30 @@ test('admin model synchronization does not call upstream when the channel lease 
   assert.equal(fetchCount, 0)
 })
 
+test('manually registers an exact model when an upstream forbids model catalog access', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const result = manager.createModel({
+    channel: 'sample',
+    model: 'text-embedding-3-small',
+    kind: 'embedding',
+    protocol: 'openai-compatible'
+  })
+  assert.equal(result.channel, 'sample')
+  assert.equal(result.model, 'text-embedding-3-small')
+  assert.equal(result.kind, 'embedding')
+  const model = loadConfig(root).channels[0].models.find(item => item.upstream === 'text-embedding-3-small')
+  assert.equal(model.protocol, 'openai-compatible')
+  assert.equal(model.canaryEligible, false)
+  assert.equal(model.status, 'active')
+  assert.throws(() => manager.createModel({
+    channel: 'sample',
+    model: 'text-embedding-3-small',
+    kind: 'embedding',
+    protocol: 'openai-compatible'
+  }), error => error.code === 'model_exists' && error.statusCode === 409)
+})
+
 test('an external valid file change is recorded as a linked revision', () => {
   const root = fixtureRoot()
   const manager = createPrivateConfigManager(loadConfig(root))

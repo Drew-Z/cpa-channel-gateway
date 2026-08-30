@@ -273,6 +273,13 @@ export function createControlGateway(config, {
       sendJson(response, 200, { data: adminModels() })
       return
     }
+    if (url.pathname === '/admin/api/models' && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      const body = await readJsonBody(request, requestBodyLimit())
+      sendJson(response, 202, await controlJobs.run('model-create', () => configManager.createModel(body)))
+      return
+    }
     if (url.pathname === '/admin/api/models' && request.method === 'PATCH') {
       requireAdminMutation(request, session)
       requireConfigManager()
