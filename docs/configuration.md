@@ -68,9 +68,9 @@ CLOUDFLARE_TUNNEL_TOKEN=<private-token>
 
 CPA 的 Codex 兼容头由 `gateway.json` 中的 `cpa.disableCodexCloaking` 控制。当前值为 `false`，因此 CPA 的 `codex-api-key` 适配路径会使用 CPA 内置的标准 Codex `User-Agent`/`Originator` 头，适用于只做浅层客户端兼容检查的上游。它不会伪造具体 Codex Desktop 版本，也不能证明请求来自真实客户端；`identity-confuse` 仍关闭。Responses 客户端直连同协议渠道时走网关的 native passthrough，保留该次真实请求的低敏头部。需要改变该策略时只改公开 `gateway.json`，重新生成并重启，不要把浏览器 Cookie、LocalStorage 或会话令牌写入任何 CPA 配置。
 
-当前管理台提供渠道/模型状态、渠道新增与编辑、路由管理和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。渠道编辑可以修改名称、Base URL、协议、优先级或只写替换渠道 API key；现有渠道密钥只返回 `hasApiKey` 布尔值，永不读取或回显。模型禁用、稳定别名移动和逻辑模型删除都先显示精确目标并要求二次确认；现有逻辑模型 ID 为只读，不提供没有后端语义的假重命名。登录后“客户端连接”区域还会根据当前访问域名生成带 `/v1` 的 Base URL，并提供复制按钮；`GATEWAY_API_KEY` 默认仅显示掩码，显式点击“显示”或“复制 API key”时才通过带 CSRF 保护的已认证同源 `POST` 取回，不写入初始 HTML，显示后 30 秒自动恢复掩码。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。结果只保留 `status`、HTTP 状态、协议、`native-passthrough` 或 `adapted` transport、延迟和正文长度。
+当前管理台提供渠道/模型状态、渠道新增与编辑、路由管理和任务型测活。已认证的渠道状态会显示经过配置校验的 Base URL（包含 origin 和固定 path），便于区分渠道；该字段不会进入公开模型 API、未登录响应或日志，管理 API 响应使用 `Cache-Control: no-store`。渠道编辑可以修改名称、Base URL、默认协议、优先级或只写替换渠道 API key；默认协议只作用于未显式设置 `model.protocol` 的模型，不会删除或覆盖模型级协议。现有渠道密钥只返回 `hasApiKey` 布尔值，永不读取或回显。模型禁用、稳定别名移动和逻辑模型删除都先显示精确目标并要求二次确认；现有逻辑模型 ID 为只读，不提供没有后端语义的假重命名。登录后“客户端连接”区域还会根据当前访问域名生成带 `/v1` 的 Base URL，并提供复制按钮；`GATEWAY_API_KEY` 默认仅显示掩码，显式点击“显示”或“复制 API key”时才通过带 CSRF 保护的已认证同源 `POST` 取回，不写入初始 HTML，显示后 30 秒自动恢复掩码。测活请求必须使用精确 `<channel>/<upstream-model-id>`，不接受逻辑模型 ID；它会取得与生产相同的每渠道租约，繁忙时返回 429 且不发出上游请求。试测协议可临时选择 Chat Completions、Responses 或 Anthropic Messages；临时覆盖标记为 `protocol-direct`，不污染当前配置协议的健康证据，默认 Responses 同协议试测仍标记为 `native-passthrough`。结果只保留 `status`、HTTP 状态、配置/试测协议、transport、延迟、正文长度和白名单诊断，不保存正文。
 
-管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。渠道 PATCH 可包含 `name`、`baseUrl`、`apiKey`、`protocol`、整数 `priority`、`enabled` 或 `staged`；省略 `apiKey` 表示保持现有密钥。逻辑组使用 `POST /admin/api/logical-models`、`PATCH /admin/api/logical-models/<id>` 和 `DELETE /admin/api/logical-models/<id>`。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名可使用精确目标 `{ "alias", "channel", "model" }`，也可使用逻辑目标 `{ "alias", "logicalModel" }`。pinned alias 仍只允许带审批引用的精确目标。禁用或删除仍被 stable/pinned alias 或逻辑候选引用的模型/渠道会返回 409。请求必须带会话 CSRF token 和同源 `Origin`；渠道 API key 只写入服务器，不在状态或变更响应中返回。成功响应包含脱敏的 `revision` 与 `restartRequired`。每次成功变更都在 `runtime/config-revisions/<revision>/` 保存变更后的完整快照和低敏 manifest；验证或 revision 写入失败会恢复原配置。
+管理 API 还提供私有配置变更：`POST /admin/api/channels` 新增渠道，`PATCH /admin/api/channels/<id>` 修改渠道，`DELETE /admin/api/channels/<id>` 删除已禁用且无引用的渠道，`PATCH /admin/api/models` 修改精确渠道模型状态，`POST /admin/api/protocols/apply` 在最近成功的同模型同协议试测后应用协议，`PUT /admin/api/stable-aliases` 新增或移动稳定别名。协议应用请求只接受 `{ "scope": "model", "channel", "model", "protocol", "confirmTarget", "confirmProtocol" }`，目标必须是精确 `<channel>/<upstream-model>`，且目标和协议确认值必须精确匹配；`scope=channel` 返回 `409 channel_protocol_scope_not_supported`，因为同一渠道可以包含不同协议的模型。渠道 PATCH 中的 `protocol` 仅更新渠道默认协议，并保留所有模型级覆盖；它还可包含 `name`、`baseUrl`、`apiKey`、整数 `priority`、`enabled` 或 `staged`，省略 `apiKey` 表示保持现有密钥。逻辑组使用 `POST /admin/api/logical-models`、`PATCH /admin/api/logical-models/<id>` 和 `DELETE /admin/api/logical-models/<id>`。模型状态请求体为 `{ "channel", "model", "status" }`；稳定别名可使用精确目标 `{ "alias", "channel", "model" }`，也可使用逻辑目标 `{ "alias", "logicalModel" }`。pinned alias 仍只允许带审批引用的精确目标。禁用或删除仍被 stable/pinned alias 或逻辑候选引用的模型/渠道会返回 409。请求必须带会话 CSRF token 和同源 `Origin`；渠道 API key 只写入服务器，不在状态或变更响应中返回。成功响应包含脱敏的 `revision` 与 `restartRequired`。每次成功变更都在 `runtime/config-revisions/<revision>/` 保存变更后的完整快照和低敏 manifest；验证或 revision 写入失败会恢复原配置。
 
 配置写入和模型同步使用单一 FIFO 控制作业队列，`GET /admin/api/status` 的 `controlJobs` 返回当前作业、等待数量和最近低敏结果；队列满时返回 `429 control_queue_full`。停用、待测试或删除当前渠道会先进入排空状态，停止新的生产预约并等待在途租约释放；禁用模型会临时抑制当前进程的该候选。正式启动脚本中的 `POST /admin/api/runtime/apply` 会在排空后替换内部 CPA/HAProxy，执行 readiness，并在失败时恢复旧 release；成功后父 Node 路由和 `loadedRevision` 一起更新。没有运行时监督器的进程仍需重启应用。
 
@@ -112,7 +112,7 @@ npm run migrate:routes -- --apply
 npm run merge:legacy -- /absolute/path/to/legacy-channel.env
 ```
 
-合并会保留现有渠道的模型目录和别名；新渠道以禁用、空模型目录加入，需先显式同步目录、完成任务型测活，再启用渠道。导入过程会在 `runtime/config-revisions/` 创建私有备份，失败会恢复原文件。
+合并会保留现有渠道的模型目录和别名；新渠道以禁用、空模型目录加入，需先显式同步目录，再按模型类型完成验收：生成模型执行任务型测活，非生成模型确认协议后通过真实业务调用观测，再启用渠道。导入过程会在 `runtime/config-revisions/` 创建私有备份，失败会恢复原文件。
 
 默认同步所有已启用渠道；要在不启用新渠道的情况下只同步指定目录，可把渠道 ID 作为位置参数：
 
@@ -120,7 +120,7 @@ npm run merge:legacy -- /absolute/path/to/legacy-channel.env
 npm run sync:models -- free3 free7-glm-5-2
 ```
 
-模型级 `protocol` 可以覆盖渠道默认值。同一物理渠道的所有协议仍使用同一个 HAProxy listener，因此共享一个并发槽。
+模型级 `protocol` 可以覆盖渠道默认值；同一物理渠道内允许同时存在 Chat Completions、Responses 和 Anthropic Messages 模型。协议选择始终跟随最终选中的精确模型，不按渠道强制统一。所有协议仍使用该物理渠道的同一个 HAProxy listener，因此共享一个并发槽。
 
 启用渠道的完整模型目录通过以下命令显式同步：
 
@@ -159,7 +159,7 @@ npm run sync:models
 逻辑组不会隐藏精确 ID；同一候选仍使用物理渠道的唯一租约。候选 `enabled` 只控制它是否
 参与该逻辑组，`priority` 只在同健康层级内排序。停用逻辑组不会停用底层精确模型。
 
-同步是显式运维动作，不在每次启动时自动执行，也不作为渠道测活。它只访问 `/models`，但仍会在整个分页请求期间取得与业务流量和 canary 相同的物理渠道互斥租约；渠道忙碌时不会访问上游。成功后备份并更新私有 routes；生成服务启动时仍只读取本地已验证配置，不依赖远程目录。上游目录不能证明模型支持哪种 API 或能力，新模型默认继承渠道协议，必要时必须在 routes 中覆盖并完成对应 canary。
+同步是显式运维动作，不在每次启动时自动执行，也不作为渠道测活。它只访问 `/models`，但仍会在整个分页请求期间取得与业务流量和 canary 相同的物理渠道互斥租约；渠道忙碌时不会访问上游。成功后备份并更新私有 routes；生成服务启动时仍只读取本地已验证配置，不依赖远程目录。上游目录不能证明模型支持哪种 API 或能力，新模型默认继承渠道协议，生成模型必要时必须在 routes 中覆盖并完成对应 canary；embedding、rerank、音频、图像等非生成模型不套用诗词请求。当前 embedding 可通过精确 `<渠道ID>/<原始模型ID>` 调用 `/v1/embeddings`，其他非生成类型先保留目录并通过后续对应业务端点验证，所有真实调用都进入低敏使用统计。
 
 每个模型至少包含：
 
@@ -171,7 +171,21 @@ npm run sync:models
 }
 ```
 
-模型能力元数据用于路由和管理台审核。`kind` 支持 `generation`、`embedding`、`rerank`、`audio`、`image`、`video`、`ocr`、`moderation`；缺省时按模型 ID 做保守推断，无法判断时按 `generation` 处理。只有 `generation` 模型会进入公开 `/v1/models`、生产调度和 stable/pinned alias；其他类型仍保留在管理台模型目录中供审计，但不会执行固定诗词测活。
+模型能力元数据用于路由和管理台审核。`kind` 支持 `generation`、`embedding`、`rerank`、`audio`、`image`、`video`、`ocr`、`moderation`；缺省时按模型 ID 做保守推断，无法判断时按 `generation` 处理。只有 `generation` 模型会进入逻辑模型、stable/pinned alias 和固定诗词测活。当前只有已实现 `/v1/embeddings` 的 embedding 模型会通过精确 `<渠道ID>/<原始模型ID>` 出现在公开 `/v1/models`，响应附带 `kind` 与 `endpoints` 并按端点类型调度；其他非生成类型继续保留在管理台模型目录中，直到实现对应业务端点。
+
+embedding 使用公开模型目录中的精确渠道模型 ID 调用：
+
+```json
+POST /v1/embeddings
+Authorization: Bearer <client-key>
+
+{
+  "model": "channel/text-embedding-3-small",
+  "input": ["待向量化文本"]
+}
+```
+
+网关仅对 `kind=embedding` 的模型开放该端点，将请求模型替换为上游原始 ID 后直连配置的上游 URL，并保留同一渠道的互斥租约、认证替换、响应透传和低敏使用统计。将 embedding ID 发到生成端点，或将生成 ID 发到 `/v1/embeddings`，均返回 `422 model_endpoint_mismatch`，不会访问上游。
 
 `streaming` 控制该模型接受的请求模式：`both`（默认）、`stream-only` 或 `non-stream-only`。客户端请求的 `stream: true` 会要求 `stream` 候选，省略或设置为 `false` 会要求 `non-stream` 候选；调度器会筛选支持该模式的健康渠道。如果渠道可用但没有任何候选支持请求模式，网关返回 `422 streaming_not_supported`，不会把流式请求静默改成非流式，也不会自动重放已发送的生成请求。网关会透传上游分块响应，流式客户端无需额外端口或单独别名。
 

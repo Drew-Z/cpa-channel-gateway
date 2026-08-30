@@ -9,7 +9,7 @@ const CHANNEL_HEALTH = new Set(['healthy', 'degraded', 'auth-failed', 'payment-b
 const CANDIDATE_HEALTH = new Set(['misconfigured'])
 const TEST_STATUS = new Set(['success', 'failed'])
 const TEST_PROTOCOLS = new Set(['responses', 'openai-compatible', 'claude'])
-const TEST_TRANSPORTS = new Set(['native-passthrough', 'adapted'])
+const TEST_TRANSPORTS = new Set(['native-passthrough', 'adapted', 'protocol-direct'])
 
 export function createControlState(config, {
   filePath = defaultFilePath(config),
@@ -207,6 +207,13 @@ function normalizeLastTest(modelId, input, validModels) {
   const statusCode = input.statusCode === null ? null : boundedInteger(input.statusCode, 100, 599)
   if (statusCode === undefined) return null
   const result = { ok, status, statusCode, protocol, transport, latencyMs, testedAt }
+  if (input.configuredProtocol !== undefined) {
+    const configuredProtocol = String(input.configuredProtocol)
+    if (!TEST_PROTOCOLS.has(configuredProtocol)) return null
+    result.configuredProtocol = configuredProtocol
+  }
+  const diagnostics = normalizeTestDiagnostics(input.diagnostics)
+  if (diagnostics) result.diagnostics = diagnostics
   if (ok) {
     const contentLength = boundedInteger(input.contentLength, 0, 1_000_000_000)
     if (contentLength === undefined) return null
@@ -217,6 +224,37 @@ function normalizeLastTest(modelId, input, validModels) {
     result.error = error
   }
   return result
+}
+
+function normalizeTestDiagnostics(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+  const result = {}
+  const bodyBytes = boundedInteger(input.bodyBytes, 0, 1_000_000_000)
+  if (bodyBytes !== undefined) result.bodyBytes = bodyBytes
+  for (const field of ['finishReason', 'stopReason', 'responseStatus']) {
+    const value = safeDiagnosticLabel(input[field])
+    if (value) result[field] = value
+  }
+  for (const field of ['outputItemTypes', 'contentTypes']) {
+    if (!Array.isArray(input[field])) continue
+    const values = [...new Set(input[field].map(safeDiagnosticLabel).filter(Boolean))].slice(0, 16)
+    if (values.length) result[field] = values
+  }
+  if (typeof input.reasoningPresent === 'boolean') result.reasoningPresent = input.reasoningPresent
+  if (input.usage && typeof input.usage === 'object' && !Array.isArray(input.usage)) {
+    const usage = {}
+    for (const field of ['inputTokens', 'outputTokens', 'totalTokens', 'reasoningTokens']) {
+      const value = boundedInteger(input.usage[field], 0, 1_000_000_000)
+      if (value !== undefined) usage[field] = value
+    }
+    if (Object.keys(usage).length) result.usage = usage
+  }
+  return Object.keys(result).length ? result : null
+}
+
+function safeDiagnosticLabel(value) {
+  const label = String(value ?? '').trim().toLowerCase()
+  return /^[a-z0-9][a-z0-9_.-]{0,63}$/.test(label) ? label : null
 }
 
 function cloneSchedulerState(state) {

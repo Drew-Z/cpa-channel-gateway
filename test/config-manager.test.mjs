@@ -72,7 +72,7 @@ test('channel mutations are private, revisioned, validated, and restart-required
 
   assert.throws(
     () => manager.updateChannel('backup', { enabled: true }),
-    error => error.code === 'configuration_validation_failed'
+    error => error instanceof ConfigMutationError && error.code === 'channel_models_required' && error.statusCode === 409
   )
   assert.equal(loadConfig(root).channels.find(channel => channel.id === 'backup').enabled, false)
   assert.ok(fs.readdirSync(path.join(root, 'runtime', 'config-revisions')).length >= 2)
@@ -215,6 +215,25 @@ test('model status and stable alias changes are revisioned and prevent broken ro
   assert.deepEqual(routing.stableAliases, [{ alias: 'coding-main', channel: 'sample', model: 'model-b' }])
   assert.equal(routing.models.find(item => item.model === 'model-a').status, 'disabled')
   assert.equal(loadConfig(root).channels[0].models.find(model => model.upstream === 'model-a').status, 'disabled')
+})
+
+test('channel default protocol changes preserve model-level protocol overrides', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const modelUpdate = manager.updateModelProtocol('sample', 'model-a', 'claude')
+  assert.equal(modelUpdate.scope, 'model')
+  assert.equal(modelUpdate.protocol, 'claude')
+  assert.equal(loadConfig(root).channels[0].models[0].protocol, 'claude')
+
+  const channelUpdate = manager.updateChannelProtocol('sample', 'openai-compatible')
+  assert.equal(channelUpdate.scope, 'channel')
+  assert.equal(channelUpdate.protocol, 'openai-compatible')
+  const loaded = loadConfig(root)
+  assert.equal(loaded.channels[0].protocol, 'openai-compatible')
+  assert.equal(loaded.channels[0].models[0].protocol, 'claude')
+  const routes = JSON.parse(fs.readFileSync(path.join(root, 'config', 'routes.local.json'), 'utf8'))
+  assert.equal(routes.channels[0].models[0].protocol, 'claude')
+  assert.equal(JSON.stringify(manager.revisions()).includes('sample_secret_key'), false)
 })
 
 test('logical model CRUD and logical stable aliases are atomic and reference-safe', () => {
@@ -492,6 +511,9 @@ test('a newly created staged channel can be synchronized without enabling it', a
   assert.equal(loaded.channels.find(channel => channel.id === 'new').staged, true)
   assert.equal(loaded.channels.find(channel => channel.id === 'new').enabled, false)
   assert.equal(loaded.channels.find(channel => channel.id === 'new').models[0].upstream, 'new-model')
+  const enabled = manager.updateChannel('new', { enabled: true, staged: false })
+  assert.equal(enabled.enabled, true)
+  assert.equal(enabled.staged, false)
 })
 
 test('discovers env-only channels and imports them as staged without exposing the API key', () => {
@@ -537,7 +559,7 @@ test('client groups and one-time keys are private, revisioned, and rotatable', (
   assert.equal(manager.deleteClientGroup('enterprise').deleted, true)
 })
 
-test('applies a canary audit without promoting an unverified channel', () => {
+test('applies only explicitly approved canary audit changes', () => {
   const root = fixtureRoot()
   fs.appendFileSync(path.join(root, 'config', 'channels.local.env'), '\nCHANNEL_STAGED_NAME=Staged\nCHANNEL_STAGED_BASE_URL=https://staged.example.test/v1\nCHANNEL_STAGED_API_KEY=staged_secret_key_123456\nCHANNEL_STAGED_PROTOCOL=responses\nCHANNEL_STAGED_ENABLED=false\n')
   const routesPath = path.join(root, 'config', 'routes.local.json')
@@ -548,13 +570,30 @@ test('applies a canary audit without promoting an unverified channel', () => {
   const result = manager.applyCanaryAudit({ results: [
     { channel: 'sample', model: 'model-a', ok: false, error: 'empty_content' },
     { channel: 'staged', model: 'model-b', ok: true }
-  ] }, { stableAliases: { 'coding-main': { channel: 'staged', model: 'model-b' } } })
+  ] }, {
+    confirm: true,
+    approvedModels: ['sample/model-a', 'staged/model-b'],
+    approvedChannels: ['staged'],
+    stableAliases: { 'coding-main': { channel: 'staged', model: 'model-b' } }
+  })
   assert.equal(result.successful, 1)
   const loaded = loadConfig(root)
-  assert.equal(loaded.channels.find(channel => channel.id === 'sample').enabled, false)
+  assert.equal(loaded.channels.find(channel => channel.id === 'sample').enabled, true)
   assert.equal(loaded.channels.find(channel => channel.id === 'staged').enabled, true)
   assert.deepEqual(loaded.stableAliases, [{ alias: 'coding-main', channel: 'staged', model: 'model-b', approvalRef: undefined }])
   assert.equal(loaded.channels.find(channel => channel.id === 'sample').models[0].status, 'disabled')
+})
+
+test('canary audit requires confirmation and does not disable transient failures', () => {
+  const root = fixtureRoot()
+  const manager = createPrivateConfigManager(loadConfig(root))
+  const report = { results: [{ channel: 'sample', model: 'model-a', ok: false, error: 'rate_limited' }] }
+  assert.throws(() => manager.applyCanaryAudit(report), error => error.code === 'canary_confirmation_required')
+  const result = manager.applyCanaryAudit(report, { confirm: true, approvedModels: ['sample/model-a'] })
+  assert.deepEqual(result.disabledModels, [])
+  const loaded = loadConfig(root)
+  assert.equal(loaded.channels[0].enabled, true)
+  assert.equal(loaded.channels[0].models[0].status, 'active')
 })
 
 function fixtureRoot() {

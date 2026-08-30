@@ -1,10 +1,11 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
+import https from 'node:https'
 import { isIP } from 'node:net'
 import { performance } from 'node:perf_hooks'
 import { sendAdminAsset, sendAdminIndex } from './admin-assets.mjs'
 import { createAuditEventStore } from './audit-events.mjs'
-import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol } from './canary.mjs'
+import { buildCanaryRequest, diagnoseCanaryResponse, normalizeCanaryProtocol } from './canary.mjs'
 import { ConfigMutationError, createPrivateConfigManager } from './config-manager.mjs'
 import { createControlState } from './control-state.mjs'
 import { createControlJobQueue } from './control-jobs.mjs'
@@ -13,7 +14,7 @@ import { createModelScheduler, GatewayRoutingError } from './scheduler.mjs'
 import { createUsageMonitor } from './usage-monitor.mjs'
 import { resolveClient } from './client-access.mjs'
 
-const API_PATHS = new Set(['/v1/responses', '/v1/chat/completions', '/v1/messages'])
+const API_PATHS = new Set(['/v1/responses', '/v1/chat/completions', '/v1/messages', '/v1/embeddings'])
 const HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
@@ -31,7 +32,9 @@ const ADMIN_TEST_COOLDOWN_MS = 5_000
 const ADMIN_LOGIN_WINDOW_MS = 5 * 60 * 1000
 const ADMIN_LOGIN_MAX_FAILURES = 5
 const ADMIN_LOGIN_SOURCE_LIMIT = 1024
+const ADMIN_TEST_RESULT_TTL_MS = 30 * 60 * 1000
 const CANARY_PROMPT = '请写一首四句七言绝句，主题是秋夜读书。只输出诗题和诗句。'
+const CONFIG_PROTOCOLS = new Set(['openai-compatible', 'responses', 'claude'])
 
 export function createControlGateway(config, {
   controlState = createControlState(config),
@@ -71,6 +74,7 @@ export function createControlGateway(config, {
     })
   })
   const lastTests = new Map(Object.entries(controlState.lastTests()))
+  const protocolTests = new Map([...lastTests].map(([modelId, result]) => [`${modelId}\0${result.protocol}`, result]))
   const lastTestStarted = new Map()
   const server = http.createServer((request, response) => {
     handleRequest(request, response).catch(error => {
@@ -82,6 +86,7 @@ export function createControlGateway(config, {
       const code = error instanceof GatewayRoutingError || error instanceof ConfigMutationError ? error.code : error.code ?? 'internal_error'
       sendJson(response, statusCode, { error: { code, message: publicErrorMessage(error, statusCode) } }, {
         ...(code === 'all_candidates_busy' ? { 'retry-after': String(config.gateway.control.busyRetryAfterSeconds) } : {}),
+        ...(code === 'channel_cooling' ? { 'retry-after': String(Math.max(1, Math.ceil((error.retryAfterMs ?? 30_000) / 1000))) } : {}),
         ...(code === 'admin_login_rate_limited' ? { 'retry-after': String(Math.ceil((error.retryAfterMs ?? ADMIN_LOGIN_WINDOW_MS) / 1000)) } : {})
       })
     })
@@ -106,7 +111,13 @@ export function createControlGateway(config, {
       return
     }
     if (request.method === 'GET' && url.pathname === '/v1/models') {
-      sendJson(response, 200, { object: 'list', data: scheduler.catalog.listPublicModels({ allowedChannels: access.allowedChannels }) })
+      sendJson(response, 200, {
+        object: 'list',
+        data: scheduler.catalog.listPublicModels({
+          allowedChannels: access.allowedChannels,
+          includeNonGeneration: true
+        })
+      })
       return
     }
     if (request.method !== 'POST' || !API_PATHS.has(url.pathname)) {
@@ -117,18 +128,20 @@ export function createControlGateway(config, {
     const body = await readJsonBody(request, requestBodyLimit())
     const requestedModel = typeof body.model === 'string' ? body.model.trim() : ''
     if (!requestedModel) throw publicError('invalid_request', 400, 'Request body must include a model')
+    const embeddingRequest = url.pathname === '/v1/embeddings'
     let selection
     try {
       selection = scheduler.reserve(requestedModel, {
         requestId: normalizeRequestId(request.headers['x-request-id']),
         source: 'production',
         streaming: body.stream === true ? 'stream' : 'non-stream',
+        allowedKinds: embeddingRequest ? ['embedding'] : ['generation'],
         allowedChannels: access.allowedChannels,
         clientId: access.clientId,
         groupId: access.groupId
       })
     } catch (error) {
-      if (error instanceof GatewayRoutingError && ['all_candidates_busy', 'no_eligible_candidates', 'streaming_not_supported'].includes(error.code)) {
+      if (error instanceof GatewayRoutingError && ['all_candidates_busy', 'no_eligible_candidates', 'streaming_not_supported', 'model_endpoint_mismatch'].includes(error.code)) {
         const resolved = scheduler.catalog.resolve(requestedModel)
         usageMonitor.record({
           requestedModel,
@@ -142,7 +155,7 @@ export function createControlGateway(config, {
       }
       throw error
     }
-    const transport = url.pathname === '/v1/responses' && selection.candidate.protocol === 'responses'
+    const transport = embeddingRequest || (url.pathname === '/v1/responses' && selection.candidate.protocol === 'responses')
       ? 'native-passthrough'
       : 'adapted'
     const outboundBody = {
@@ -151,7 +164,7 @@ export function createControlGateway(config, {
         ? selection.candidate.upstreamModel
         : selection.candidate.directAlias
     }
-    await proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel, access })
+    await proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel, access, upstreamDirect: embeddingRequest })
   }
 
   async function handleAdminRequest(request, response, url) {
@@ -463,6 +476,13 @@ export function createControlGateway(config, {
       sendJson(response, 200, await runAdminTest(body))
       return
     }
+    if (url.pathname === '/admin/api/protocols/apply' && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      requireConfigManager()
+      const body = await readJsonBody(request, requestBodyLimit())
+      sendJson(response, 202, await controlJobs.run('protocol-update', () => applyTestedProtocol(body)))
+      return
+    }
     sendJson(response, 404, { error: { code: 'not_found', message: 'Admin route not found' } })
   }
 
@@ -514,6 +534,7 @@ export function createControlGateway(config, {
     }
     const requestedModel = typeof body.model === 'string' ? body.model.trim() : ''
     if (!requestedModel) throw publicError('invalid_request', 400, 'Test body must include a model')
+    const protocolOverride = normalizeConfigProtocol(body.protocolOverride, { optional: true })
     const adminCandidate = findAdminCandidate(requestedModel)
     const resolved = scheduler.catalog.resolve(requestedModel)
     if (!resolved && !adminCandidate) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${requestedModel}`)
@@ -523,21 +544,37 @@ export function createControlGateway(config, {
     if (!isCanaryEligible(adminCandidate)) {
       throw publicError('canary_not_supported', 409, 'Fixed text canary is available only for eligible generation models')
     }
-    const previousStartedAt = lastTestStarted.get(requestedModel) ?? 0
-    if (Date.now() - previousStartedAt < ADMIN_TEST_COOLDOWN_MS) {
-      throw publicError('test_rate_limited', 429, 'This model was tested too recently')
+    if (scheduler.isChannelDraining?.(adminCandidate.channelId) || scheduler.isCandidateSuppressed?.(adminCandidate.channelId, adminCandidate.upstreamModel)) {
+      throw publicError('candidate_unavailable', 409, 'The selected model is draining or waiting for configuration apply')
     }
-    const selection = scheduler.reserve(requestedModel, { source: 'manual-test', streaming: 'non-stream' })
-    lastTestStarted.set(requestedModel, Date.now())
+    const channelRuntime = scheduler.snapshot().channels[adminCandidate.channelId]
+    if (channelRuntime?.health === 'cooling' && channelRuntime.cooldownUntil > Date.now()) {
+      const error = publicError('channel_cooling', 429, 'The selected channel is cooling after a rate limit')
+      error.retryAfterMs = channelRuntime.cooldownUntil - Date.now()
+      throw error
+    }
+    const configuredProtocol = adminCandidate.protocol
+    const actualProtocol = protocolOverride ?? configuredProtocol
+    const cooldownKey = `${requestedModel}\0${actualProtocol}`
+    const previousStartedAt = lastTestStarted.get(cooldownKey) ?? 0
+    if (Date.now() - previousStartedAt < ADMIN_TEST_COOLDOWN_MS) {
+      throw publicError('test_rate_limited', 429, 'This model and protocol were tested too recently')
+    }
+    const lease = scheduler.reservations.tryAcquire(adminCandidate.channelId, {
+      source: 'manual-test',
+      requestedModel,
+      upstreamModel: adminCandidate.upstreamModel
+    })
+    if (!lease) throw new GatewayRoutingError('all_candidates_busy', 429, `Channel is busy for model: ${requestedModel}`)
+    const selection = { ...lease, candidate: adminCandidate, resolved }
+    lastTestStarted.set(cooldownKey, Date.now())
     const startedAt = monotonicNow()
-    const protocol = normalizeCanaryProtocol(selection.candidate.protocol)
-    const requestShape = buildCanaryRequest(protocol, selection.candidate.upstreamModel, CANARY_PROMPT)
-    const transport = protocol === 'responses' && selection.candidate.protocol === 'responses'
-      ? 'native-passthrough'
-      : 'adapted'
+    const wireProtocol = normalizeCanaryProtocol(actualProtocol)
+    const requestShape = buildCanaryRequest(wireProtocol, selection.candidate.upstreamModel, CANARY_PROMPT)
+    const transport = !protocolOverride && actualProtocol === 'responses' ? 'native-passthrough' : 'protocol-direct'
     const outboundBody = {
       ...requestShape.body,
-      model: transport === 'native-passthrough' ? selection.candidate.upstreamModel : selection.candidate.directAlias
+      model: selection.candidate.upstreamModel
     }
     try {
       let result
@@ -547,81 +584,118 @@ export function createControlGateway(config, {
           outboundBody,
           selection,
           transport,
-          incomingHeaders: canaryHeaders(protocol)
+          incomingHeaders: canaryHeaders(wireProtocol),
+          directProtocol: actualProtocol
         })
       } catch {
-        scheduler.recordTransportError(selection, elapsedMs(startedAt))
+        if (actualProtocol === configuredProtocol) scheduler.recordTransportError(selection, elapsedMs(startedAt))
         return rememberTest(requestedModel, {
           ok: false,
           status: 'failed',
           error: 'transport_error',
           statusCode: null,
-          protocol: selection.candidate.protocol,
+          protocol: actualProtocol,
+          configuredProtocol,
           transport,
           latencyMs: elapsedMs(startedAt)
         })
       }
       const durationMs = elapsedMs(startedAt)
-      scheduler.recordOutcome(selection, {
-        kind: result.statusCode >= 200 && result.statusCode < 300 ? 'success' : 'http-failure',
-        transient: result.statusCode >= 500,
-        statusCode: result.statusCode,
-        durationMs
-      }, result.headers)
       if (result.statusCode < 200 || result.statusCode >= 300) {
+        if (actualProtocol === configuredProtocol) {
+          scheduler.recordOutcome(selection, {
+            kind: 'http-failure',
+            transient: result.statusCode >= 500,
+            statusCode: result.statusCode,
+            durationMs
+          }, result.headers)
+        }
         return rememberTest(requestedModel, {
           ok: false,
           status: 'failed',
           error: classifyCanaryError(result.statusCode),
           statusCode: result.statusCode,
-          protocol: selection.candidate.protocol,
+          protocol: actualProtocol,
+          configuredProtocol,
           transport,
-          latencyMs: durationMs
+          latencyMs: durationMs,
+          diagnostics: { bodyBytes: Buffer.byteLength(result.body) }
         })
       }
-      let parsed
-      try { parsed = JSON.parse(result.body) } catch { parsed = null }
-      const content = extractCanaryContent(protocol, parsed)
-      if (typeof content !== 'string' || content.trim().length < 8) {
+      const diagnosis = diagnoseCanaryResponse(wireProtocol, result.body)
+      if (actualProtocol === configuredProtocol) {
+        scheduler.recordOutcome(selection, {
+          kind: diagnosis.ok ? 'success' : 'http-failure',
+          transient: false,
+          statusCode: diagnosis.ok ? result.statusCode : null,
+          durationMs
+        }, result.headers)
+      }
+      if (!diagnosis.ok) {
         return rememberTest(requestedModel, {
           ok: false,
           status: 'failed',
-          error: 'empty_content',
+          error: diagnosis.error,
           statusCode: result.statusCode,
-          protocol: selection.candidate.protocol,
+          protocol: actualProtocol,
+          configuredProtocol,
           transport,
-          latencyMs: durationMs
+          latencyMs: durationMs,
+          diagnostics: diagnosis.diagnostics
         })
       }
       return rememberTest(requestedModel, {
         ok: true,
         status: 'success',
         statusCode: result.statusCode,
-        protocol: selection.candidate.protocol,
+        protocol: actualProtocol,
+        configuredProtocol,
         transport,
         latencyMs: durationMs,
-        contentLength: content.trim().length
+        contentLength: diagnosis.contentLength,
+        diagnostics: diagnosis.diagnostics
       })
     } finally {
       selection.release()
     }
   }
 
-  function dispatchPayload({ url, outboundBody, selection, transport, incomingHeaders }) {
+  function applyTestedProtocol(body) {
+    const channel = typeof body.channel === 'string' ? body.channel.trim() : ''
+    const model = typeof body.model === 'string' ? body.model.trim() : ''
+    const protocol = normalizeConfigProtocol(body.protocol)
+    const scope = body.scope === 'channel' ? 'channel' : body.scope === 'model' ? 'model' : ''
+    if (scope === 'channel') {
+      throw publicError('channel_protocol_scope_not_supported', 409, 'A channel may contain models using different protocols; apply a protocol to an exact model')
+    }
+    const target = `${channel}/${model}`
+    if (scope !== 'model' || !channel || !model) throw publicError('invalid_request', 400, 'Protocol apply requires an exact channel/model target and a valid scope')
+    if (body.confirmTarget !== target || body.confirmProtocol !== protocol) {
+      throw publicError('protocol_confirmation_required', 400, 'Protocol apply requires exact target and protocol confirmation')
+    }
+    const directId = `${channel}/${model}`
+    const latest = protocolTests.get(`${directId}\0${protocol}`)
+    if (!latest?.ok || latest.protocol !== protocol || Date.parse(latest.testedAt) < Date.now() - ADMIN_TEST_RESULT_TTL_MS) {
+      throw publicError('protocol_test_required', 409, 'A recent successful test for this exact model and protocol is required')
+    }
+    return configManager.updateModelProtocol(channel, model, protocol)
+  }
+
+  function dispatchPayload({ url, outboundBody, selection, transport, incomingHeaders, directProtocol = null }) {
     const payload = Buffer.from(JSON.stringify(outboundBody))
-    const native = transport === 'native-passthrough'
-    const target = native
+    const direct = transport === 'native-passthrough' || Boolean(directProtocol)
+    const target = direct
       ? {
           host: config.gateway.internal.host,
           port: selection.candidate.channel.listener,
-          path: `${appendPath(selection.candidate.channel.upstream.pathname, url.pathname === '/v1/responses' ? '/responses' : url.pathname)}${url.search}`,
-          authorization: `Bearer ${selection.candidate.channel.apiKey}`
+          path: `${directUpstreamPath(selection.candidate.channel.upstream.pathname, url.pathname)}${url.search}`,
+          credentials: protocolCredentials(directProtocol ?? selection.candidate.protocol, selection.candidate.channel.apiKey)
         }
       : {
           host: config.gateway.internal.host,
           port: internalCpaPort(),
           path: `${url.pathname}${url.search}`,
-          authorization: `Bearer ${config.gatewayKey}`
+          credentials: `Bearer ${config.gatewayKey}`
         }
     return new Promise((resolve, reject) => {
       const upstreamRequest = http.request({
@@ -629,7 +703,7 @@ export function createControlGateway(config, {
         port: target.port,
         path: target.path,
         method: 'POST',
-        headers: forwardHeaders(incomingHeaders, payload.length, target.authorization, selection.reservation.requestId)
+        headers: forwardHeaders(incomingHeaders, payload.length, target.credentials, selection.reservation.requestId)
       }, upstreamResponse => {
         const chunks = []
         let size = 0
@@ -739,6 +813,7 @@ export function createControlGateway(config, {
       pruneTestCooldowns()
       lastTests.clear()
       for (const [modelId, result] of Object.entries(controlState.lastTests())) lastTests.set(modelId, result)
+      rebuildProtocolTests()
       if (markApplied) configManager?.markApplied?.(nextConfig.digest)
       return { configRevision: nextConfig.digest ?? null, controlState: controlState.status() }
     } catch (error) {
@@ -751,6 +826,7 @@ export function createControlGateway(config, {
         pruneTestCooldowns()
         lastTests.clear()
         for (const [modelId, result] of Object.entries(controlState.lastTests())) lastTests.set(modelId, result)
+        rebuildProtocolTests()
       } catch (restoreError) {
         const failure = publicError('runtime_reload_failed', 503, 'Runtime configuration reload failed and could not be restored')
         failure.cause = restoreError
@@ -765,7 +841,7 @@ export function createControlGateway(config, {
       [...scheduler.catalog.allModels.values()].flatMap(candidates => candidates.map(candidate => candidate.directAlias))
     )
     for (const modelId of lastTestStarted.keys()) {
-      if (!validModels.has(modelId)) lastTestStarted.delete(modelId)
+      if (!validModels.has(modelId.split('\0', 1)[0])) lastTestStarted.delete(modelId)
     }
   }
 
@@ -784,8 +860,21 @@ export function createControlGateway(config, {
   function rememberTest(modelId, result) {
     const summary = { ...result, testedAt: new Date().toISOString() }
     lastTests.set(modelId, summary)
+    protocolTests.set(`${modelId}\0${summary.protocol}`, summary)
     controlState.rememberTest(modelId, summary)
     return summary
+  }
+
+  function rebuildProtocolTests() {
+    protocolTests.clear()
+    for (const [modelId, result] of lastTests) protocolTests.set(`${modelId}\0${result.protocol}`, result)
+  }
+
+  function protocolTestSummaries(modelId) {
+    return Object.fromEntries([...CONFIG_PROTOCOLS].flatMap(protocol => {
+      const result = protocolTests.get(`${modelId}\0${protocol}`)
+      return result ? [[protocol, result]] : []
+    }))
   }
 
   function adminModels() {
@@ -815,7 +904,8 @@ export function createControlGateway(config, {
             scheduling: loaded
               ? scheduler.candidateStatus?.(loaded) ?? null
               : { evidence: null, reasonCodes: ['configuration-pending-restart'] },
-            lastTest: lastTests.get(directId) ?? null
+            lastTest: lastTests.get(directId) ?? null,
+            protocolTests: protocolTestSummaries(directId)
           }
         })
       : [...scheduler.catalog.allModels.values()].flat().map(candidate => ({
@@ -834,7 +924,8 @@ export function createControlGateway(config, {
           draining: scheduler.isChannelDraining?.(candidate.channelId) ?? false,
           suppressed: scheduler.isCandidateSuppressed?.(candidate.channelId, candidate.upstreamModel) ?? false,
           scheduling: scheduler.candidateStatus?.(candidate) ?? null,
-          lastTest: lastTests.get(candidate.directAlias) ?? null
+          lastTest: lastTests.get(candidate.directAlias) ?? null,
+          protocolTests: protocolTestSummaries(candidate.directAlias)
         }))
     const groups = new Map()
     for (const candidate of models) {
@@ -855,25 +946,36 @@ export function createControlGateway(config, {
     return null
   }
 
-  function proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel, access }) {
+  function proxyRequest({ request, response, url, outboundBody, selection, transport, requestedModel, access, upstreamDirect = false }) {
     return new Promise(resolve => {
       const payload = Buffer.from(JSON.stringify(outboundBody))
       const startedAt = monotonicNow()
       const native = transport === 'native-passthrough'
-      const target = native
+      const direct = upstreamDirect === true
+      const target = direct
         ? {
+            protocol: selection.candidate.channel.upstream.protocol,
+            hostname: selection.candidate.channel.upstream.hostname,
+            port: selection.candidate.channel.upstream.port || undefined,
+            path: `${directUpstreamPath(selection.candidate.channel.upstream.pathname, url.pathname)}${url.search}`,
+            credentials: protocolCredentials(selection.candidate.protocol, selection.candidate.channel.apiKey)
+          }
+        : native
+        ? {
+            protocol: 'http:',
             host: config.gateway.internal.host,
             port: selection.candidate.channel.listener,
             path: `${appendPath(selection.candidate.channel.upstream.pathname, '/responses')}${url.search}`,
-            authorization: `Bearer ${selection.candidate.channel.apiKey}`
+            credentials: `Bearer ${selection.candidate.channel.apiKey}`
           }
         : {
+            protocol: 'http:',
             host: config.gateway.internal.host,
             port: internalCpaPort(),
             path: `${url.pathname}${url.search}`,
-            authorization: `Bearer ${config.gatewayKey}`
+            credentials: `Bearer ${config.gatewayKey}`
           }
-      const headers = forwardHeaders(request.headers, payload.length, target.authorization, selection.reservation.requestId)
+      const headers = forwardHeaders(request.headers, payload.length, target.credentials, selection.reservation.requestId)
       let completed = false
       let clientClosed = false
       let upstreamRequest
@@ -907,8 +1009,9 @@ export function createControlGateway(config, {
       }
       response.once('close', onClientClose)
 
-      upstreamRequest = http.request({
-        host: target.host,
+      const requestModule = target.protocol === 'https:' ? https : http
+      upstreamRequest = requestModule.request({
+        ...(target.hostname ? { hostname: target.hostname } : { host: target.host }),
         port: target.port,
         path: target.path,
         method: 'POST',
@@ -1081,7 +1184,7 @@ async function withSchedulerChannelLease(scheduler, channel, operation) {
   }
 }
 
-function forwardHeaders(incoming, contentLength, authorization, requestId) {
+function forwardHeaders(incoming, contentLength, credentials, requestId) {
   const connectionTokens = String(incoming.connection ?? '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean)
   const blocked = new Set([
     ...HOP_BY_HOP,
@@ -1103,7 +1206,8 @@ function forwardHeaders(incoming, contentLength, authorization, requestId) {
     if (value === undefined || blocked.has(lower) || lower.startsWith('x-forwarded-') || lower.startsWith('cf-')) continue
     headers[lower] = value
   }
-  headers.authorization = authorization
+  if (typeof credentials === 'string') headers.authorization = credentials
+  else Object.assign(headers, credentials)
   headers['content-length'] = String(contentLength)
   headers['content-type'] = headers['content-type'] ?? 'application/json'
   headers['x-request-id'] = normalizeRequestId(requestId)
@@ -1142,6 +1246,21 @@ function appendPath(basePath, suffix) {
   const base = basePath === '/' ? '' : basePath.replace(/\/+$/, '')
   const path = suffix.startsWith('/') ? suffix : `/${suffix}`
   return `${base}${path}` || '/'
+}
+
+function directUpstreamPath(basePath, requestPath) {
+  const normalizedBase = basePath === '/' ? '' : basePath.replace(/\/+$/, '')
+  const normalizedRequest = requestPath.startsWith('/') ? requestPath : `/${requestPath}`
+  const suffix = normalizedBase.endsWith('/v1') && normalizedRequest.startsWith('/v1/')
+    ? normalizedRequest.slice('/v1'.length)
+    : normalizedRequest
+  return appendPath(normalizedBase || '/', suffix)
+}
+
+function protocolCredentials(protocol, apiKey) {
+  return protocol === 'claude'
+    ? { authorization: `Bearer ${apiKey}`, 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
+    : { authorization: `Bearer ${apiKey}` }
 }
 
 function connectionOrigin(request) {
@@ -1213,6 +1332,13 @@ function canaryHeaders(protocol) {
   return protocol === 'claude'
     ? { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'user-agent': 'cpa-channel-gateway/1.0' }
     : { 'content-type': 'application/json', 'user-agent': 'cpa-channel-gateway/1.0' }
+}
+
+function normalizeConfigProtocol(value, { optional = false } = {}) {
+  if (optional && (value === undefined || value === null || value === '')) return null
+  const protocol = String(value ?? '').trim()
+  if (!CONFIG_PROTOCOLS.has(protocol)) throw publicError('invalid_protocol', 400, `Unsupported protocol: ${protocol}`)
+  return protocol
 }
 
 function classifyCanaryError(statusCode) {

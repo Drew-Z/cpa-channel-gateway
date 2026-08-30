@@ -23,13 +23,15 @@ test('persists scheduler state and allowlisted canary summaries across restart',
     status: 'success',
     statusCode: 200,
     protocol: 'responses',
+    configuredProtocol: 'responses',
     transport: 'native-passthrough',
     latencyMs: 250,
     contentLength: 32,
     testedAt: new Date(timestamp).toISOString(),
     prompt: 'must-not-persist',
     responseBody: 'must-not-persist',
-    headers: { authorization: 'must-not-persist' }
+    headers: { authorization: 'must-not-persist' },
+    diagnostics: { bodyBytes: 128, responseStatus: 'completed', outputItemTypes: ['message'], reasoningPresent: false, usage: { outputTokens: 32 }, responseBody: 'must-not-persist' }
   }), true)
 
   const persisted = fs.readFileSync(filePath, 'utf8')
@@ -44,10 +46,12 @@ test('persists scheduler state and allowlisted canary summaries across restart',
     status: 'success',
     statusCode: 200,
     protocol: 'responses',
+    configuredProtocol: 'responses',
     transport: 'native-passthrough',
     latencyMs: 250,
     testedAt: new Date(timestamp).toISOString(),
-    contentLength: 32
+    contentLength: 32,
+    diagnostics: { bodyBytes: 128, responseStatus: 'completed', outputItemTypes: ['message'], reasoningPresent: false, usage: { outputTokens: 32 } }
   })
   assert.equal(restored.status().storage, 'persistent')
 })

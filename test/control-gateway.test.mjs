@@ -62,6 +62,69 @@ test('native Responses forwarding preserves reviewed client headers and replaces
   assert.equal(result.headers['retry-after'], '7')
 })
 
+test('embeddings forward directly to the configured upstream with the native model id', async t => {
+  let captured
+  let upstreamCalls = 0
+  const upstream = http.createServer(async (request, response) => {
+    upstreamCalls += 1
+    captured = {
+      path: request.url,
+      headers: request.headers,
+      body: await jsonBody(request)
+    }
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ object: 'list', data: [], model: captured.body.model }))
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+
+  const config = fixtureConfig(19001)
+  config.channels[0].upstream = new URL(`http://127.0.0.1:${upstreamAddress.port}/proxy/v1`)
+  config.channels[0].protocol = 'openai-compatible'
+  config.channels[0].models.push({
+    upstream: 'text-embedding-3-small',
+    protocol: 'openai-compatible',
+    kind: 'embedding',
+    aliases: ['free/text-embedding-3-small']
+  })
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const result = await request({
+    port: address.port,
+    path: '/v1/embeddings?encoding_format=float',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}`, 'user-agent': 'embedding-client/1.0' },
+    body: { model: 'free/text-embedding-3-small', input: ['秋夜读书'] }
+  })
+
+  assert.equal(result.statusCode, 200)
+  assert.equal(captured.path, '/proxy/v1/embeddings?encoding_format=float')
+  assert.equal(captured.body.model, 'text-embedding-3-small')
+  assert.equal(captured.body.input[0], '秋夜读书')
+  assert.equal(captured.headers.authorization, 'Bearer fixture-upstream-key')
+  assert.equal(captured.headers['user-agent'], 'embedding-client/1.0')
+  const wrongChatEndpoint = await request({
+    port: address.port,
+    path: '/v1/chat/completions',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'free/text-embedding-3-small', messages: [{ role: 'user', content: 'wrong endpoint' }] }
+  })
+  const wrongEmbeddingEndpoint = await request({
+    port: address.port,
+    path: '/v1/embeddings',
+    headers: { authorization: `Bearer ${GATEWAY_KEY}` },
+    body: { model: 'free/shared-model', input: 'wrong endpoint' }
+  })
+  assert.equal(wrongChatEndpoint.statusCode, 422)
+  assert.equal(JSON.parse(wrongChatEndpoint.body).error.code, 'model_endpoint_mismatch')
+  assert.equal(wrongEmbeddingEndpoint.statusCode, 422)
+  assert.equal(JSON.parse(wrongEmbeddingEndpoint.body).error.code, 'model_endpoint_mismatch')
+  assert.equal(upstreamCalls, 1)
+  const usage = gateway.usageMonitor.snapshot()
+  assert.equal(usage.physicalModels.find(item => item.id === 'free/text-embedding-3-small').total, 1)
+})
+
 test('records a 2xx outcome only after the complete upstream response ends', async t => {
   let releaseResponse
   let upstreamHeadersSent
@@ -440,7 +503,14 @@ test('an upstream transport failure is not replayed on another candidate', async
 })
 
 test('models endpoint exposes logical, stable, and direct ids', async t => {
-  const gateway = createControlGateway(fixtureConfig(19001))
+  const config = fixtureConfig(19001)
+  config.channels[0].models.push({
+    upstream: 'text-embedding-3-small',
+    protocol: 'openai-compatible',
+    kind: 'embedding',
+    aliases: ['free/text-embedding-3-small']
+  })
+  const gateway = createControlGateway(config)
   const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
   t.after(() => gateway.close())
   const result = await request({
@@ -450,8 +520,11 @@ test('models endpoint exposes logical, stable, and direct ids', async t => {
     headers: { 'x-api-key': GATEWAY_KEY }
   })
   assert.equal(result.statusCode, 200)
-  const ids = JSON.parse(result.body).data.map(item => item.id)
-  assert.deepEqual(ids, ['coding-main', 'free/shared-model', 'shared-model'])
+  const models = JSON.parse(result.body).data
+  const ids = models.map(item => item.id)
+  assert.deepEqual(ids, ['coding-main', 'free/shared-model', 'free/text-embedding-3-small', 'shared-model'])
+  assert.deepEqual(models.find(item => item.id === 'free/text-embedding-3-small').endpoints, ['/v1/embeddings'])
+  assert.equal(models.find(item => item.id === 'free/text-embedding-3-small').kind, 'embedding')
   assert.doesNotMatch(result.body, /upstream\.example\.test/)
 })
 
@@ -843,6 +916,102 @@ test('admin session protects status and runs a redacted exact-model canary', asy
   })
   assert.equal(logicalRejected.statusCode, 400)
   assert.equal(JSON.parse(logicalRejected.body).error.code, 'exact_model_required')
+})
+
+test('admin canary can probe a protocol override and apply it only after success', async t => {
+  let captured
+  const upstream = http.createServer(async (request, response) => {
+    captured = { path: request.url, body: await jsonBody(request), headers: request.headers }
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(request.url.endsWith('/messages')
+      ? JSON.stringify({ content: [{ type: 'text', text: '秋夜读书灯映寒窗' }], stop_reason: 'end_turn', usage: { input_tokens: 12, output_tokens: 8 } })
+      : JSON.stringify({ choices: [{ message: { content: '秋夜读书灯映寒窗' }, finish_reason: 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 8 } }))
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+  const config = fixtureConfig(upstreamAddress.port)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const calls = []
+  const configManager = {
+    status: () => ({ revision: 'loaded', loadedRevision: 'loaded', restartRequired: false }),
+    updateModelProtocol: (channel, model, protocol) => { calls.push({ scope: 'model', channel, model, protocol }); return { revision: 'pending-model-protocol', restartRequired: true } }
+  }
+  const gateway = createControlGateway(config, { configManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const headers = { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf }
+
+  const tested = await request({ port: address.port, path: '/admin/api/tests', headers, body: { model: 'free/shared-model', protocolOverride: 'openai-compatible' } })
+  assert.equal(tested.statusCode, 200)
+  const summary = JSON.parse(tested.body)
+  assert.equal(summary.ok, true)
+  assert.equal(summary.protocol, 'openai-compatible')
+  assert.equal(summary.configuredProtocol, 'responses')
+  assert.equal(summary.transport, 'protocol-direct')
+  assert.equal(captured.path, '/v1/chat/completions')
+  assert.equal(captured.body.messages[0].content.includes('四句七言绝句'), true)
+  assert.equal(captured.headers.authorization, 'Bearer fixture-upstream-key')
+
+  const anthropic = await request({ port: address.port, path: '/admin/api/tests', headers, body: { model: 'free/shared-model', protocolOverride: 'claude' } })
+  assert.equal(JSON.parse(anthropic.body).ok, true)
+  assert.equal(captured.path, '/v1/messages')
+  assert.equal(captured.headers['x-api-key'], 'fixture-upstream-key')
+  assert.equal(captured.headers['anthropic-version'], '2023-06-01')
+  assert.equal(gateway.scheduler.snapshot().candidates['free\\0shared-model\\0responses']?.evidence?.sampleCount ?? 0, 0)
+
+  const applied = await request({
+    port: address.port,
+    path: '/admin/api/protocols/apply',
+    headers,
+    body: { scope: 'model', channel: 'free', model: 'shared-model', protocol: 'openai-compatible', confirmTarget: 'free/shared-model', confirmProtocol: 'openai-compatible' }
+  })
+  assert.equal(applied.statusCode, 202)
+  assert.deepEqual(calls, [{ scope: 'model', channel: 'free', model: 'shared-model', protocol: 'openai-compatible' }])
+
+  const channelScope = await request({
+    port: address.port,
+    path: '/admin/api/protocols/apply',
+    headers,
+    body: { scope: 'channel', channel: 'free', model: 'shared-model', protocol: 'claude', confirmTarget: 'free', confirmProtocol: 'claude' }
+  })
+  assert.equal(channelScope.statusCode, 409)
+  assert.equal(JSON.parse(channelScope.body).error.code, 'channel_protocol_scope_not_supported')
+  assert.deepEqual(calls, [{ scope: 'model', channel: 'free', model: 'shared-model', protocol: 'openai-compatible' }])
+})
+
+test('a 2xx canary without final content records candidate failure instead of success', async t => {
+  const upstream = http.createServer((request, response) => {
+    request.resume()
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({ status: 'incomplete', output: [{ type: 'reasoning', summary: [] }], usage: { output_tokens: 512 } }))
+  })
+  const upstreamAddress = await listen(upstream)
+  t.after(() => close(upstream))
+  const config = fixtureConfig(upstreamAddress.port)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const gateway = createControlGateway(config)
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const tested = await request({
+    port: address.port,
+    path: '/admin/api/tests',
+    headers: { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf },
+    body: { model: 'free/shared-model' }
+  })
+  const summary = JSON.parse(tested.body)
+  assert.equal(summary.ok, false)
+  assert.equal(summary.error, 'reasoning_only')
+  assert.equal(summary.diagnostics.outputItemTypes[0], 'reasoning')
+  const evidence = gateway.scheduler.snapshot().candidates['free\0shared-model\0responses'].evidence
+  assert.equal(evidence.sampleCount, 1)
+  assert.equal(evidence.successCount, 0)
+  assert.equal(evidence.failureCount, 1)
 })
 
 test('admin API updates model status and stable aliases through the private config manager', async t => {
@@ -1265,6 +1434,9 @@ test('admin page serves the built app with strict static CSP and immutable asset
   assert.match(asset.body, /编辑渠道/)
   assert.match(asset.body, /替换 API key/)
   assert.match(asset.body, /留空保持现有密钥/)
+  assert.match(asset.body, /应用到当前模型/)
+  assert.doesNotMatch(asset.body, /应用到渠道/)
+  assert.match(asset.body, /同一渠道内的模型可以使用不同协议/)
   assert.match(asset.body, /禁用后该模型会从公开目录和生产调度移除/)
   assert.match(asset.body, /删除前必须先移走稳定别名引用/)
   assert.match(asset.body, /现有逻辑模型 ID 不可修改/)

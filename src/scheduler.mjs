@@ -78,10 +78,19 @@ export function createModelScheduler(config, {
       ? resolved.candidates.filter(candidate => allowedChannels.has(candidate.channelId))
       : resolved.candidates
     if (!accessCandidates.length) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${modelId}`)
+    const allowedKinds = Array.isArray(metadata.allowedKinds) && metadata.allowedKinds.length
+      ? new Set(metadata.allowedKinds.map(value => String(value).trim().toLowerCase()))
+      : null
+    const kindCandidates = allowedKinds
+      ? accessCandidates.filter(candidate => allowedKinds.has(candidate.kind))
+      : accessCandidates
+    if (!kindCandidates.length && allowedKinds) {
+      throw new GatewayRoutingError('model_endpoint_mismatch', 422, `Model ${modelId} is not compatible with this endpoint`)
+    }
     const requestedStreaming = metadata.streaming
     const modeCandidates = requestedStreaming
-      ? accessCandidates.filter(candidate => supportsStreaming(candidate.model, requestedStreaming))
-      : accessCandidates
+      ? kindCandidates.filter(candidate => supportsStreaming(candidate.model, requestedStreaming))
+      : kindCandidates
     if (!modeCandidates.length && requestedStreaming) {
       throw new GatewayRoutingError('streaming_not_supported', 422, `No candidate supports ${requestedStreaming} requests for model: ${modelId}`, {
         requestedStreaming,

@@ -3,6 +3,7 @@ import { isGenerationModel, normalizeModelKind, normalizeStreamingMode } from '.
 export function buildModelCatalog(config) {
   const logicalModels = new Map()
   const exactAliases = new Map()
+  const nonGenerationExactAliases = new Map()
   const stagedExactAliases = new Map()
   const routeAliases = new Map()
   const candidatesByKey = new Map()
@@ -33,6 +34,8 @@ export function buildModelCatalog(config) {
         if (!logicalModels.has(model.upstream)) logicalModels.set(model.upstream, [])
         logicalModels.get(model.upstream).push(candidate)
         for (const alias of model.aliases) exactAliases.set(alias, candidate)
+      } else if (channel.enabled) {
+        nonGenerationExactAliases.set(candidate.directAlias, candidate)
       } else if (channel.staged) {
         if (isGenerationModel(candidate)) stagedExactAliases.set(candidate.directAlias, candidate)
       }
@@ -95,29 +98,49 @@ export function buildModelCatalog(config) {
       if (logicalCandidates) return { requestedModel: modelId, kind: 'logical', logicalModelId: modelId, candidates: [...logicalCandidates] }
       const exactCandidate = exactAliases.get(modelId)
       if (exactCandidate) return { requestedModel: modelId, kind: 'direct', logicalModelId: exactCandidate.upstreamModel, candidates: [exactCandidate] }
+      const nonGenerationCandidate = nonGenerationExactAliases.get(modelId)
+      if (nonGenerationCandidate) return { requestedModel: modelId, kind: 'direct', logicalModelId: nonGenerationCandidate.upstreamModel, candidates: [nonGenerationCandidate] }
       const stagedCandidate = stagedExactAliases.get(modelId)
       if (stagedCandidate) return { requestedModel: modelId, kind: 'staged-direct', logicalModelId: stagedCandidate.upstreamModel, candidates: [stagedCandidate] }
       return null
     },
-    listPublicModels({ allowedChannels = null } = {}) {
+    listPublicModels({ allowedChannels = null, includeNonGeneration = false } = {}) {
       const allowed = allowedChannels instanceof Set ? allowedChannels : null
       const ids = new Set()
       for (const [id, candidates] of logicalModels) if (!allowed || candidates.some(candidate => allowed.has(candidate.channelId))) ids.add(id)
       for (const [id, route] of routeAliases) if (!allowed || route.candidates.some(candidate => allowed.has(candidate.channelId))) ids.add(id)
       for (const [id, candidate] of exactAliases) if (!allowed || allowed.has(candidate.channelId)) ids.add(id)
-      return [...ids].sort((left, right) => left.localeCompare(right)).map(id => ({
-        id,
-        object: 'model',
-        created: 0,
-        owned_by: 'cpa-channel-gateway'
-      }))
+      if (includeNonGeneration) {
+        for (const [id, candidate] of nonGenerationExactAliases) {
+          if ((!allowed || allowed.has(candidate.channelId)) && publicEndpointsForKind(candidate.kind).length) ids.add(id)
+        }
+      }
+      return [...ids].sort((left, right) => left.localeCompare(right)).map(id => {
+        const candidate = exactAliases.get(id) ?? nonGenerationExactAliases.get(id)
+        const kind = candidate?.kind ?? 'generation'
+        return {
+          id,
+          object: 'model',
+          created: 0,
+          owned_by: 'cpa-channel-gateway',
+          kind,
+          endpoints: publicEndpointsForKind(kind)
+        }
+      })
     },
     logicalModels,
     allModels,
     exactAliases,
+    nonGenerationExactAliases,
     routeAliases,
     stagedExactAliases
   }
+}
+
+function publicEndpointsForKind(kind) {
+  if (kind === 'generation') return ['/v1/responses', '/v1/chat/completions', '/v1/messages']
+  if (kind === 'embedding') return ['/v1/embeddings']
+  return []
 }
 
 export function compareCandidates(left, right) {

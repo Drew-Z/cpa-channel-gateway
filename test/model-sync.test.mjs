@@ -8,9 +8,10 @@ test('builds model catalog URLs from the configured upstream base path', () => {
   assert.equal(buildModelCatalogUrl(new URL('https://api.example.test')).toString(), 'https://api.example.test/models')
 })
 
-test('selects enabled channels by default and explicit disabled channels by id', () => {
-  const channels = [{ id: 'free', enabled: true }, { id: 'free3', enabled: false }]
+test('selects enabled channels by default and explicit staged or disabled channels by id', () => {
+  const channels = [{ id: 'free', enabled: true }, { id: 'staged', enabled: false, staged: true }, { id: 'free3', enabled: false }]
   assert.deepEqual(selectChannelsForSync(channels).map(channel => channel.id), ['free'])
+  assert.deepEqual(selectChannelsForSync(channels, ['staged']).map(channel => channel.id), ['staged'])
   assert.deepEqual(selectChannelsForSync(channels, ['free3']).map(channel => channel.id), ['free3'])
   assert.throws(() => selectChannelsForSync(channels, ['missing']), /Unknown channels/)
 })

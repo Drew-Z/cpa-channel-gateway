@@ -8,7 +8,7 @@ Router MVP is implemented in the working tree:
 - logical, stable, pinned, and direct model IDs resolve through one scheduler;
 - one in-memory reservation covers every model and protocol on a physical channel;
 - busy candidates are skipped, and an all-busy result returns `429 all_candidates_busy` without another upstream request;
-- same-protocol Responses traffic uses reviewed native passthrough, while other combinations use the internal CPA `adapted` transport;
+- same-protocol Responses traffic uses reviewed native passthrough; explicit protocol override canary requests use a direct protocol-faithful transport, while production combinations that require translation use the internal CPA `adapted` transport;
 - CPA now listens only on the internal loopback port and Node owns the single public port;
 - cancellation, streaming lifetime, authentication replacement, header filtering, and no-replay behavior have integration coverage.
 

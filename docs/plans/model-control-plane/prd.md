@@ -81,7 +81,7 @@ Turn the current single-tenant CPA + HAProxy deployment into a manageable model 
 - Tests are rate-limited and never run periodically unless a later explicit feature enables a schedule.
 - Success requires a 2xx response and non-empty extracted text.
 - The UI stores status, protocol, latency, timestamp, and redacted error class. It does not persist or log the generated poem.
-- A test result must identify the request profile and whether the upstream request used native protocol forwarding or CPA's `adapted` transport.
+- A test result must identify the configured/test protocol and whether the upstream request used native protocol forwarding, an explicit `protocol-direct` canary, or CPA's `adapted` transport.
 
 ### R6. WebUI and Administration Security
 

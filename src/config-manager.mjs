@@ -14,6 +14,20 @@ const MODEL_ID = /^[^\s/][^\r\n]{0,254}$/
 const ALIAS = /^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,254}$/
 const PROTOCOLS = new Set(['openai-compatible', 'responses', 'claude'])
 const MODEL_STATUSES = new Set(['active', 'stale', 'disabled'])
+const DEFINITE_CANARY_FAILURES = new Set([
+  'authentication_failed',
+  'payment_blocked',
+  'protocol_or_path_error',
+  'invalid_json',
+  'empty_body',
+  'empty_content',
+  'missing_choices',
+  'content_null',
+  'reasoning_only',
+  'structured_content_unsupported',
+  'refusal_or_tool_call',
+  'short_content'
+])
 
 export class ConfigMutationError extends Error {
   constructor(code, statusCode, message) {
@@ -419,6 +433,9 @@ export function createPrivateConfigManager(config, {
         const provider = providers?.providers?.find(item => String(item.id).toLowerCase() === id)
         if (providers && !provider) throw new ConfigMutationError('channel_not_found', 404, `Unknown provider: ${id}`)
         const values = validateChannelInput(input, { partial: true, requireApiKey: false })
+        if (values.enabled === true && values.staged !== true && (channel.models ?? []).length === 0) {
+          throw new ConfigMutationError('channel_models_required', 409, '请先同步该渠道的模型目录，再启用生产')
+        }
         if (values.name !== undefined) providers ? provider.name = values.name : env[`${prefix}_NAME`] = values.name
         if (values.baseUrl !== undefined) providers ? provider.baseUrl = values.baseUrl : env[`${prefix}_BASE_URL`] = values.baseUrl
         if (values.apiKey !== undefined) providers ? provider.apiKey = values.apiKey : env[`${prefix}_API_KEY`] = values.apiKey
@@ -487,6 +504,33 @@ export function createPrivateConfigManager(config, {
         model.status = status
         return { channel: channelId, model: modelId, status }
       }, result => ({ channelIds: [result.channel], modelIds: [`${result.channel}/${result.model}`] }))
+    },
+    updateModelProtocol(channelValue, modelValue, protocolValue) {
+      return mutate('model-protocol-update', ({ routes }) => {
+        const channelId = normalizeChannelId(channelValue)
+        const modelId = normalizeModelId(modelValue)
+        const protocol = normalizeProtocol(protocolValue)
+        const channel = (routes.channels ?? []).find(item => item.id === channelId)
+        if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${channelId}`)
+        const model = (channel.models ?? []).find(item => item.upstream === modelId)
+        if (!model) throw new ConfigMutationError('model_not_found', 404, `Unknown model: ${channelId}/${modelId}`)
+        model.protocol = protocol
+        return { scope: 'model', channel: channelId, model: modelId, protocol, affectedModels: [`${channelId}/${modelId}`] }
+      }, result => ({ channelIds: [result.channel], modelIds: result.affectedModels }))
+    },
+    updateChannelProtocol(channelValue, protocolValue) {
+      return mutate('channel-protocol-update', ({ routes, env, providers }) => {
+        const channelId = normalizeChannelId(channelValue)
+        const protocol = normalizeProtocol(protocolValue)
+        const channel = (routes.channels ?? []).find(item => item.id === channelId)
+        if (!channel) throw new ConfigMutationError('channel_not_found', 404, `Unknown channel: ${channelId}`)
+        const provider = providers?.providers?.find(item => String(item.id).toLowerCase() === channelId)
+        if (providers && !provider) throw new ConfigMutationError('channel_not_found', 404, `Unknown provider: ${channelId}`)
+        if (providers) provider.protocol = protocol
+        else env[`${providerEnvPrefix(channelId)}_PROTOCOL`] = protocol
+        const affectedModels = (channel.models ?? []).map(model => `${channelId}/${model.upstream}`)
+        return { scope: 'channel', channel: channelId, protocol, affectedModels }
+      }, result => ({ channelIds: [result.channel], modelIds: result.affectedModels }))
     },
     setStableAlias(aliasValue, channelValue, modelValue) {
       return mutate('alias-update', ({ routes }) => {
@@ -686,8 +730,11 @@ export function createPrivateConfigManager(config, {
         modelSyncActive = false
       }
     },
-    applyCanaryAudit(report, { stableAliases = {} } = {}) {
+    applyCanaryAudit(report, { stableAliases = {}, confirm = false, approvedModels = [], approvedChannels = [] } = {}) {
       if (!report || !Array.isArray(report.results)) throw new ConfigMutationError('invalid_canary_audit', 400, 'Canary audit results are required')
+      if (confirm !== true) throw new ConfigMutationError('canary_confirmation_required', 400, 'Applying a canary audit requires explicit confirmation')
+      const approvedModelSet = new Set(approvedModels.map(value => String(value).trim()))
+      const approvedChannelSet = new Set(approvedChannels.map(value => String(value).trim().toLowerCase()))
       return mutate('canary-audit', ({ routes, env, providers }) => {
         const byChannel = new Map()
         for (const item of report.results) {
@@ -708,8 +755,8 @@ export function createPrivateConfigManager(config, {
           if (!channel) continue
           const successful = entries.filter(item => item.ok)
           const hasSuccess = successful.length > 0
-          const definiteFailures = entries.filter(item => !item.ok && item.error !== 'timeout' && item.error !== 'transport_error')
-          const failedModels = hasSuccess ? entries.filter(item => !item.ok) : definiteFailures
+          const definiteFailures = entries.filter(item => !item.ok && isDefiniteCanaryFailure(item.error))
+          const failedModels = definiteFailures.filter(item => approvedModelSet.has(`${channelId}/${item.modelId}`))
           for (const item of failedModels) {
             const model = channel.models.find(entry => entry.upstream === item.modelId)
             if (model && model.status !== 'disabled') {
@@ -717,8 +764,8 @@ export function createPrivateConfigManager(config, {
               changedModels.push(`${channelId}/${item.modelId}`)
             }
           }
-          const shouldProduce = hasSuccess
-          const shouldDisableChannel = !hasSuccess
+          const shouldDisableChannel = entries.some(item => ['authentication_failed', 'payment_blocked'].includes(item.error))
+          const shouldProduce = hasSuccess && approvedChannelSet.has(channelId) && !shouldDisableChannel
           if (shouldProduce) {
             if (channel.staged !== false || channel.enabled === false) changedChannels.push(channelId)
             channel.staged = false
@@ -751,7 +798,7 @@ export function createPrivateConfigManager(config, {
           const channel = (routes.channels ?? []).find(item => item.id === channelId)
           const model = channel?.models?.find(item => item.upstream === modelId)
           const result = byChannel.get(channelId)?.find(item => item.modelId === modelId && item.ok)
-          if (!channel || !model || !result) throw new ConfigMutationError('canary_alias_target_unverified', 409, `Stable alias target was not verified: ${channelId}/${modelId}`)
+          if (!channel || !model || !result || !approvedModelSet.has(`${channelId}/${modelId}`)) throw new ConfigMutationError('canary_alias_target_unverified', 409, `Stable alias target was not explicitly approved: ${channelId}/${modelId}`)
           if (model.status === 'disabled') model.status = 'active'
           routes.stableAliases ??= []
           const current = routes.stableAliases.find(item => item.alias === alias)
@@ -947,6 +994,12 @@ function normalizeModelId(value) {
   return model
 }
 
+function normalizeProtocol(value) {
+  const protocol = String(value ?? '').trim()
+  if (!PROTOCOLS.has(protocol)) throw new ConfigMutationError('invalid_protocol', 400, `Unsupported protocol: ${protocol}`)
+  return protocol
+}
+
 function normalizeAlias(value) {
   const alias = String(value ?? '').trim()
   if (!ALIAS.test(alias)) throw new ConfigMutationError('invalid_alias', 400, 'Alias is invalid')
@@ -1067,4 +1120,8 @@ function mutationFailure(error, phase) {
     return new ConfigMutationError('configuration_revision_failed', 500, 'Configuration revision could not be written')
   }
   return new ConfigMutationError('configuration_write_failed', 500, 'Private configuration could not be written')
+}
+
+function isDefiniteCanaryFailure(error) {
+  return DEFINITE_CANARY_FAILURES.has(String(error ?? ''))
 }

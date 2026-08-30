@@ -160,16 +160,18 @@ MVP does not transparently replay a generation POST after forwarding it upstream
 
 ## Manual Model Test
 
-`POST /admin/api/tests` accepts channel, provider model, and protocol. The server:
+`POST /admin/api/tests` accepts channel, provider model, and an optional protocol override. The override is limited to `openai-compatible`, `responses`, or `claude`, affects only this fixed-task request, and never silently changes configuration. The server:
 
 1. checks admin authorization and rate limit;
 2. tries to acquire the exact channel semaphore without queueing;
 3. sends the fixed poetry task through the same selected transport and HAProxy path as production;
 4. validates HTTP status and extracted non-empty text;
-5. records only redacted metadata;
+5. validates protocol-specific response semantics and records only redacted metadata;
 6. releases the semaphore.
 
 A busy result is not a failed model test. It is reported as `channel_busy` and sends no upstream request.
+
+The admin API does not automatically retry the same generation request under another protocol. After a recent successful override test, `POST /admin/api/protocols/apply` can explicitly apply the protocol only to the exact model, with exact target/protocol confirmation and a second admin confirmation in the UI. A channel may contain models using different protocols; its protocol remains only a default for models without an explicit override. Application writes a revision and still requires runtime apply or restart.
 
 ## WebUI
 

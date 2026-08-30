@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { request } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { buildCanaryRequest, extractCanaryContent, normalizeCanaryProtocol, resolveCanaryUrl } from '../src/canary.mjs'
+import { buildCanaryRequest, diagnoseCanaryResponse, normalizeCanaryProtocol, resolveCanaryUrl } from '../src/canary.mjs'
 
 const port = Number(process.env.SERVER_PORT || process.env.PORT || 3000)
 const apiKey = process.env.GATEWAY_API_KEY
@@ -15,11 +15,9 @@ const result = await post(resolveCanaryUrl(process.env.GATEWAY_BASE_URL, port, r
   ...(protocol === 'claude' ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' } : {})
 })
 if (result.status < 200 || result.status >= 300) throw new Error(`Canary failed with HTTP ${result.status}`)
-let parsed
-try { parsed = JSON.parse(result.body) } catch { throw new Error('Canary returned invalid JSON') }
-const content = extractCanaryContent(protocol, parsed)
-if (typeof content !== 'string' || content.trim().length < 8) throw new Error('Canary returned empty content')
-console.log(JSON.stringify({ ok: true, protocol, model, status: result.status, contentLength: content.trim().length }, null, 2))
+const diagnosis = diagnoseCanaryResponse(protocol, result.body)
+if (!diagnosis.ok) throw new Error(`Canary failed semantic validation: ${diagnosis.error}`)
+console.log(JSON.stringify({ ok: true, protocol, model, status: result.status, contentLength: diagnosis.contentLength, diagnostics: diagnosis.diagnostics }, null, 2))
 
 function post(url, body, headers) {
   return new Promise((resolve, reject) => {

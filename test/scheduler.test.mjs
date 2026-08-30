@@ -340,7 +340,7 @@ test('marks protocol status errors as misconfigured candidates', () => {
   }
 })
 
-test('non-generation models remain auditable but are absent from public routing', () => {
+test('non-generation models are publicly discoverable by exact id but remain outside generation routing', () => {
   const config = fixtureConfig()
   config.channels[0].models.push({
     upstream: 'text-embedding-3-small',
@@ -349,12 +349,23 @@ test('non-generation models remain auditable but are absent from public routing'
   })
   config.stableAliases.push({ alias: 'embedding-main', channel: 'alpha', model: 'text-embedding-3-small' })
   const scheduler = createModelScheduler(config)
-  const publicIds = scheduler.catalog.listPublicModels().map(item => item.id)
+  const publicModels = scheduler.catalog.listPublicModels({ includeNonGeneration: true })
+  const publicIds = publicModels.map(item => item.id)
   assert.ok(!publicIds.includes('text-embedding-3-small'))
-  assert.ok(!publicIds.includes('alpha/text-embedding-3-small'))
+  assert.ok(publicIds.includes('alpha/text-embedding-3-small'))
   assert.ok(!publicIds.includes('embedding-main'))
+  assert.deepEqual(publicModels.find(item => item.id === 'alpha/text-embedding-3-small'), {
+    id: 'alpha/text-embedding-3-small',
+    object: 'model',
+    created: 0,
+    owned_by: 'cpa-channel-gateway',
+    kind: 'embedding',
+    endpoints: ['/v1/embeddings']
+  })
   assert.ok(scheduler.catalog.allModels.get('text-embedding-3-small'))
-  assert.throws(() => scheduler.reserve('alpha/text-embedding-3-small'), error => error.code === 'model_not_found')
+  const embedding = scheduler.reserve('alpha/text-embedding-3-small', { allowedKinds: ['embedding'] })
+  embedding.release()
+  assert.throws(() => scheduler.reserve('alpha/text-embedding-3-small', { allowedKinds: ['generation'] }), error => error.code === 'model_endpoint_mismatch')
 })
 
 test('client channel groups filter public models and logical candidates', () => {

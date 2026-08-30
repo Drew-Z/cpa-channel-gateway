@@ -37,7 +37,7 @@ runtime/usage-events.jsonl
 }
 ```
 
-`logicalModelId` 是 catalog 已解析的逻辑组 ID；旧 v1 事件在读取时回退到 `upstreamModel`，因此升级不会丢失现有统计。`outcome` 只能是 `success`、`failure` 或 `cancelled`；`transport` 只能是 `native-passthrough`、`adapted` 或 `unassigned`。
+`logicalModelId` 是 catalog 已解析的逻辑组 ID；旧 v1 事件在读取时回退到 `upstreamModel`，因此升级不会丢失现有统计。`outcome` 只能是 `success`、`failure` 或 `cancelled`；生产 `transport` 只能是 `native-passthrough`、`adapted` 或 `unassigned`。管理台协议试测不写入使用统计，因此它的 `protocol-direct` transport 不会出现在这里。
 
 ## 3. Contracts
 
