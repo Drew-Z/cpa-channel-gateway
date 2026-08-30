@@ -99,6 +99,7 @@ export function synchronizeRouteModels(routes, discoveries) {
           upstream,
           aliases: [canonicalModelAlias(channel.id, upstream)],
           kind,
+          protocol: defaultProtocolForKind(kind, channel.protocol),
           streaming: normalizeStreamingMode(undefined),
           canaryEligible: isGenerationModel({ kind, canaryEligible: true }),
           status: 'active'
@@ -109,10 +110,12 @@ export function synchronizeRouteModels(routes, discoveries) {
       const canonical = canonicalModelAlias(channel.id, upstream)
       const hasCanonical = prior.some(model => (model.aliases ?? []).includes(canonical))
       for (const [index, model] of prior.entries()) {
+        const kind = normalizeModelKind(model.kind, model.upstream)
+        const protocol = model.protocol ?? defaultProtocolForKind(kind, channel.protocol)
         if (index === 0 && !hasCanonical) {
-          models.push({ ...model, aliases: [...new Set([...(model.aliases ?? []), canonical])], status: synchronizedModelStatus(model) })
+          models.push({ ...model, ...(model.protocol === undefined ? { protocol } : {}), aliases: [...new Set([...(model.aliases ?? []), canonical])], status: synchronizedModelStatus(model) })
         } else {
-          models.push({ ...model, status: synchronizedModelStatus(model) })
+          models.push({ ...model, ...(model.protocol === undefined ? { protocol } : {}), status: synchronizedModelStatus(model) })
         }
       }
     }
@@ -137,6 +140,13 @@ export function synchronizeRouteModels(routes, discoveries) {
   })
 
   return { routes: { ...routes, channels }, summaries }
+}
+
+function defaultProtocolForKind(kind, channelProtocol) {
+  // Embeddings use the OpenAI-compatible /embeddings endpoint; Responses is a
+  // generation transport and cannot represent this request shape.
+  if (kind === 'embedding') return 'openai-compatible'
+  return channelProtocol ?? 'openai-compatible'
 }
 
 function synchronizedModelStatus(model) {

@@ -74,6 +74,19 @@ test('synchronizes complete channel inventories while preserving reviewed metada
   assert.equal(canonicalModelAlias('sample', 'provider/model-b:free'), 'sample/provider/model-b:free')
 })
 
+test('assigns the embedding endpoint protocol to newly discovered embedding models', () => {
+  const routes = {
+    schemaVersion: 1,
+    channels: [{ id: 'sample', protocol: 'responses', models: [] }],
+    stableAliases: [],
+    pinnedAliases: []
+  }
+  const result = synchronizeRouteModels(routes, new Map([['sample', ['text-embedding-3-small', 'coding-model']]]))
+  const models = result.routes.channels[0].models
+  assert.equal(models.find(model => model.upstream === 'text-embedding-3-small').protocol, 'openai-compatible')
+  assert.equal(models.find(model => model.upstream === 'coding-model').protocol, 'responses')
+})
+
 test('preserves stale models until stable or pinned aliases move away from them', () => {
   const routes = {
     schemaVersion: 1,

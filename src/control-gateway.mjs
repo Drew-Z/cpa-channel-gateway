@@ -674,6 +674,14 @@ export function createControlGateway(config, {
       throw publicError('protocol_confirmation_required', 400, 'Protocol apply requires exact target and protocol confirmation')
     }
     const directId = `${channel}/${model}`
+    const candidate = findAdminCandidate(directId)
+    if (!candidate) throw new GatewayRoutingError('model_not_found', 404, `Unknown model: ${directId}`)
+    if (candidate.kind !== 'generation') {
+      if (body.confirmNonGeneration !== true) {
+        throw publicError('non_generation_protocol_confirmation_required', 400, 'Non-generation protocol apply requires explicit confirmation')
+      }
+      return configManager.updateModelProtocol(channel, model, protocol)
+    }
     const latest = protocolTests.get(`${directId}\0${protocol}`)
     if (!latest?.ok || latest.protocol !== protocol || Date.parse(latest.testedAt) < Date.now() - ADMIN_TEST_RESULT_TTL_MS) {
       throw publicError('protocol_test_required', 409, 'A recent successful test for this exact model and protocol is required')

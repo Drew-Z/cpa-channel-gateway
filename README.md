@@ -165,7 +165,7 @@ npm run sync:models
 npm run check
 ```
 
-同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何渠道请求失败或返回空目录时都不会改写 routes；成功时会先创建 `config/routes.local.pre-model-sync-*.json` 或 revision 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`，未被引用的下线模型会删除。仍被 stable/pinned alias 或逻辑候选引用的下线模型会保留并标记为 `stale`，待引用移走后在下次同步清理。模型可以在私有 routes 中标记为 `disabled`；该状态会在目录同步中保留，模型不会进入公开 `/v1/models`、生产调度或生成的 CPA 模型段。管理台同步支持显式指定待测试渠道，不会把它们加入公开目录。
+同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何渠道请求失败或返回空目录时都不会改写 routes；成功时会先创建 `config/routes.local.pre-model-sync-*.json` 或 revision 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`。新识别的 embedding 模型默认记录为 `openai-compatible`，对应 `/v1/embeddings` 请求形状；其他新模型继承渠道默认协议。未被引用的下线模型会删除。仍被 stable/pinned alias 或逻辑候选引用的下线模型会保留并标记为 `stale`，待引用移走后在下次同步清理。模型可以在私有 routes 中标记为 `disabled`；该状态会在目录同步中保留，模型不会进入公开 `/v1/models`、生产调度或生成的 CPA 模型段。管理台同步支持显式指定待测试渠道，不会把它们加入公开目录。
 
 上游 `/models` 可能同时列出生成、embedding、reranker 或语音模型。目录同步只证明“上游声明存在”，不证明它支持当前渠道默认协议；生成模型正式使用前仍要按能力执行任务型 canary，非生成模型不发送不兼容的诗词请求，改由对应协议的真实业务调用验证。
 
@@ -217,7 +217,7 @@ npm run canary
 
 默认任务是生成一首四句七言绝句。`CANARY_PROTOCOL` 接受 `responses`、`openai-compatible`（或等价的 `chat`）和 `claude`。管理台还允许对当前精确模型临时覆盖协议进行一次试测；覆盖只作用于本次请求，不会静默修改配置或在业务请求中自动 fallback。脚本和管理台只记录 HTTP 状态、模型名、协议、transport、正文长度及白名单诊断，不输出正文、密钥、上游地址或完整错误。canary 也是正式请求，必须取得与生产请求相同的渠道租约，并由操作者明确执行；项目不创建周期性模型探测。
 
-当某个模型的协议设置可能有误时，在“模型”视图选择精确 `<channel>/<upstream-model>`，切换 `Chat Completions`、`Responses` 或 `Anthropic Messages` 后点击“按此协议测活”。成功结果只在 30 分钟内有效，并解锁“应用到当前模型”；应用要求二次确认，写入私有 revision 后仍需显式应用或重启。同一渠道可以包含不同协议的模型，管理台不会把一次试测结果批量应用到整个渠道。测活失败会区分无效 JSON、空正文、缺少 choices、推理-only、工具/拒答、结构化正文和协议/路径错误等原因。
+当某个生成模型的协议设置可能有误时，在“模型”视图选择精确 `<channel>/<upstream-model>`，切换 `Chat Completions`、`Responses` 或 `Anthropic Messages` 后点击“按此协议测活”。成功结果只在 30 分钟内有效，并解锁“应用到当前模型”；应用要求二次确认，写入私有 revision 后仍需显式应用或重启。同一渠道可以包含不同协议的模型，管理台不会把一次试测结果批量应用到整个渠道。非生成模型不发送诗词任务，可在精确模型上显式确认协议后应用，再通过对应业务端点和真实调用记录验证。测活失败会区分无效 JSON、空正文、缺少 choices、推理-only、工具/拒答、结构化正文和协议/路径错误等原因。
 
 对本地所有已发现生成模型做一次逐渠道串行验收时使用：
 
