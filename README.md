@@ -165,7 +165,7 @@ npm run sync:models
 npm run check
 ```
 
-同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何渠道请求失败或返回空目录时都不会改写 routes；成功时会先创建 `config/routes.local.pre-model-sync-*.json` 或 revision 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`。新识别的 embedding 模型默认记录为 `openai-compatible`，对应 `/v1/embeddings` 请求形状；其他新模型继承渠道默认协议。未被引用的下线模型会删除。仍被 stable/pinned alias 或逻辑候选引用的下线模型会保留并标记为 `stale`，待引用移走后在下次同步清理。模型可以在私有 routes 中标记为 `disabled`；该状态会在目录同步中保留，模型不会进入公开 `/v1/models`、生产调度或生成的 CPA 模型段。管理台同步支持显式指定待测试渠道，不会把它们加入公开目录。
+同步器按渠道顺序请求只读 `/models`，不发送生成提示词。任何渠道请求失败或返回空目录时都不会改写 routes；管理 API 会以 `424 model_sync_failed` 返回不含响应正文的渠道 ID 与 HTTP/超时/JSON 分类，避免公网代理把它误写为 HTML 502。成功时会先创建 `config/routes.local.pre-model-sync-*.json` 或 revision 备份，再原子更新 `routes.local.json`。已有的协议、上下文、模态、thinking 和额外 alias 会保留；新模型得到 `<渠道ID>/<原始模型ID>`。新识别的 embedding 模型默认记录为 `openai-compatible`，对应 `/v1/embeddings` 请求形状；其他新模型继承渠道默认协议。未被引用的下线模型会删除。仍被 stable/pinned alias 或逻辑候选引用的下线模型会保留并标记为 `stale`，待引用移走后在下次同步清理。模型可以在私有 routes 中标记为 `disabled`；该状态会在目录同步中保留，模型不会进入公开 `/v1/models`、生产调度或生成的 CPA 模型段。管理台同步支持显式指定待测试渠道，不会把它们加入公开目录。
 
 上游 `/models` 可能同时列出生成、embedding、reranker 或语音模型。目录同步只证明“上游声明存在”，不证明它支持当前渠道默认协议；生成模型正式使用前仍要按能力执行任务型 canary，非生成模型不发送不兼容的诗词请求，改由对应协议的真实业务调用验证。
 

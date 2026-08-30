@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { createControlGateway } from '../src/control-gateway.mjs'
+import { ConfigMutationError } from '../src/config-manager.mjs'
 import { createControlState } from '../src/control-state.mjs'
 import { hashClientKey } from '../src/client-access.mjs'
 
@@ -1027,6 +1028,33 @@ test('admin can explicitly apply a protocol to an exact non-generation model wit
   })
   assert.equal(applied.statusCode, 202)
   assert.deepEqual(calls, [{ channel: 'free', model: 'text-embedding-3-small', protocol: 'openai-compatible' }])
+})
+
+test('model synchronization failures retain a redacted JSON status outside proxy error pages', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const configManager = {
+    status: () => ({ revision: 'loaded', loadedRevision: 'loaded', restartRequired: false }),
+    syncModels: async () => {
+      throw new ConfigMutationError('model_sync_failed', 424, 'Channel sample model catalog returned HTTP 401')
+    }
+  }
+  const gateway = createControlGateway(config, { configManager })
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const result = await request({
+    port: address.port,
+    path: '/admin/api/model-sync',
+    headers: { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf },
+    body: { channels: ['sample'] }
+  })
+  assert.equal(result.statusCode, 424)
+  assert.deepEqual(JSON.parse(result.body), {
+    error: { code: 'model_sync_failed', message: 'Channel sample model catalog returned HTTP 401' }
+  })
 })
 
 test('a 2xx canary without final content records candidate failure instead of success', async t => {

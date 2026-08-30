@@ -683,7 +683,9 @@ export function createPrivateConfigManager(config, {
           }
         } catch (error) {
           if (error instanceof ConfigMutationError) throw error
-          throw new ConfigMutationError('model_sync_failed', 502, error instanceof Error ? error.message : 'Model synchronization failed')
+          // This is an upstream dependency failure, not an internal gateway
+          // fault; 424 avoids proxy layers replacing the redacted JSON error.
+          throw new ConfigMutationError('model_sync_failed', 424, error instanceof Error ? error.message : 'Model synchronization failed')
         }
         const { routes, summaries } = synchronizeRouteModels(current.routes, discoveries)
         const nextRoutes = JSON.stringify(routes, null, 2) + '\n'
