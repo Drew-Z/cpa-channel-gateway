@@ -66,7 +66,7 @@ test('expires transient health, retains release-scoped failures, and resets them
     channels: {
       alpha: { health: 'healthy', updatedAt: clock },
       beta: { health: 'degraded', updatedAt: clock },
-      gamma: { health: 'auth-failed', updatedAt: clock },
+      gamma: { health: 'auth-failed', lastStatusCode: 403, updatedAt: clock },
       delta: { health: 'payment-blocked', updatedAt: clock },
       epsilon: { health: 'cooling', cooldownUntil: clock + 100, updatedAt: clock }
     },
@@ -79,7 +79,7 @@ test('expires transient health, retains release-scoped failures, and resets them
   clock += 201
   const aged = createControlState(config, { filePath, now: () => clock, healthStaleMs: 100 })
   assert.deepEqual(aged.schedulerState().channels, {
-    gamma: { health: 'auth-failed', updatedAt: 1_000 },
+    gamma: { health: 'auth-failed', lastStatusCode: 403, updatedAt: 1_000 },
     delta: { health: 'payment-blocked', updatedAt: 1_000 }
   })
   assert.equal(aged.schedulerState().candidates['alpha\0shared-model\0responses'].health, 'misconfigured')
@@ -87,6 +87,28 @@ test('expires transient health, retains release-scoped failures, and resets them
   const nextRelease = createControlState({ ...config, digest: 'release-b' }, { filePath, now: () => clock, healthStaleMs: 100 })
   assert.deepEqual(nextRelease.schedulerState(), { channels: {}, candidates: {} })
   assert.equal(nextRelease.lastTests()['alpha/shared-model'].status, 'success')
+})
+
+test('persists only 401 or 403 authentication diagnostics', t => {
+  const root = temporaryRoot(t)
+  const filePath = path.join(root, 'runtime', 'control-state.json')
+  const config = fixtureConfig(root, ['alpha', 'beta', 'gamma'])
+  const state = createControlState(config, { filePath, now: () => 5_000 })
+  state.replaceSchedulerState({
+    channels: {
+      alpha: { health: 'auth-failed', lastStatusCode: 401, updatedAt: 5_000 },
+      beta: { health: 'auth-failed', lastStatusCode: 403, updatedAt: 5_000 },
+      gamma: { health: 'auth-failed', lastStatusCode: 500, updatedAt: 5_000 }
+    }
+  })
+  assert.deepEqual(state.schedulerState().channels, {
+    alpha: { health: 'auth-failed', lastStatusCode: 401, updatedAt: 5_000 },
+    beta: { health: 'auth-failed', lastStatusCode: 403, updatedAt: 5_000 },
+    gamma: { health: 'auth-failed', updatedAt: 5_000 }
+  })
+  const restored = createControlState(config, { filePath, now: () => 5_001 })
+  assert.deepEqual(restored.schedulerState().channels, state.schedulerState().channels)
+  assert.doesNotMatch(fs.readFileSync(filePath, 'utf8'), /authorization|apiKey|responseBody/)
 })
 
 test('rejects invalid summaries and falls back to memory for corrupt or unwritable state paths', t => {

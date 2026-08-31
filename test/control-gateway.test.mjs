@@ -578,6 +578,39 @@ test('channel updates enter drain mode before the pending restart', async t => {
   assert.equal(status.controlJobs.recent.at(-1).status, 'completed')
 })
 
+test('admin channel retry clears only local auth isolation without contacting an upstream', async t => {
+  const config = fixtureConfig(19001)
+  config.managementKey = 'fixture_management_key_that_is_long_enough_123456'
+  const gateway = createControlGateway(config)
+  const selection = gateway.scheduler.reserve('free/shared-model')
+  gateway.scheduler.recordOutcome(selection, 403)
+  selection.release()
+  const address = await gateway.listen({ host: '127.0.0.1', port: 0 })
+  t.after(() => gateway.close())
+
+  const unauthorized = await request({ port: address.port, path: '/admin/api/channels/free/retry', body: {} })
+  assert.equal(unauthorized.statusCode, 401)
+
+  const login = await request({ port: address.port, path: '/admin/api/session', body: { key: config.managementKey } })
+  const cookie = login.headers['set-cookie'][0].split(';', 1)[0]
+  const csrf = JSON.parse(login.body).csrfToken
+  const missingCsrf = await request({ port: address.port, path: '/admin/api/channels/free/retry', headers: { cookie, origin: `http://127.0.0.1:${address.port}` }, body: {} })
+  assert.equal(missingCsrf.statusCode, 403)
+
+  const retried = await request({
+    port: address.port,
+    path: '/admin/api/channels/free/retry',
+    headers: { cookie, origin: `http://127.0.0.1:${address.port}`, 'x-csrf-token': csrf },
+    body: {}
+  })
+  assert.equal(retried.statusCode, 200)
+  assert.deepEqual(JSON.parse(retried.body), { channel: 'free', cleared: true, health: 'unknown', lastStatusCode: null })
+  assert.equal(gateway.scheduler.snapshot().channels.free, undefined)
+  assert.equal(gateway.usageMonitor.snapshot().summary.total, 0)
+  const status = JSON.parse((await request({ port: address.port, method: 'GET', path: '/admin/api/status', headers: { cookie } })).body)
+  assert.equal(status.controlJobs.recent.at(-1).type, 'channel-retry')
+})
+
 test('reloadConfig switches public routing to the new validated catalog', async t => {
   const config = fixtureConfig(19001)
   const gateway = createControlGateway(config)
@@ -595,6 +628,19 @@ test('reloadConfig switches public routing to the new validated catalog', async 
   assert.ok(ids.includes('new-model'))
   assert.ok(!ids.includes('shared-model'))
   assert.equal(gateway.scheduler.catalog.resolve('shared-model'), null)
+})
+
+test('reloadConfig clears persisted auth isolation only when a channel key changes', () => {
+  const config = fixtureConfig(19001)
+  const gateway = createControlGateway(config)
+  const failed = gateway.scheduler.reserve('free/shared-model')
+  gateway.scheduler.recordOutcome(failed, 401)
+  failed.release()
+
+  gateway.reloadConfig({ ...config, channels: [{ ...config.channels[0] }] })
+  assert.equal(gateway.scheduler.snapshot().channels.free.health, 'auth-failed')
+  gateway.reloadConfig({ ...config, channels: [{ ...config.channels[0], apiKey: 'fixture-upstream-key-rotated' }] })
+  assert.equal(gateway.scheduler.snapshot().channels.free, undefined)
 })
 
 test('reloadConfig restores the previous catalog and revision when validation fails', async t => {
@@ -757,7 +803,7 @@ test('restores persisted health and canary summaries into the admin status', asy
   const timestamp = Date.now()
   const persisted = createControlState(config, { now: () => timestamp })
   persisted.replaceSchedulerState({
-    channels: { free: { health: 'auth-failed', updatedAt: timestamp } }
+    channels: { free: { health: 'auth-failed', lastStatusCode: 401, updatedAt: timestamp } }
   })
   persisted.rememberTest('free/shared-model', {
     ok: false,
@@ -787,6 +833,7 @@ test('restores persisted health and canary summaries into the admin status', asy
   })).body)
 
   assert.equal(status.channels[0].health, 'auth-failed')
+  assert.equal(status.channels[0].lastStatusCode, 401)
   assert.equal(status.lastTests['free/shared-model'].error, 'authentication_failed')
   assert.equal(status.controlState.storage, 'persistent')
   const blocked = await request({

@@ -153,7 +153,7 @@ export function createModelScheduler(config, {
     if (statusCode >= 200 && statusCode < 300) {
       channelState.set(candidate.channelId, { health: 'healthy', updatedAt: timestamp })
     } else if (statusCode === 401 || statusCode === 403) {
-      channelState.set(candidate.channelId, { health: 'auth-failed', updatedAt: timestamp })
+      channelState.set(candidate.channelId, { health: 'auth-failed', lastStatusCode: statusCode, updatedAt: timestamp })
     } else if (statusCode === 402) {
       channelState.set(candidate.channelId, { health: 'payment-blocked', updatedAt: timestamp })
     } else if (statusCode === 429) {
@@ -219,6 +219,14 @@ export function createModelScheduler(config, {
     return drainingChannels.delete(String(channelId ?? '').trim())
   }
 
+  function resetChannelHealth(channelId) {
+    const id = String(channelId ?? '').trim()
+    if (!validChannelIds.has(id)) return false
+    const changed = channelState.delete(id)
+    if (changed) notifyStateChange()
+    return changed
+  }
+
   function drainAll() {
     for (const channelId of validChannelIds) drainingChannels.add(channelId)
     return [...drainingChannels].sort()
@@ -275,7 +283,11 @@ export function createModelScheduler(config, {
     if (circuit === 'open') reasons.push('circuit-open')
     if (circuit === 'half-open') reasons.push(halfOpenCandidates.has(candidate.key) ? 'half-open-busy' : 'half-open-ready')
     if (!reasons.length) reasons.push('candidate-ready')
-    return { evidence: publicEvidence(evidence, circuit), reasonCodes: reasons }
+    return {
+      evidence: publicEvidence(evidence, circuit),
+      ...(channel?.lastStatusCode === 401 || channel?.lastStatusCode === 403 ? { lastStatusCode: channel.lastStatusCode } : {}),
+      reasonCodes: reasons
+    }
   }
 
   function candidatesFor(channelId, upstreamModel) {
@@ -315,6 +327,7 @@ export function createModelScheduler(config, {
     reload,
     drainChannel,
     resumeChannel,
+    resetChannelHealth,
     drainAll,
     resumeAll,
     waitForIdle,
@@ -372,8 +385,17 @@ function restoreChannelState(input, validChannelIds) {
       if (!Number.isSafeInteger(value.cooldownUntil) || value.cooldownUntil < 0) return []
       return [[channelId, { health: value.health, cooldownUntil: value.cooldownUntil, updatedAt: value.updatedAt }]]
     }
-    return [[channelId, { health: value.health, updatedAt: value.updatedAt }]]
+    const lastStatusCode = normalizeAuthStatusCode(value.lastStatusCode)
+    return [[channelId, {
+      health: value.health,
+      ...(value.health === 'auth-failed' && lastStatusCode ? { lastStatusCode } : {}),
+      updatedAt: value.updatedAt
+    }]]
   }))
+}
+
+function normalizeAuthStatusCode(value) {
+  return value === 401 || value === 403 ? value : null
 }
 
 function restoreCandidateState(input, validCandidateKeys, now) {

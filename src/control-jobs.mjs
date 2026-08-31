@@ -7,6 +7,7 @@ const JOB_TYPES = new Set([
   'channel-create',
   'channel-import',
   'channel-update',
+  'channel-retry',
   'channel-delete',
   'model-update',
   'model-create',

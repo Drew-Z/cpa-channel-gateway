@@ -170,7 +170,12 @@ function normalizeChannels(input, { now, healthStaleMs, validChannels }) {
       result.push([channelId, { health: value.health, cooldownUntil, updatedAt }])
       continue
     }
-    result.push([channelId, { health: value.health, updatedAt }])
+    const lastStatusCode = normalizeAuthStatusCode(value.lastStatusCode)
+    result.push([channelId, {
+      health: value.health,
+      ...(value.health === 'auth-failed' && lastStatusCode ? { lastStatusCode } : {}),
+      updatedAt
+    }])
   }
   return Object.fromEntries(result)
 }
@@ -274,6 +279,10 @@ function nonNegativeInteger(value) {
 
 function boundedInteger(value, minimum, maximum) {
   return Number.isSafeInteger(value) && value >= minimum && value <= maximum ? value : undefined
+}
+
+function normalizeAuthStatusCode(value) {
+  return value === 401 || value === 403 ? value : null
 }
 
 function validIsoTimestamp(value) {

@@ -452,6 +452,25 @@ export function createControlGateway(config, {
       return
     }
     const channelRoute = /^\/admin\/api\/channels\/([a-z][a-z0-9-]{0,31})$/.exec(url.pathname)
+    const channelRetryRoute = /^\/admin\/api\/channels\/([a-z][a-z0-9-]{0,31})\/retry$/.exec(url.pathname)
+    if (channelRetryRoute && request.method === 'POST') {
+      requireAdminMutation(request, session)
+      const channelId = channelRetryRoute[1]
+      sendJson(response, 200, await controlJobs.run('channel-retry', () => {
+        if (!config.channels?.some(channel => channel.id === channelId)) {
+          throw new GatewayRoutingError('channel_not_found', 404, `Unknown channel: ${channelId}`)
+        }
+        const cleared = scheduler.resetChannelHealth?.(channelId) ?? false
+        const status = scheduler.snapshot().channels[channelId] ?? null
+        return {
+          channel: channelId,
+          cleared,
+          health: status?.health ?? 'unknown',
+          lastStatusCode: status?.lastStatusCode ?? null
+        }
+      }))
+      return
+    }
     if (channelRoute && request.method === 'PATCH') {
       requireAdminMutation(request, session)
       requireConfigManager()
@@ -792,6 +811,7 @@ export function createControlGateway(config, {
         busy: snapshot.reservations.some(item => item.channelId === channel.id),
         draining: (snapshot.draining ?? []).includes(channel.id),
         health: snapshot.channels[channel.id]?.health ?? 'unknown',
+        lastStatusCode: snapshot.channels[channel.id]?.lastStatusCode ?? null,
         cooldownUntil: snapshot.channels[channel.id]?.cooldownUntil ?? null
       }))
     }
@@ -817,6 +837,7 @@ export function createControlGateway(config, {
     if (!nextConfig || typeof nextConfig !== 'object') throw new TypeError('A runtime configuration is required')
     if (scheduler.reservations.snapshot().length) throw publicError('runtime_busy', 409, 'Cannot reload configuration while requests are active')
     const previousConfig = { ...config }
+    const previousChannelKeys = new Map((config.channels ?? []).map(channel => [channel.id, channel.apiKey]))
     const previousState = controlState.snapshot?.() ?? {
       schedulerState: controlState.schedulerState(),
       lastTests: controlState.lastTests()
@@ -824,6 +845,11 @@ export function createControlGateway(config, {
     try {
       const nextState = controlState.reconfigure(nextConfig)
       scheduler.reload(nextConfig, { initialState: nextState })
+      for (const channel of nextConfig.channels ?? []) {
+        if (previousChannelKeys.has(channel.id) && previousChannelKeys.get(channel.id) !== channel.apiKey) {
+          scheduler.resetChannelHealth?.(channel.id)
+        }
+      }
       Object.assign(config, nextConfig)
       pruneTestCooldowns()
       lastTests.clear()

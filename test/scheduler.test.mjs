@@ -73,9 +73,39 @@ test('passive authentication failure removes a channel from later selection', ()
   const first = scheduler.reserve('shared-model')
   scheduler.recordOutcome(first, 401)
   first.release()
+  const status = scheduler.candidateStatus(scheduler.catalog.resolve('alpha/shared-model').candidates[0])
+  assert.equal(status.lastStatusCode, 401)
   const next = scheduler.reserve('shared-model')
   assert.equal(next.candidate.channelId, 'beta')
   next.release()
+})
+
+test('channel health reset clears only the selected authentication blocker', () => {
+  const scheduler = createModelScheduler(fixtureConfig())
+  const alpha = scheduler.reserve('alpha/shared-model')
+  scheduler.recordOutcome(alpha, 403)
+  alpha.release()
+  const beta = scheduler.reserve('beta/shared-model')
+  scheduler.recordOutcome(beta, 401)
+  beta.release()
+
+  assert.equal(scheduler.resetChannelHealth('alpha'), true)
+  assert.equal(scheduler.snapshot().channels.alpha, undefined)
+  assert.deepEqual(scheduler.snapshot().channels.beta, { health: 'auth-failed', lastStatusCode: 401, updatedAt: scheduler.snapshot().channels.beta.updatedAt })
+
+  const recovered = scheduler.reserve('alpha/shared-model')
+  assert.equal(recovered.candidate.channelId, 'alpha')
+  recovered.release()
+  assert.equal(scheduler.resetChannelHealth('missing'), false)
+})
+
+test('a successful outcome replaces an earlier authentication diagnostic', () => {
+  const scheduler = createModelScheduler(fixtureConfig())
+  const candidate = scheduler.catalog.resolve('alpha/shared-model').candidates[0]
+  scheduler.recordOutcome({ candidate }, 403)
+  assert.equal(scheduler.snapshot().channels.alpha.lastStatusCode, 403)
+  scheduler.recordOutcome({ candidate }, 200)
+  assert.deepEqual(scheduler.snapshot().channels.alpha, { health: 'healthy', updatedAt: scheduler.snapshot().channels.alpha.updatedAt })
 })
 
 test('opens a transient candidate circuit and permits one half-open recovery trial', () => {
